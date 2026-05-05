@@ -1,0 +1,255 @@
+# egisai — Runtime governance for AI agents
+
+[![PyPI version](https://img.shields.io/pypi/v/egisai.svg)](https://pypi.org/project/egisai/)
+[![Python versions](https://img.shields.io/pypi/pyversions/egisai.svg)](https://pypi.org/project/egisai/)
+[![License](https://img.shields.io/pypi/l/egisai.svg)](https://github.com/EgisLabs/egisai-sdk/blob/main/LICENSE)
+
+**Production guardrails for Python AI applications.** Install the SDK, call `egisai.init()`, and continue using OpenAI, Anthropic, Google Gemini, or plain HTTP clients as you do today—policy evaluation and audit logging wrap those calls automatically.
+
+This document is the canonical SDK guide for **[PyPI](https://pypi.org/project/egisai/)** and mirrors what we publish at **[docs.egisai.co](https://docs.egisai.co)**.
+
+---
+
+## Overview
+
+| Capability | What it means for you |
+|------------|------------------------|
+| **Central policies** | Operators configure rules in the [EgisAI dashboard](https://app.egisai.co). The SDK loads them at runtime and refreshes them continuously—no redeploy to tighten controls. |
+| **Transparent integration** | No proxy layer and no wrapper objects you must remember to use. Supported libraries are patched in-process when your application imports them after `egisai.init()`. |
+| **Audit trail** | Governed calls emit structured events to your org so teams can review verdicts, latency, and usage in one place. |
+| **Local-first sensitive checks** | Pattern-based PII handling and other deterministic rules run entirely inside your process before traffic leaves your environment. |
+
+---
+
+## What you need
+
+1. **Python 3.11+**
+2. An **[EgisAI](https://app.egisai.co)** account and an **SDK API key** (dashboard → **API Keys** → create). Keys look like `egis_live_…`.
+3. The AI SDK(s) you already use (`openai`, `anthropic`, `google-generativeai`, …).
+
+---
+
+## Installation
+
+```bash
+pip install "egisai[all]"
+```
+
+Optional extras (smaller installs):
+
+```bash
+pip install "egisai[openai]"
+pip install "egisai[anthropic]"
+pip install "egisai[google]"
+```
+
+Only frameworks present in your environment are activated at runtime.
+
+---
+
+## Getting started
+
+### 1. Initialize once per process
+
+Call `egisai.init()` as early as possible in your application lifecycle (for example right after loading configuration). Use your SDK API key from the dashboard.
+
+```python
+import egisai
+
+egisai.init(
+    api_key="egis_live_…",   # or set EGISAI_API_KEY in the environment
+    app="customer-support-bot",
+    env="production",
+)
+```
+
+### 2. Use your LLM client normally
+
+No changes to your calling convention—the SDK intercepts supported APIs after initialization.
+
+**OpenAI**
+
+```python
+from openai import OpenAI
+
+client = OpenAI()
+response = client.chat.completions.create(
+    model="gpt-4.1",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+```
+
+**Anthropic**
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+response = client.messages.create(
+    model="claude-sonnet-4-20250514",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello"}],
+)
+```
+
+### 3. Review activity
+
+Open **[Dashboard → Requests](https://app.egisai.co/dashboard)** to see governed calls, verdicts, and supporting metadata for your organization.
+
+---
+
+## How governance fits your call path
+
+1. **Evaluation** — Before the upstream model runs, the SDK applies your organization’s active policies (cached locally). Rules such as PII detection, regex denylists, model allowlists, and intent-oriented policies are evaluated in a fixed order defined by the product.
+2. **Outcomes** — A call may be **allowed**, **sanitized** (payload adjusted per policy, then forwarded), or **blocked**. Blocked calls never reach the provider when enforcement raises or returns a stub, depending on configuration (see below).
+3. **Telemetry** — Non-blocking delivery of audit metadata to EgisAI so your dashboard stays current without slowing customer-facing inference.
+
+Sensitive pattern detection intended to catch regulated data is performed locally so raw values are not sent to third-party models as part of governance. Intent-oriented policies operate only after applicable local checks have run on the text that will be judged.
+
+---
+
+## When a call is blocked
+
+| `on_block` | Behavior |
+|------------|----------|
+| `"raise"` *(default)* | Raises `PermissionError` if a policy blocks the call. |
+| `"stub"` | Returns a framework-shaped refusal object so applications that cannot tolerate exceptions keep running; the refusal is clearly identifiable in your logs and on the dashboard. |
+
+Configure at init:
+
+```python
+egisai.init(..., on_block="stub")
+```
+
+---
+
+## Configuration reference
+
+### Initialization parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `api_key` | — | **Required** unless `EGISAI_API_KEY` is set. Your EgisAI SDK key (`egis_live_…`). |
+| `app` | `"default"` | Logical application name; appears as an **Agent** in the dashboard for attribution. |
+| `env` | `"production"` | Environment label (for example `staging`, `prod`). Free-form string for your own segmentation. |
+| `base_url` | Hosted control plane | Override only when directed by EgisAI (for example dedicated regions or enterprise deployments). |
+| `on_block` | `"raise"` | `"raise"` or `"stub"` — see above. |
+| `refresh_interval_seconds` | `10` | How often to poll for policy updates if live streaming is unavailable. |
+| `enable_sse` | `True` | Subscribe to live policy and configuration updates when supported. |
+| `enable_http_fallback` | `True` | Optional patching of `httpx` / `requests` for broader HTTP visibility where enabled. |
+| `quiet` | `False` | Set `True` to suppress the one-line startup banner on stderr. |
+
+### Environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `EGISAI_API_KEY` | SDK API key if not passed as `api_key=`. |
+| `EGISAI_BASE_URL` | Control plane base URL override when supplied by EgisAI. |
+
+Treat API keys as secrets—use environment variables or a secrets manager, never commit them to source control.
+
+---
+
+## Policies (operator concepts)
+
+Organizations configure policies in the dashboard. Typical categories include:
+
+| Category | Purpose (high level) |
+|----------|----------------------|
+| **PII & secrets** | Detect and block or mask categories such as government identifiers, payment data, and credential-shaped strings before model calls. |
+| **Content patterns** | Allow or deny prompts or outputs matching operator-defined patterns. |
+| **Models & size** | Restrict which model names may be called or cap prompt size. |
+| **Intent** | Block requests that match dangerous or out-of-scope *intent* even when phrased obliquely or in another language. |
+| **Tools & connectors** | Restrict tool, shell, or integration use when the model returns structured tool or command requests. |
+
+Exact rule JSON and ordering are managed in the product; the SDK consumes the published configuration and does not require you to embed policy documents in your repository.
+
+---
+
+## Advanced: explicit context (optional)
+
+For multi-tenant or test scenarios, you may override auto-detected context (for example agent identity) with `egisai.set_context(**kwargs)` as described in the package API. This is **optional**—the default path fingerprints agents from your application’s behavior.
+
+---
+
+## Performance and availability
+
+- **Steady-state overhead** is designed to stay on the order of a fraction of a millisecond for policy lookup per call after initialization and cache warm-up.
+- **Control plane connectivity** — If the SDK cannot reach EgisAI at startup, your process can still run; policy enforcement may be limited until a successful connection and policy fetch. PII and other local checks remain in force where the engine can evaluate them. For your specific deployment’s behavior, refer to your contract and [SECURITY.md](https://github.com/EgisLabs/egisai-sdk/blob/main/SECURITY.md).
+- **Audit delivery** is asynchronous so network latency to EgisAI does not sit on the critical path of every model call.
+
+---
+
+## Privacy and security
+
+- Do **not** embed secrets in repository copies of this README.
+- For vulnerability reporting, see **[SECURITY.md](https://github.com/EgisLabs/egisai-sdk/blob/main/SECURITY.md)** — please use the disclosed channel rather than public issues for security-sensitive matters.
+
+A short summary suitable for architecture reviews:
+
+- Governance evaluates prompts with respect to your organization’s policies before upstream invocation where applicable.
+- Sensitive-content handling is architected so that raw regulated values are not sent to third-party LLMs as part of policy enforcement workflows described here.
+
+---
+
+## Troubleshooting
+
+| Symptom | Things to check |
+|---------|-----------------|
+| `RuntimeError: egisai.init() requires api_key` | Set `api_key=` or `EGISAI_API_KEY`. |
+| Policies never update | Network egress to your configured control plane; SSE disabled behind strict firewalls—polling still applies on an interval. |
+| Calls succeed but dashboard stays empty | Confirm the SDK key matches the org you expect; verify process can reach the control plane for logging. |
+| Blocked call raises unexpectedly | Review active policies in the dashboard; set `on_block="stub"` if you need non-throwing behavior. |
+
+---
+
+## Supported Python libraries
+
+| Library | Notes |
+|---------|--------|
+| `openai` ≥ 1.40 | Chat Completions, Responses API, streaming where supported by the adapter. |
+| `anthropic` ≥ 0.40 | Messages API, streaming. |
+| `google-generativeai` ≥ 0.8 | `GenerativeModel.generate_content`, streaming. |
+| `httpx` / `requests` | Optional broad HTTP capture when the fallback is enabled. |
+
+Minimum versions are guidance; pin in your own `requirements.txt` for reproducible builds.
+
+---
+
+## Verifying PyPI artifacts (optional)
+
+Releases are published to PyPI via automation. To verify a wheel cryptographically when verifying identity bindings published by the project:
+
+```bash
+pip download egisai==0.10.0 --no-deps
+python -m sigstore verify identity \
+  --cert-identity-regexp "https://github.com/EgisLabs/egisai-sdk/.+" \
+  --cert-oidc-issuer "https://token.actions.githubusercontent.com" \
+  egisai-0.10.0-py3-none-any.whl
+```
+
+Adjust the version to match the release you installed. A CycloneDX SBOM is attached to GitHub releases for supply-chain review.
+
+---
+
+## Resources
+
+| Resource | URL |
+|----------|-----|
+| **Website** | [egisai.co](https://egisai.co) |
+| **Documentation** | [docs.egisai.co](https://docs.egisai.co) |
+| **Dashboard** | [app.egisai.co](https://app.egisai.co) |
+| **PyPI** | [pypi.org/project/egisai](https://pypi.org/project/egisai) |
+| **Repository & issues** | [github.com/EgisLabs/egisai-sdk](https://github.com/EgisLabs/egisai-sdk) |
+| **Changelog** | [CHANGELOG.md on GitHub](https://github.com/EgisLabs/egisai-sdk/blob/main/CHANGELOG.md) |
+| **Security** | [SECURITY.md on GitHub](https://github.com/EgisLabs/egisai-sdk/blob/main/SECURITY.md) |
+
+---
+
+## Licence
+
+Apache License 2.0 — see the [LICENSE file in the source repository](https://github.com/EgisLabs/egisai-sdk/blob/main/LICENSE).
+
+---
+
+**EgisAI** — runtime governance for AI agents.

@@ -1,0 +1,188 @@
+"""``egisai.init()`` and ``egisai.shutdown()``.
+
+Idempotent. Each process maintains its own SDK state.
+"""
+
+from __future__ import annotations
+
+import atexit
+import logging
+import os
+import threading
+from typing import Optional
+
+from egisai import __version__
+from egisai._backend import close_client, handshake
+from egisai._config import EgisaiConfig, get_config_optional, set_config, update_config
+from egisai._redact import redact_api_key
+from egisai._logger import start_worker as start_logger
+from egisai._logger import stop_worker as stop_logger
+from egisai._patches import anthropic as patch_anthropic
+from egisai._patches import google as patch_google
+from egisai._patches import http as patch_http
+from egisai._patches import openai as patch_openai
+from egisai._policy_cache import refresh_now
+from egisai._refresher import start_worker as start_refresher
+from egisai._refresher import stop_worker as stop_refresher
+
+LOGGER = logging.getLogger("egisai")
+
+_init_lock = threading.RLock()
+
+
+def init(
+    *,
+    api_key: Optional[str] = None,
+    app: str = "default",
+    env: str = "production",
+    base_url: Optional[str] = None,
+    on_block: str = "raise",
+    refresh_interval_seconds: float = 10.0,
+    enable_sse: bool = True,
+    enable_http_fallback: bool = True,
+    quiet: bool = False,
+) -> None:
+    """Activate egisai for the current process.
+
+    After this call returns, every supported AI library installed in the
+    environment is patched and will route through your platform-defined
+    policies before reaching the model. Decisions are logged to the
+    platform's audit trail asynchronously.
+
+    Parameters
+    ----------
+    api_key
+        Your platform API key (the one starting with ``egis_live_`` that
+        you created on the dashboard's API Keys page). If not provided,
+        falls back to the ``EGISAI_API_KEY`` environment variable.
+    app
+        Logical agent name. The platform auto-creates an Agent matching
+        this name in your org if one doesn't exist; subsequent calls
+        from this SDK instance are tied to it for auditing.
+    env
+        Free-form environment label (``"dev"``, ``"staging"``, ``"prod"``).
+    base_url
+        Override the platform URL. Defaults to ``EGISAI_BASE_URL`` or
+        ``https://app.egisai.co``. Only needed for self-hosted /
+        regional installs.
+    on_block
+        ``"raise"`` (default) — raise ``PermissionError`` when a policy
+        denies a call. ``"stub"`` — return a framework-shaped "blocked"
+        response so the agent keeps running.
+    refresh_interval_seconds
+        How often to poll for policy changes if SSE is unavailable.
+    enable_sse
+        Use Server-Sent Events for instant policy updates. Falls back to
+        polling on connection failure.
+    enable_http_fallback
+        Patch ``httpx`` / ``requests`` for HTTP-level audit visibility.
+    quiet
+        Suppress the one-line "egisai active" startup log.
+    """
+    with _init_lock:
+        existing = get_config_optional()
+        if existing is not None:
+            LOGGER.debug("egisai.init() called twice; ignoring (already initialized)")
+            return
+
+        api_key = api_key or os.getenv("EGISAI_API_KEY", "")
+        if not api_key:
+            raise RuntimeError(
+                "egisai.init() requires `api_key` or the EGISAI_API_KEY env var."
+            )
+        if on_block not in ("raise", "stub"):
+            raise ValueError(f"on_block must be 'raise' or 'stub', got {on_block!r}")
+
+        cfg = EgisaiConfig(
+            api_key=api_key,
+            app=app,
+            env=env,
+            base_url=base_url
+            or os.getenv("EGISAI_BASE_URL")
+            or "https://app.egisai.co",
+            on_block=on_block,  # type: ignore[arg-type]
+            refresh_interval_seconds=refresh_interval_seconds,
+            enable_sse=enable_sse,
+            enable_http_fallback=enable_http_fallback,
+            sdk_version=__version__,
+        )
+        set_config(cfg)
+
+        handshake_ok = False
+        try:
+            hs = handshake(app=app, env=env, sdk_version=__version__)
+            cfg = update_config(org_id=hs.get("org_id"), agent_id=hs.get("agent_id"))
+            handshake_ok = True
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"⚠  [egisai] handshake failed: {exc}\n"
+                f"   running in OFFLINE mode — no policies will be enforced.\n"
+                f"   api_key={redact_api_key(cfg.api_key)} "
+                f"base_url={cfg.base_url}",
+                flush=True,
+            )
+
+        rules_count = 0
+        if handshake_ok:
+            try:
+                refresh_now()
+                from egisai._policy_cache import get_rules
+
+                rules_count = len(get_rules())
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"⚠  [egisai] policy fetch failed: {exc}\n"
+                    f"   no policies will be enforced until next refresh.",
+                    flush=True,
+                )
+
+        enabled: list[str] = []
+        if patch_openai.apply():
+            enabled.append("openai")
+        if patch_anthropic.apply():
+            enabled.append("anthropic")
+        if patch_google.apply():
+            enabled.append("google.generativeai")
+        if enable_http_fallback and patch_http.apply():
+            enabled.append("httpx/requests")
+
+        start_logger()
+        start_refresher()
+        atexit.register(shutdown)
+
+        if not quiet:
+            integrations = ", ".join(enabled) if enabled else "none"
+            print(
+                f"✓ [egisai] active — app={cfg.app} env={cfg.env} "
+                f"on_block={cfg.on_block} integrations=[{integrations}] "
+                f"policies={rules_count}",
+                flush=True,
+            )
+            if rules_count == 0 and handshake_ok:
+                print(
+                    "   ⚠  no enabled policies in this org — every call will be allowed.\n"
+                    "      visit your dashboard → Policies → + New policy.",
+                    flush=True,
+                )
+
+
+def shutdown() -> None:
+    """Stop background workers and flush remaining events. Idempotent."""
+    try:
+        stop_refresher()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        stop_logger()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        close_client()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from egisai._evaluator import _close_semantic_blocker
+
+        _close_semantic_blocker()
+    except Exception:  # noqa: BLE001
+        pass
