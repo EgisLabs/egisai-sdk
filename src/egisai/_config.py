@@ -6,9 +6,10 @@ Set once by ``egisai.init()``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal
 
 OnBlock = Literal["raise", "stub"]
+OnOutage = Literal["allow", "block"]
 
 
 @dataclass(frozen=True)
@@ -23,13 +24,19 @@ class EgisaiConfig:
     flush_batch_size: int = 50
     enable_sse: bool = True
     enable_http_fallback: bool = True
-    sdk_version: str = "0.10.0"
+    sdk_version: str = "0.11.0"
     timeout_seconds: float = 10.0
-    org_id: Optional[str] = None
-    agent_id: Optional[str] = None
+    org_id: str | None = None
+    agent_id: str | None = None
+    # Behavior when the platform's semantic-guard judge is unreachable.
+    # "allow"  — fail open (default; matches pre-0.11 behavior).
+    # "block"  — fail closed; treat the call as if every semantic_guard
+    #            rule fired. Use when the operator considers Phase 2
+    #            checks the primary defense for that workload.
+    semantic_on_outage: OnOutage = "allow"
 
 
-_CONFIG: Optional[EgisaiConfig] = None
+_CONFIG: EgisaiConfig | None = None
 
 
 def set_config(cfg: EgisaiConfig) -> None:
@@ -43,7 +50,7 @@ def get_config() -> EgisaiConfig:
     return _CONFIG
 
 
-def get_config_optional() -> Optional[EgisaiConfig]:
+def get_config_optional() -> EgisaiConfig | None:
     return _CONFIG
 
 
@@ -67,6 +74,7 @@ def update_config(**fields: object) -> EgisaiConfig:
         "timeout_seconds": _CONFIG.timeout_seconds,
         "org_id": _CONFIG.org_id,
         "agent_id": _CONFIG.agent_id,
+        "semantic_on_outage": _CONFIG.semantic_on_outage,
     }
     base.update(fields)
     new = EgisaiConfig(**base)  # type: ignore[arg-type]

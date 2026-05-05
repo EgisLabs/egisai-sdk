@@ -6,9 +6,11 @@ Targets ``anthropic.resources.messages.Messages.create`` (and async sibling).
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from egisai._evaluator import extract_anthropic_prompt
+from egisai._output_signals import extract_anthropic
 from egisai._patches import has_module
 from egisai._patches._common import async_gate_call, gate_call
 from egisai.policy import PolicyDecision
@@ -76,10 +78,11 @@ def _wrap_messages_create(orig: Callable[..., Any], is_async: bool) -> Callable[
                 payload={"messages": messages, "system": system, "tools": kwargs.get("tools")},
                 stub_factory=_stub_message,
                 extract_usage=_extract_message_usage,
+                extract_output_signals=extract_anthropic,
                 forward=lambda: orig(self, *args, **kwargs),
             )
 
-        setattr(aw, "__egisai_wrapped__", True)
+        aw.__egisai_wrapped__ = True  # type: ignore[attr-defined]
         return aw
 
     def w(self, *args, **kwargs):  # type: ignore[no-untyped-def]
@@ -96,10 +99,11 @@ def _wrap_messages_create(orig: Callable[..., Any], is_async: bool) -> Callable[
             payload={"messages": messages, "system": system, "tools": kwargs.get("tools")},
             stub_factory=_stub_message,
             extract_usage=_extract_message_usage,
+            extract_output_signals=extract_anthropic,
             forward=lambda: orig(self, *args, **kwargs),
         )
 
-    setattr(w, "__egisai_wrapped__", True)
+    w.__egisai_wrapped__ = True  # type: ignore[attr-defined]
     return w
 
 
@@ -116,7 +120,7 @@ def _patch_class(module_path: str, attr: str, *, is_async: bool) -> bool:
         return False
     if getattr(orig, "__egisai_wrapped__", False):
         return True
-    setattr(cls, "create", _wrap_messages_create(orig, is_async=is_async))
+    cls.create = _wrap_messages_create(orig, is_async=is_async)
     return True
 
 

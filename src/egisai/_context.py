@@ -14,23 +14,22 @@ import logging
 import threading
 import uuid
 from dataclasses import dataclass
-from typing import Optional
 
 LOGGER = logging.getLogger("egisai.context")
 
 
 @dataclass(frozen=True)
 class EgisaiContext:
-    user_id: Optional[str] = None
-    user_role: Optional[str] = None
-    agent_id: Optional[str] = None
-    agent_name: Optional[str] = None
-    session_id: Optional[str] = None
-    workflow_id: Optional[str] = None
+    user_id: str | None = None
+    user_role: str | None = None
+    agent_id: str | None = None
+    agent_name: str | None = None
+    session_id: str | None = None
+    workflow_id: str | None = None
 
 
 _ctx: contextvars.ContextVar[EgisaiContext] = contextvars.ContextVar(
-    "egisai_ctx", default=EgisaiContext()
+    "egisai_ctx", default=EgisaiContext()  # noqa: B039 — frozen dataclass is immutable
 )
 _trace_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "egisai_trace", default=""
@@ -51,7 +50,7 @@ _agent_id_cache: dict[str, str] = {}
 _agent_cache_lock = threading.Lock()
 
 
-def _resolve_agent_id(name: str) -> Optional[str]:
+def _resolve_agent_id(name: str) -> str | None:
     """Get-or-fetch the platform agent_id for a role name.
 
     Returns ``None`` on failure or when the SDK isn't initialised
@@ -84,28 +83,25 @@ def _resolve_agent_id(name: str) -> Optional[str]:
                 _agent_id_cache[name] = agent_id
                 created = bool(payload.get("created"))
                 if created:
-                    print(
-                        f"✓ [egisai] registered sub-agent {name!r} "
-                        f"(id={agent_id[:8]}…) — visible on dashboard now",
-                        flush=True,
+                    LOGGER.info(
+                        "[egisai] registered sub-agent %r (id=%s…) — "
+                        "visible on dashboard now",
+                        name,
+                        agent_id[:8],
                     )
                 else:
-                    print(
-                        f"✓ [egisai] resolved sub-agent {name!r} "
-                        f"(id={agent_id[:8]}…)",
-                        flush=True,
+                    LOGGER.debug(
+                        "[egisai] resolved sub-agent %r (id=%s…)",
+                        name,
+                        agent_id[:8],
                     )
                 return agent_id
         except Exception as exc:  # noqa: BLE001
-            print(
-                f"⚠  [egisai] could not register sub-agent {name!r}: {exc}\n"
-                f"   events for this call will be attributed to the main "
-                f"agent.",
-                flush=True,
-            )
             LOGGER.warning(
-                "egisai: ensure_agent(%r) failed",
+                "[egisai] could not register sub-agent %r: %s — events "
+                "for this call will be attributed to the main agent",
                 name,
+                exc,
                 exc_info=True,
             )
         return None
@@ -113,12 +109,12 @@ def _resolve_agent_id(name: str) -> Optional[str]:
 
 def set_context(
     *,
-    user_id: Optional[str] = None,
-    user_role: Optional[str] = None,
-    agent: Optional[str] = None,
-    agent_id: Optional[str] = None,
-    session_id: Optional[str] = None,
-    workflow_id: Optional[str] = None,
+    user_id: str | None = None,
+    user_role: str | None = None,
+    agent: str | None = None,
+    agent_id: str | None = None,
+    session_id: str | None = None,
+    workflow_id: str | None = None,
 ) -> None:
     """Attach request-level metadata to all subsequent governed calls.
 

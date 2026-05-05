@@ -10,7 +10,6 @@ nothing.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from egisai._context import get_policy_checked
 from egisai._events import build_event
@@ -65,7 +64,7 @@ def _patch_requests() -> bool:
             pass
         return orig(self, method, url, **kwargs)
 
-    setattr(wrapped, "__egisai_wrapped__", True)
+    wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]
     Session.request = wrapped  # type: ignore[assignment]
     return True
 
@@ -100,7 +99,7 @@ def _patch_httpx() -> bool:
             pass
         return orig(self, method, url, **kwargs)
 
-    setattr(wrapped, "__egisai_wrapped__", True)
+    wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]
     httpx.Client.request = wrapped  # type: ignore[assignment]
     return True
 

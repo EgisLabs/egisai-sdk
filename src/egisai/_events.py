@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any
 
 from egisai._config import get_config
 from egisai._context import ensure_trace_id, get_context
@@ -31,7 +31,7 @@ def build_event(
     source: str,
     target: str,
     payload: Any,
-    model: Optional[str] = None,
+    model: str | None = None,
     stream: bool = False,
 ) -> dict[str, Any]:
     """Construct a base event for governance + logging.

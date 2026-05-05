@@ -1,0 +1,145 @@
+name: Release
+
+# Triggered by pushing a tag matching ``v*`` (e.g. ``v0.11.0``).
+# Builds the wheel + sdist, signs the artefacts with sigstore, and
+# publishes to PyPI via the trusted-publisher OIDC flow — no
+# long-lived API tokens.
+#
+# One-time setup checklist:
+#   1. On PyPI, configure the trusted publisher for ``egisai`` to
+#      this repository's release workflow + the ``pypi`` environment.
+#   2. Create the ``pypi`` environment in GitHub repo settings with
+#      required reviewers so a release can't ship without approval.
+#   3. Tag the release: ``git tag v0.11.0 && git push --tags``.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest -q
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Read version from tag
+        id: read-version
+        # Tag format ``v0.11.0`` → version ``0.11.0``.
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify pyproject version matches tag
+        run: |
+          PYPROJECT_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          TAG_VERSION="${{ steps.read-version.outputs.version }}"
+          if [ "$PYPROJECT_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::pyproject.toml version ($PYPROJECT_VERSION) does not match tag ($TAG_VERSION)"
+            exit 1
+          fi
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Upload distribution artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  sign:
+    # Sigstore-sign the wheel + sdist via OIDC. The signature
+    # certificate is bound to this workflow's GitHub OIDC identity,
+    # so customers can verify the wheel was built from this repo's
+    # tagged commit — no private key on our side.
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: sigstore/[email protected]
+        with:
+          inputs: |
+            ./dist/*.whl
+            ./dist/*.tar.gz
+          upload-signing-artifacts: true
+
+  publish:
+    needs: sign
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/egisai
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true
+
+  attach-to-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Attach artefacts to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+          generate_release_notes: true

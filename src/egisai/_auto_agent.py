@@ -19,7 +19,7 @@ import hashlib
 import logging
 import re
 import threading
-from typing import Any, Optional
+from typing import Any
 
 LOGGER = logging.getLogger("egisai.auto_agent")
 
@@ -79,13 +79,17 @@ def _system_text(payload: Any, messages: Any) -> str:
     return ""
 
 
-def derive_identity(payload: Any, messages: Any) -> Optional[tuple[str, str]]:
+def derive_identity(payload: Any, messages: Any) -> tuple[str, str] | None:
     """Return ``(identity_hash, display_name)``, or ``None`` if no system prompt."""
     system = _system_text(payload, messages)
     if not system:
         return None
 
-    digest = hashlib.sha1(system.encode("utf-8")).hexdigest()  # noqa: S324
+    # SHA-256 is used here purely as a stable bucket key for grouping
+    # calls that share a system prompt. It is not used for authentication
+    # or integrity. We picked SHA-256 over a faster non-cryptographic
+    # hash so security reviewers don't have to ask why we're using SHA-1.
+    digest = hashlib.sha256(system.encode("utf-8")).hexdigest()
 
     name: str | None = None
     for pat in _NAME_PATTERNS:
@@ -102,7 +106,7 @@ def derive_identity(payload: Any, messages: Any) -> Optional[tuple[str, str]]:
     return digest, name
 
 
-def resolve_agent_id(identity_hash: str, display_name: str) -> Optional[str]:
+def resolve_agent_id(identity_hash: str, display_name: str) -> str | None:
     """Look up or lazily register the agent id for this identity.
 
     Cached for the lifetime of the process. Failures degrade
@@ -132,10 +136,11 @@ def resolve_agent_id(identity_hash: str, display_name: str) -> Optional[str]:
             if isinstance(agent_id, str) and agent_id:
                 _id_cache[identity_hash] = agent_id
                 if payload.get("created"):
-                    print(
-                        f"✓ [egisai] auto-registered agent {display_name!r} "
-                        f"(id={agent_id[:8]}…) — now visible on dashboard",
-                        flush=True,
+                    LOGGER.info(
+                        "[egisai] auto-registered agent %r (id=%s…) — "
+                        "now visible on dashboard",
+                        display_name,
+                        agent_id[:8],
                     )
                 return agent_id
         except Exception as exc:  # noqa: BLE001

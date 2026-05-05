@@ -6,11 +6,9 @@ falls back to ETag polling when SSE is disabled or disconnects.
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
-from typing import Optional
 
 import httpx
 
@@ -20,7 +18,7 @@ from egisai._policy_cache import refresh_now
 
 LOGGER = logging.getLogger("egisai.refresher")
 
-_thread: Optional[threading.Thread] = None
+_thread: threading.Thread | None = None
 _stop_event = threading.Event()
 
 
@@ -77,12 +75,16 @@ def _sse_listen_loop() -> None:
 
 
 def _handle_sse(event_name: str, data: str) -> None:
+    """React to one server-sent event.
+
+    Only ``policy.*`` events trigger a refresh. The data payload is
+    treated as an opaque trigger — the actual policy snapshot is
+    pulled by ``refresh_now()`` so we always hit the cache-aware
+    ETag path on the server.
+    """
     if not event_name.startswith("policy."):
         return
-    try:
-        json.loads(data)
-    except Exception:  # noqa: BLE001
-        pass
+    _ = data  # opaque trigger; refresh_now() handles cache validation
     try:
         refresh_now()
     except Exception:  # noqa: BLE001

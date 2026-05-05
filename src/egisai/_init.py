@@ -9,12 +9,10 @@ import atexit
 import logging
 import os
 import threading
-from typing import Optional
 
 from egisai import __version__
 from egisai._backend import close_client, handshake
 from egisai._config import EgisaiConfig, get_config_optional, set_config, update_config
-from egisai._redact import redact_api_key
 from egisai._logger import start_worker as start_logger
 from egisai._logger import stop_worker as stop_logger
 from egisai._patches import anthropic as patch_anthropic
@@ -22,6 +20,7 @@ from egisai._patches import google as patch_google
 from egisai._patches import http as patch_http
 from egisai._patches import openai as patch_openai
 from egisai._policy_cache import refresh_now
+from egisai._redact import redact_api_key
 from egisai._refresher import start_worker as start_refresher
 from egisai._refresher import stop_worker as stop_refresher
 
@@ -32,11 +31,12 @@ _init_lock = threading.RLock()
 
 def init(
     *,
-    api_key: Optional[str] = None,
+    api_key: str | None = None,
     app: str = "default",
     env: str = "production",
-    base_url: Optional[str] = None,
+    base_url: str | None = None,
     on_block: str = "raise",
+    semantic_on_outage: str = "allow",
     refresh_interval_seconds: float = 10.0,
     enable_sse: bool = True,
     enable_http_fallback: bool = True,
@@ -69,6 +69,13 @@ def init(
         ``"raise"`` (default) — raise ``PermissionError`` when a policy
         denies a call. ``"stub"`` — return a framework-shaped "blocked"
         response so the agent keeps running.
+    semantic_on_outage
+        Behavior when the semantic-guard judge cannot be reached.
+        ``"allow"`` (default, fail-open) treats the rule as a no-op so
+        availability of the primary call path is preserved. ``"block"``
+        (fail-closed) refuses the call when the judge is unreachable —
+        appropriate when an operator considers Phase 2 their primary
+        defense for that workload.
     refresh_interval_seconds
         How often to poll for policy changes if SSE is unavailable.
     enable_sse
@@ -92,6 +99,11 @@ def init(
             )
         if on_block not in ("raise", "stub"):
             raise ValueError(f"on_block must be 'raise' or 'stub', got {on_block!r}")
+        if semantic_on_outage not in ("allow", "block"):
+            raise ValueError(
+                f"semantic_on_outage must be 'allow' or 'block', "
+                f"got {semantic_on_outage!r}"
+            )
 
         cfg = EgisaiConfig(
             api_key=api_key,
@@ -101,6 +113,7 @@ def init(
             or os.getenv("EGISAI_BASE_URL")
             or "https://app.egisai.co",
             on_block=on_block,  # type: ignore[arg-type]
+            semantic_on_outage=semantic_on_outage,  # type: ignore[arg-type]
             refresh_interval_seconds=refresh_interval_seconds,
             enable_sse=enable_sse,
             enable_http_fallback=enable_http_fallback,
@@ -114,12 +127,12 @@ def init(
             cfg = update_config(org_id=hs.get("org_id"), agent_id=hs.get("agent_id"))
             handshake_ok = True
         except Exception as exc:  # noqa: BLE001
-            print(
-                f"⚠  [egisai] handshake failed: {exc}\n"
-                f"   running in OFFLINE mode — no policies will be enforced.\n"
-                f"   api_key={redact_api_key(cfg.api_key)} "
-                f"base_url={cfg.base_url}",
-                flush=True,
+            LOGGER.warning(
+                "[egisai] handshake failed: %s — running in OFFLINE mode "
+                "(no policies will be enforced) api_key=%s base_url=%s",
+                exc,
+                redact_api_key(cfg.api_key),
+                cfg.base_url,
             )
 
         rules_count = 0
@@ -130,10 +143,10 @@ def init(
 
                 rules_count = len(get_rules())
             except Exception as exc:  # noqa: BLE001
-                print(
-                    f"⚠  [egisai] policy fetch failed: {exc}\n"
-                    f"   no policies will be enforced until next refresh.",
-                    flush=True,
+                LOGGER.warning(
+                    "[egisai] policy fetch failed: %s — no policies will be "
+                    "enforced until next refresh",
+                    exc,
                 )
 
         enabled: list[str] = []
@@ -186,3 +199,46 @@ def shutdown() -> None:
         _close_semantic_blocker()
     except Exception:  # noqa: BLE001
         pass
+
+
+def diagnostics() -> dict[str, object]:
+    """Return a JSON-serializable snapshot of SDK runtime health.
+
+    Suitable for surfacing in dashboards or ``/healthz`` endpoints.
+    The keys are stable across patch releases:
+
+    * ``initialized`` — whether ``init()`` has run.
+    * ``sdk_version`` — version string of this SDK install.
+    * ``app`` / ``env`` — process-wide config.
+    * ``policy_etag`` — opaque cache version of the current rule set.
+    * ``policy_rule_count`` — number of cached rules currently active.
+    * ``audit_queue_size`` — pending audit events not yet flushed.
+    * ``audit_dropped_total`` — events dropped due to queue overflow.
+    """
+    cfg = get_config_optional()
+    if cfg is None:
+        return {"initialized": False, "sdk_version": __version__}
+
+    try:
+        from egisai._logger import get_dropped_total, queue_size
+        from egisai._policy_cache import get_etag, get_rules
+
+        return {
+            "initialized": True,
+            "sdk_version": __version__,
+            "app": cfg.app,
+            "env": cfg.env,
+            "base_url": cfg.base_url,
+            "on_block": cfg.on_block,
+            "semantic_on_outage": cfg.semantic_on_outage,
+            "policy_etag": get_etag(),
+            "policy_rule_count": len(get_rules()),
+            "audit_queue_size": queue_size(),
+            "audit_dropped_total": get_dropped_total(),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "initialized": True,
+            "sdk_version": __version__,
+            "diagnostics_error": exc.__class__.__name__,
+        }

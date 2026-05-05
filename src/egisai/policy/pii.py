@@ -32,6 +32,47 @@ _CONTEXT_KEYWORDS: dict[str, list[str]] = {
 _CONTEXT_WINDOW = 60  # chars to look around a match for context keywords
 
 
+# ── Reserved / placeholder email domains ────────────────────────────
+#
+# Email addresses landing on these domains are treated as documentation
+# and test fixtures rather than real PII. Two sets:
+#
+# * ``_RFC_RESERVED_EMAIL_TLDS`` and ``_RFC_RESERVED_EMAIL_SLDS`` come
+#   straight from RFC 2606 §3 / RFC 6761 §6 and are guaranteed never to
+#   resolve. Skipping them avoids false positives on every code sample
+#   that uses ``user@example.com`` style addresses.
+#
+# * ``_PLACEHOLDER_EMAIL_DOMAINS`` is a small list of widely-used
+#   placeholder domains that aren't covered by the RFCs but show up in
+#   docs, tutorials, and form auto-fill data so often that flagging
+#   them is more noise than signal.
+_RFC_RESERVED_EMAIL_TLDS: frozenset[str] = frozenset(
+    {".test", ".example", ".invalid", ".localhost"}
+)
+_RFC_RESERVED_EMAIL_SLDS: frozenset[str] = frozenset(
+    {"example.com", "example.net", "example.org"}
+)
+_PLACEHOLDER_EMAIL_DOMAINS: frozenset[str] = frozenset({"test.com"})
+
+
+def _is_reserved_email_domain(domain: str) -> bool:
+    """Return True if ``domain`` is RFC-reserved or a known placeholder.
+
+    Case-insensitive. ``endswith`` covers any subdomain beneath a
+    reserved TLD (e.g. ``api.example.invalid``).
+    """
+    if not domain:
+        return False
+    d = domain.lower().strip()
+    if d == "localhost":
+        return True
+    if d in _RFC_RESERVED_EMAIL_SLDS or d in _PLACEHOLDER_EMAIL_DOMAINS:
+        return True
+    if any(d.endswith(tld) for tld in _RFC_RESERVED_EMAIL_TLDS):
+        return True
+    return False
+
+
 @dataclass(frozen=True)
 class PIIFinding:
     kind: str            # "credit_card", "ssn", "api_key", etc.
@@ -223,8 +264,8 @@ def label_redact(text: str, kinds: list[str] | None = None) -> str:
 
     if kind_filter is None or "email" in kind_filter:
         def _email_repl(m: re.Match[str]) -> str:
-            domain = m.group(0).rsplit("@", 1)[1].lower()
-            if domain in ("example.com", "example.org", "test.com", "localhost"):
+            domain = m.group(0).rsplit("@", 1)[1]
+            if _is_reserved_email_domain(domain):
                 return m.group(0)
             return _LABEL_FOR_KIND["email"]
         text = _EMAIL_RE.sub(_email_repl, text)
@@ -341,8 +382,8 @@ def sanitize(
 
     if kind_filter is None or "email" in kind_filter:
         def _email_repl(m: re.Match[str]) -> str:
-            domain = m.group(0).rsplit("@", 1)[1].lower()
-            if domain in ("example.com", "example.org", "test.com", "localhost"):
+            domain = m.group(0).rsplit("@", 1)[1]
+            if _is_reserved_email_domain(domain):
                 return m.group(0)
             rendered = _WORD_PLACEHOLDERS["email"]
             _bump("email", rendered)
@@ -544,7 +585,7 @@ def _scan_emails(text: str) -> list[PIIFinding]:
     for match in _EMAIL_RE.finditer(text):
         raw = match.group()
         local, domain = raw.rsplit("@", 1)
-        if domain.lower() in ("example.com", "example.org", "test.com", "localhost"):
+        if _is_reserved_email_domain(domain):
             continue
         confidence = 0.80
         confidence += _context_boost(text, match.start(), match.end(), "email")

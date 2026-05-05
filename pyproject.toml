@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "egisai"
-version = "0.10.0"
+version = "0.11.0"
 description = "Native runtime governance SDK for AI agents — import egisai; egisai.init() and you're protected."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -63,6 +63,10 @@ dependencies = [
 # wire format is much more stable than the SDK wrapper.
 openai = ["openai>=1.40.0"]
 anthropic = ["anthropic>=0.40.0"]
+# google.generativeai is upstream-deprecated in favor of google.genai.
+# We continue to govern apps that still use it; teams already on the
+# new client are governed via the httpx fallback patcher today, with
+# first-class google.genai support on the roadmap.
 google = ["google-generativeai>=0.8.0"]
 all = [
   "openai>=1.40.0",

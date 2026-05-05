@@ -12,7 +12,7 @@ import logging
 import queue
 import threading
 import time
-from typing import Any, Optional
+from typing import Any
 
 from egisai._backend import post_events
 from egisai._config import get_config
@@ -21,29 +21,74 @@ LOGGER = logging.getLogger("egisai.logger")
 
 _QUEUE_MAX = 5000
 
-_q: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=_QUEUE_MAX)
-_thread: Optional[threading.Thread] = None
+_q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=_QUEUE_MAX)
+_thread: threading.Thread | None = None
 _stop_event = threading.Event()
+
+# Counters for ``egisai.diagnostics()``. Lossy-on-overflow is part of
+# the contract — bounded memory matters more than perfect audit
+# completeness during a multi-hour platform outage — but the customer
+# needs a way to *see* that drops happened so they can scale up the
+# queue or investigate the outage.
+_dropped_total: int = 0
+_dropped_lock = threading.Lock()
 
 
 def enqueue(event: dict[str, Any]) -> None:
     """Drop an event onto the flush queue. Never blocks the caller.
 
     Strips ``payload`` and any underscore-prefixed keys before
-    queueing — only previewable, audit-safe fields ship.
+    queueing — only previewable, audit-safe fields ship. When the
+    queue is full, the oldest pending event is discarded so the
+    most recent decision is always preserved (and the global drop
+    counter exposed via :func:`egisai.diagnostics` is incremented).
     """
+    global _dropped_total
     safe = {
         k: v for k, v in event.items()
         if k != "payload" and not (isinstance(k, str) and k.startswith("_"))
     }
     try:
         _q.put_nowait(safe)
+        return
     except queue.Full:
-        try:
-            _q.get_nowait()
-            _q.put_nowait(safe)
-        except queue.Empty:
-            pass
+        pass
+
+    dropped = False
+    try:
+        _q.get_nowait()
+        dropped = True
+    except queue.Empty:
+        pass
+    try:
+        _q.put_nowait(safe)
+    except queue.Full:
+        dropped = True
+
+    if dropped:
+        with _dropped_lock:
+            _dropped_total += 1
+        # Single-line warn so a long outage doesn't flood the log.
+        if _dropped_total in (1, 10, 100, 1000) or _dropped_total % 1000 == 0:
+            LOGGER.warning(
+                "[egisai] audit queue full — %d event(s) dropped so far. "
+                "platform_unreachable=%s",
+                _dropped_total,
+                _q.qsize() == _QUEUE_MAX,
+            )
+
+
+def get_dropped_total() -> int:
+    """Total number of audit events dropped since process start."""
+    with _dropped_lock:
+        return _dropped_total
+
+
+def reset_dropped_total() -> None:
+    """Reset the drop counter (used in tests)."""
+    global _dropped_total
+    with _dropped_lock:
+        _dropped_total = 0
 
 
 def _drain(max_items: int) -> list[dict[str, Any]]:

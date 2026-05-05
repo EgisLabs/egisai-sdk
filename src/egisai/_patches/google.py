@@ -1,15 +1,25 @@
 """Google Generative AI (Gemini) patcher.
 
-Targets ``google.generativeai.GenerativeModel.generate_content`` and the
-async sibling ``generate_content_async``.
+Targets ``google.generativeai.GenerativeModel.generate_content`` and
+the async sibling ``generate_content_async``.
+
+.. deprecated::
+   Google's ``google.generativeai`` package is being replaced by
+   ``google.genai`` (`google-genai` on PyPI). This module continues
+   to govern apps that still use the legacy package. Apps already on
+   ``google.genai`` are governed via the ``httpx`` fallback patcher
+   today; first-class ``google.genai`` support is on the roadmap
+   for a future minor release.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from egisai._evaluator import extract_gemini_prompt
+from egisai._output_signals import extract_google
 from egisai._patches import has_module
 from egisai._patches._common import async_gate_call, gate_call
 from egisai.policy import PolicyDecision
@@ -79,10 +89,11 @@ def _wrap_generate(orig: Callable[..., Any], is_async: bool) -> Callable[..., An
                 payload={"contents": contents, "tools": kwargs.get("tools")},
                 stub_factory=_stub_response,
                 extract_usage=_extract_gemini_usage,
+                extract_output_signals=extract_google,
                 forward=lambda: orig(self, contents, *args, **kwargs),
             )
 
-        setattr(aw, "__egisai_wrapped__", True)
+        aw.__egisai_wrapped__ = True  # type: ignore[attr-defined]
         return aw
 
     def w(self, contents, *args, **kwargs):  # type: ignore[no-untyped-def]
@@ -97,10 +108,11 @@ def _wrap_generate(orig: Callable[..., Any], is_async: bool) -> Callable[..., An
             payload={"contents": contents, "tools": kwargs.get("tools")},
             stub_factory=_stub_response,
             extract_usage=_extract_gemini_usage,
+            extract_output_signals=extract_google,
             forward=lambda: orig(self, contents, *args, **kwargs),
         )
 
-    setattr(w, "__egisai_wrapped__", True)
+    w.__egisai_wrapped__ = True  # type: ignore[attr-defined]
     return w
 
 

@@ -14,10 +14,10 @@ plus an httpx / requests fallback.
 
 from __future__ import annotations
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 from egisai._context import set_context
-from egisai._init import init, shutdown
+from egisai._init import diagnostics, init, shutdown
 from egisai.policy import (
     OutputPolicyContext,
     PolicyContext,
@@ -33,6 +33,7 @@ __all__ = [
     "PolicyDecision",
     "PolicyRule",
     "__version__",
+    "diagnostics",
     "evaluate_output_policies",
     "evaluate_policies",
     "init",

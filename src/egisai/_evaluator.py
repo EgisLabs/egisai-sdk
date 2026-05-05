@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any
 
 from egisai._config import get_config_optional
 from egisai._context import get_context
@@ -83,6 +84,7 @@ def _get_semantic_blocker() -> SemanticBlocker | None:
             _blocker = SemanticBlocker(
                 platform_api_key=cfg.api_key,
                 platform_base_url=cfg.base_url,
+                on_outage=cfg.semantic_on_outage,
             )
     return _blocker
 
@@ -108,7 +110,7 @@ class InputCall:
     model: str
     prompt_text: str
     stream: bool = False
-    tenant: Optional[str] = None
+    tenant: str | None = None
 
 
 @dataclass(frozen=True)
@@ -121,7 +123,7 @@ class OutputCall:
     tool_calls: list[dict]
     mcp_targets: list[str]
     stream: bool = False
-    tenant: Optional[str] = None
+    tenant: str | None = None
 
 
 def evaluate(call: InputCall) -> PolicyDecision:

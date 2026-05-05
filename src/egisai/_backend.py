@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Callable, Optional, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 import httpx
 
@@ -63,7 +64,7 @@ def _retry_on_429(
     return last  # type: ignore[return-value]
 
 
-_client: Optional[httpx.Client] = None
+_client: httpx.Client | None = None
 
 
 def get_client() -> httpx.Client:
@@ -108,7 +109,7 @@ def handshake(*, app: str, env: str, sdk_version: str) -> dict[str, Any]:
     return r.json()
 
 
-def fetch_policies(etag: Optional[str] = None) -> tuple[Optional[str], Optional[list[dict]]]:
+def fetch_policies(etag: str | None = None) -> tuple[str | None, list[dict] | None]:
     """Returns ``(new_etag, rules)``. ``rules`` is ``None`` on 304."""
     headers: dict[str, str] = {}
     if etag:
@@ -125,7 +126,7 @@ def fetch_policies(etag: Optional[str] = None) -> tuple[Optional[str], Optional[
     return body.get("etag"), body.get("rules", [])
 
 
-def ensure_agent(*, name: str, description: Optional[str] = None) -> dict[str, Any]:
+def ensure_agent(*, name: str, description: str | None = None) -> dict[str, Any]:
     """Find-or-create an agent in the caller's org by name. Idempotent."""
     payload: dict[str, Any] = {"name": name}
     if description:

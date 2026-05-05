@@ -7,13 +7,12 @@ updates it when the platform signals a change.
 from __future__ import annotations
 
 import threading
-from typing import Optional
 
 from egisai._backend import fetch_policies
 from egisai.policy import PolicyRule
 
 _lock = threading.RLock()
-_etag: Optional[str] = None
+_etag: str | None = None
 _rules: list[PolicyRule] = []
 
 
@@ -50,12 +49,12 @@ def get_rules() -> list[PolicyRule]:
         return list(_rules)
 
 
-def get_etag() -> Optional[str]:
+def get_etag() -> str | None:
     with _lock:
         return _etag
 
 
-def replace_rules(new_etag: Optional[str], raw_rules: list[dict]) -> int:
+def replace_rules(new_etag: str | None, raw_rules: list[dict]) -> int:
     """Replace the cache atomically. Returns the new rule count."""
     with _lock:
         global _etag, _rules

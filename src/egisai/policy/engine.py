@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from egisai.policy import pii as pii_scanner
 from egisai.policy._regex_safe import safe_search
@@ -25,10 +25,10 @@ class PolicyRule:
     "applies to every agent".
     """
 
-    id: Optional[str]
+    id: str | None
     name: str
     type: str
-    tenant: Optional[str]
+    tenant: str | None
     config: dict[str, Any]
     agent_ids: tuple[str, ...] = field(default=())
 
@@ -90,15 +90,15 @@ class PolicyDecision:
     ``matched_policies`` is the full ordered list of rules that fired.
     """
     verdict: str
-    reason_code: Optional[str]
-    message: Optional[str]
-    matched_policy: Optional[str]
+    reason_code: str | None
+    message: str | None
+    matched_policy: str | None
     matched_policies: tuple[MatchedPolicyRecord, ...] = ()
     sanitize_kinds: list[str] = field(default_factory=list)
     sanitize_mask_char: str = "#"
 
     @classmethod
-    def allow(cls) -> "PolicyDecision":
+    def allow(cls) -> PolicyDecision:
         return cls(
             verdict="allow",
             reason_code=None,
@@ -114,7 +114,7 @@ class PolicyDecision:
         message: str,
         matched_policy: str,
         matched_policies: tuple[MatchedPolicyRecord, ...] = (),
-    ) -> "PolicyDecision":
+    ) -> PolicyDecision:
         return cls(
             verdict="block",
             reason_code=reason_code,
@@ -133,7 +133,7 @@ class PolicyDecision:
         matched_policy: str,
         mask_char: str = "#",
         matched_policies: tuple[MatchedPolicyRecord, ...] = (),
-    ) -> "PolicyDecision":
+    ) -> PolicyDecision:
         """The call should forward, but with these PII kinds masked."""
         return cls(
             verdict="sanitize",
@@ -257,7 +257,7 @@ def _evaluate_one_input_policy(
     policy: PolicyRule,
     context: PolicyContext,
     semantic_blocker: SemanticBlocker | None,
-) -> Optional[MatchedPolicyRecord]:
+) -> MatchedPolicyRecord | None:
     if policy.type == "allow_model":
         allowed_models = policy.config.get("models", [])
         if isinstance(allowed_models, list) and context.model not in allowed_models:
@@ -410,7 +410,7 @@ def _semantic_guard_match(
     text: str,
     semantic_blocker: SemanticBlocker | None,
     side: str,
-) -> Optional[MatchedPolicyRecord]:
+) -> MatchedPolicyRecord | None:
     """Returns a block record when the judge flags the text, else ``None``.
 
     With no live ``SemanticBlocker`` the rule is a no-op — there's
@@ -459,7 +459,7 @@ def _evaluate_one_output_policy(
     policy: PolicyRule,
     context: OutputPolicyContext,
     semantic_blocker: SemanticBlocker | None,
-) -> Optional[MatchedPolicyRecord]:
+) -> MatchedPolicyRecord | None:
     if policy.type == "deny_output_regex":
         pattern = policy.config.get("pattern")
         if isinstance(pattern, str):

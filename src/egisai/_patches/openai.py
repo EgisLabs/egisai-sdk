@@ -7,9 +7,11 @@ legacy v0 ``openai.ChatCompletion.create`` path.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from egisai._evaluator import extract_prompt_text
+from egisai._output_signals import extract_openai_chat, extract_openai_responses
 from egisai._patches import has_module
 from egisai._patches._common import async_gate_call, gate_call
 from egisai.policy import PolicyDecision
@@ -114,10 +116,11 @@ def _wrap_create_chat(orig: Callable[..., Any], is_async: bool) -> Callable[...,
                 payload={"messages": messages, "tools": kwargs.get("tools")},
                 stub_factory=_stub_chat_completion,
                 extract_usage=_extract_chat_usage,
+                extract_output_signals=extract_openai_chat,
                 forward=lambda: orig(self, *args, **kwargs),
             )
 
-        setattr(aw, "__egisai_wrapped__", True)
+        aw.__egisai_wrapped__ = True  # type: ignore[attr-defined]
         return aw
 
     def w(self, *args, **kwargs):  # type: ignore[no-untyped-def]
@@ -133,10 +136,11 @@ def _wrap_create_chat(orig: Callable[..., Any], is_async: bool) -> Callable[...,
             payload={"messages": messages, "tools": kwargs.get("tools")},
             stub_factory=_stub_chat_completion,
             extract_usage=_extract_chat_usage,
+            extract_output_signals=extract_openai_chat,
             forward=lambda: orig(self, *args, **kwargs),
         )
 
-    setattr(w, "__egisai_wrapped__", True)
+    w.__egisai_wrapped__ = True  # type: ignore[attr-defined]
     return w
 
 
@@ -157,10 +161,11 @@ def _wrap_create_responses(orig: Callable[..., Any], is_async: bool) -> Callable
                 payload={"input": inp, "tools": kwargs.get("tools")},
                 stub_factory=_stub_response,
                 extract_usage=_extract_responses_usage,
+                extract_output_signals=extract_openai_responses,
                 forward=lambda: orig(self, *args, **kwargs),
             )
 
-        setattr(aw, "__egisai_wrapped__", True)
+        aw.__egisai_wrapped__ = True  # type: ignore[attr-defined]
         return aw
 
     def w(self, *args, **kwargs):  # type: ignore[no-untyped-def]
@@ -176,10 +181,11 @@ def _wrap_create_responses(orig: Callable[..., Any], is_async: bool) -> Callable
             payload={"input": inp, "tools": kwargs.get("tools")},
             stub_factory=_stub_response,
             extract_usage=_extract_responses_usage,
+            extract_output_signals=extract_openai_responses,
             forward=lambda: orig(self, *args, **kwargs),
         )
 
-    setattr(w, "__egisai_wrapped__", True)
+    w.__egisai_wrapped__ = True  # type: ignore[attr-defined]
     return w
 
 
@@ -202,7 +208,7 @@ def _patch_class(module_path: str, attr: str, *, is_async: bool, kind: str) -> b
         wrapped = _wrap_create_responses(orig, is_async=is_async)
     else:
         return False
-    setattr(cls, "create", wrapped)
+    cls.create = wrapped
     return True
 
 
@@ -220,7 +226,7 @@ def apply() -> bool:
         any_patched = True
 
     try:
-        import openai  # noqa: WPS433
+        import openai  # type: ignore[import-not-found]  # noqa: WPS433
 
         chat = getattr(openai, "ChatCompletion", None)
         if chat is not None and hasattr(chat, "create"):

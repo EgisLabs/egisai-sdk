@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 from egisai._auto_agent import derive_identity, resolve_agent_id
 from egisai._config import get_config
@@ -33,13 +34,17 @@ from egisai._context import (
 )
 from egisai._evaluator import (
     InputCall,
+    OutputCall,
     evaluate,
+    evaluate_output,
     extract_payload_text,
     mutate_prompt_text,
 )
 from egisai._events import build_event, safe_preview
 from egisai._logger import enqueue
-from egisai.policy import MatchedPolicyRecord, PolicyDecision, label_redact
+from egisai.policy import PolicyDecision, label_redact
+from egisai.policy.pii import Sanitization
+from egisai.policy.pii import sanitize as pii_sanitize
 
 
 def _serialize_matched_policies(
@@ -75,7 +80,7 @@ def _serialize_matched_policies(
             }
         )
     return out
-from egisai.policy.pii import Sanitization, sanitize as pii_sanitize
+
 
 _MAX_PREVIEW_LEN = 2048
 
@@ -102,7 +107,7 @@ LOGGER = logging.getLogger("egisai.patches")
 ExtractUsage = Callable[[Any], dict[str, Any]]
 
 
-def _stamp_usage(ev: dict, response: Any, extract_usage: Optional[ExtractUsage]) -> None:
+def _stamp_usage(ev: dict, response: Any, extract_usage: ExtractUsage | None) -> None:
     """Copy ``tokens_in`` / ``tokens_out`` / ``cost_usd`` onto the event."""
     if extract_usage is None or response is None:
         return
@@ -199,6 +204,154 @@ def _attribute_event(ev: dict, payload: Any) -> None:
         ev["app"] = cfg.app
 
 
+# Output-side signal extractor: ``(response, request_payload) → (text,
+# tool_names, tool_calls, mcp_targets)``. Patchers that don't care about
+# output-side policies pass ``None``; the gate then skips Phase 3.
+ExtractOutputSignals = Callable[
+    [Any, Any],
+    tuple[str, list[str], list[dict[str, Any]], list[str]],
+]
+
+
+def _build_input_event(
+    *,
+    source: str,
+    target: str,
+    model: str,
+    prompt_text: str,
+    stream: bool,
+    payload: Any,
+) -> dict[str, Any]:
+    """Construct the audit event and attribute it to an agent identity."""
+    ev = build_event(
+        source=source, target=target, payload=payload, model=model, stream=stream
+    )
+    _attribute_event(ev, payload)
+    ev["prompt_chars"] = len(prompt_text or "")
+    ev["prompt_preview"] = _safe_text_preview(prompt_text)
+    ev["_prompt_text_original"] = prompt_text
+    return ev
+
+
+def _run_input_phase(
+    *,
+    source: str,
+    target: str,
+    model: str,
+    prompt_text: str,
+    stream: bool,
+    ev: dict[str, Any],
+) -> PolicyDecision:
+    """Evaluate input-side policies and stamp the verdict onto ``ev``."""
+    policy_started = time.monotonic()
+    decision = evaluate(
+        InputCall(
+            source=source,
+            target=target,
+            model=model,
+            prompt_text=prompt_text,
+            stream=stream,
+        )
+    )
+    ev["policy_latency_ms"] = int((time.monotonic() - policy_started) * 1000)
+    policy_in, policy_out = get_policy_usage()
+    ev["policy_tokens_in"] = policy_in
+    ev["policy_tokens_out"] = policy_out
+    ev["verdict"] = decision.verdict
+    ev["reason_code"] = decision.reason_code
+    ev["reason"] = decision.message
+    ev["matched_policy"] = decision.matched_policy
+    ev["matched_policies"] = _serialize_matched_policies(decision)
+    return decision
+
+
+def _block_response(
+    *,
+    decision: PolicyDecision,
+    ev: dict[str, Any],
+    model: str,
+    stub_factory: Callable[[PolicyDecision, str, str], Any] | None,
+) -> Any:
+    """Enqueue + return-or-raise the framework-shaped block response.
+
+    ``ev`` is enqueued as-is; the caller is responsible for setting
+    ``ev["latency_ms"]`` first (zero for input-side blocks, real
+    elapsed time for output-side blocks).
+    """
+    enqueue(ev)
+    cfg = get_config()
+    msg = (
+        f"[egisai] {decision.message or 'blocked by policy'} "
+        f"(matched={decision.matched_policy})"
+    )
+    if cfg.on_block == "raise" or stub_factory is None:
+        raise PermissionError(msg)
+    return stub_factory(decision, ensure_trace_id(), model)
+
+
+def _run_output_phase(
+    *,
+    response: Any,
+    payload: Any,
+    source: str,
+    target: str,
+    model: str,
+    stream: bool,
+    extract_output_signals: ExtractOutputSignals | None,
+) -> PolicyDecision | None:
+    """Run output-side policies; return a block decision or ``None``.
+
+    Allow / sanitize verdicts on the output side are no-ops (we
+    don't rewrite assistant text). Only ``block`` reaches the
+    caller, which handles enqueue + raise/stub.
+    """
+    if extract_output_signals is None or response is None:
+        return None
+    try:
+        text, tool_names, tool_calls, mcp_targets = extract_output_signals(
+            response, payload
+        )
+    except Exception:  # noqa: BLE001
+        LOGGER.debug(
+            "output signal extractor failed for %s", source, exc_info=True
+        )
+        return None
+
+    if not (text or tool_names or tool_calls or mcp_targets):
+        return None
+
+    decision = evaluate_output(
+        OutputCall(
+            source=source,
+            target=target,
+            model=model,
+            text=text or "",
+            tool_names=list(tool_names or []),
+            tool_calls=list(tool_calls or []),
+            mcp_targets=list(mcp_targets or []),
+            stream=stream,
+        )
+    )
+    return decision if decision.verdict == "block" else None
+
+
+def _stamp_output_block(
+    ev: dict[str, Any], decision: PolicyDecision
+) -> None:
+    """Re-stamp the audit event so it reflects the output-side block.
+
+    Input-side matches that fired (allow / sanitize) are preserved
+    on ``ev["matched_policies"]``; the output match is appended so
+    the audit row carries the full chain.
+    """
+    ev["verdict"] = "block"
+    ev["reason_code"] = decision.reason_code
+    ev["reason"] = decision.message
+    ev["matched_policy"] = decision.matched_policy
+    existing = ev.get("matched_policies") or []
+    ev["matched_policies"] = list(existing) + _serialize_matched_policies(decision)
+
+
 def gate_call(
     *,
     source: str,
@@ -207,18 +360,23 @@ def gate_call(
     prompt_text: str,
     stream: bool,
     payload: Any,
-    stub_factory: Optional[Callable[[PolicyDecision, str, str], Any]] = None,
-    extract_usage: Optional[ExtractUsage] = None,
+    stub_factory: Callable[[PolicyDecision, str, str], Any] | None = None,
+    extract_usage: ExtractUsage | None = None,
+    extract_output_signals: ExtractOutputSignals | None = None,
     forward: Callable[[], Any],
 ) -> Any:
-    """Run the gate around a single model call.
+    """Run the gate around a single synchronous model call.
 
     ``forward`` is a zero-arg callable invoking the original
     function; it runs only on allow / sanitize verdicts. Events are
     enqueued after ``forward()`` returns for allowed calls (so
     latency + tokens are populated), or immediately on block.
+
+    Output-side policies (``deny_tool_call``, ``deny_mcp_call``,
+    ``deny_output_regex``, output-side ``semantic_guard``) run
+    against the response when ``extract_output_signals`` is
+    provided.
     """
-    cfg = get_config()
     prev_source = get_source()
     prev_checked = get_policy_checked()
 
@@ -230,51 +388,35 @@ def gate_call(
         if prev_checked:
             return forward()
 
-        ev = build_event(
-            source=source, target=target, payload=payload, model=model, stream=stream
+        ev = _build_input_event(
+            source=source,
+            target=target,
+            model=model,
+            prompt_text=prompt_text,
+            stream=stream,
+            payload=payload,
         )
-        _attribute_event(ev, payload)
-        ev["prompt_chars"] = len(prompt_text or "")
-        ev["prompt_preview"] = _safe_text_preview(prompt_text)
-        ev["_prompt_text_original"] = prompt_text
 
         set_policy_checked(True)
         reset_policy_usage()
         try:
-            policy_started = time.monotonic()
-            decision = evaluate(
-                InputCall(
-                    source=source,
-                    target=target,
-                    model=model,
-                    prompt_text=prompt_text,
-                    stream=stream,
-                )
+            decision = _run_input_phase(
+                source=source,
+                target=target,
+                model=model,
+                prompt_text=prompt_text,
+                stream=stream,
+                ev=ev,
             )
-            ev["policy_latency_ms"] = int((time.monotonic() - policy_started) * 1000)
-            policy_in, policy_out = get_policy_usage()
-            ev["policy_tokens_in"] = policy_in
-            ev["policy_tokens_out"] = policy_out
-            ev["verdict"] = decision.verdict
-            ev["reason_code"] = decision.reason_code
-            ev["reason"] = decision.message
-            ev["matched_policy"] = decision.matched_policy
-            ev["matched_policies"] = _serialize_matched_policies(decision)
 
             if decision.verdict == "block":
                 ev["latency_ms"] = 0
-                enqueue(ev)
-                if cfg.on_block == "raise":
-                    raise PermissionError(
-                        f"[egisai] {decision.message or 'blocked by policy'} "
-                        f"(matched={decision.matched_policy})"
-                    )
-                if stub_factory is None:
-                    raise PermissionError(
-                        f"[egisai] {decision.message or 'blocked by policy'} "
-                        f"(matched={decision.matched_policy})"
-                    )
-                return stub_factory(decision, ensure_trace_id(), model)
+                return _block_response(
+                    decision=decision,
+                    ev=ev,
+                    model=model,
+                    stub_factory=stub_factory,
+                )
 
             if decision.verdict == "sanitize":
                 _apply_sanitization(decision=decision, payload=payload, ev=ev)
@@ -289,6 +431,25 @@ def gate_call(
                 raise
             ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
             _stamp_usage(ev, response, extract_usage)
+
+            output_block = _run_output_phase(
+                response=response,
+                payload=payload,
+                source=source,
+                target=target,
+                model=model,
+                stream=stream,
+                extract_output_signals=extract_output_signals,
+            )
+            if output_block is not None:
+                _stamp_output_block(ev, output_block)
+                return _block_response(
+                    decision=output_block,
+                    ev=ev,
+                    model=model,
+                    stub_factory=stub_factory,
+                )
+
             enqueue(ev)
             return response
         finally:
@@ -305,12 +466,12 @@ async def async_gate_call(
     prompt_text: str,
     stream: bool,
     payload: Any,
-    stub_factory: Optional[Callable[[PolicyDecision, str, str], Any]] = None,
-    extract_usage: Optional[ExtractUsage] = None,
+    stub_factory: Callable[[PolicyDecision, str, str], Any] | None = None,
+    extract_usage: ExtractUsage | None = None,
+    extract_output_signals: ExtractOutputSignals | None = None,
     forward: Callable[[], Any],
 ) -> Any:
-    """Async sibling of gate_call. Same semantics; awaits ``forward()``."""
-    cfg = get_config()
+    """Async sibling of ``gate_call`` — same semantics, awaits ``forward()``."""
     prev_source = get_source()
     prev_checked = get_policy_checked()
 
@@ -322,51 +483,35 @@ async def async_gate_call(
         if prev_checked:
             return await forward()
 
-        ev = build_event(
-            source=source, target=target, payload=payload, model=model, stream=stream
+        ev = _build_input_event(
+            source=source,
+            target=target,
+            model=model,
+            prompt_text=prompt_text,
+            stream=stream,
+            payload=payload,
         )
-        _attribute_event(ev, payload)
-        ev["prompt_chars"] = len(prompt_text or "")
-        ev["prompt_preview"] = _safe_text_preview(prompt_text)
-        ev["_prompt_text_original"] = prompt_text
 
         set_policy_checked(True)
         reset_policy_usage()
         try:
-            policy_started = time.monotonic()
-            decision = evaluate(
-                InputCall(
-                    source=source,
-                    target=target,
-                    model=model,
-                    prompt_text=prompt_text,
-                    stream=stream,
-                )
+            decision = _run_input_phase(
+                source=source,
+                target=target,
+                model=model,
+                prompt_text=prompt_text,
+                stream=stream,
+                ev=ev,
             )
-            ev["policy_latency_ms"] = int((time.monotonic() - policy_started) * 1000)
-            policy_in, policy_out = get_policy_usage()
-            ev["policy_tokens_in"] = policy_in
-            ev["policy_tokens_out"] = policy_out
-            ev["verdict"] = decision.verdict
-            ev["reason_code"] = decision.reason_code
-            ev["reason"] = decision.message
-            ev["matched_policy"] = decision.matched_policy
-            ev["matched_policies"] = _serialize_matched_policies(decision)
 
             if decision.verdict == "block":
                 ev["latency_ms"] = 0
-                enqueue(ev)
-                if cfg.on_block == "raise":
-                    raise PermissionError(
-                        f"[egisai] {decision.message or 'blocked by policy'} "
-                        f"(matched={decision.matched_policy})"
-                    )
-                if stub_factory is None:
-                    raise PermissionError(
-                        f"[egisai] {decision.message or 'blocked by policy'} "
-                        f"(matched={decision.matched_policy})"
-                    )
-                return stub_factory(decision, ensure_trace_id(), model)
+                return _block_response(
+                    decision=decision,
+                    ev=ev,
+                    model=model,
+                    stub_factory=stub_factory,
+                )
 
             if decision.verdict == "sanitize":
                 _apply_sanitization(decision=decision, payload=payload, ev=ev)
@@ -381,6 +526,25 @@ async def async_gate_call(
                 raise
             ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
             _stamp_usage(ev, response, extract_usage)
+
+            output_block = _run_output_phase(
+                response=response,
+                payload=payload,
+                source=source,
+                target=target,
+                model=model,
+                stream=stream,
+                extract_output_signals=extract_output_signals,
+            )
+            if output_block is not None:
+                _stamp_output_block(ev, output_block)
+                return _block_response(
+                    decision=output_block,
+                    ev=ev,
+                    model=model,
+                    stub_factory=stub_factory,
+                )
+
             enqueue(ev)
             return response
         finally:
