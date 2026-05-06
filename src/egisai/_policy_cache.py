@@ -16,10 +16,16 @@ _etag: str | None = None
 _rules: list[PolicyRule] = []
 
 
+_VALID_PHASES = ("pre_model", "post_model", "both")
+
+
 def _to_rule(d: dict) -> PolicyRule:
     """Wire-shape → ``PolicyRule`` dataclass.
 
     ``agent_ids`` defaults to an empty tuple ("applies to all").
+    ``phase`` defaults to ``"both"`` so older platform responses
+    (which don't carry the field) keep their previous behaviour:
+    each rule fires on whichever side its type supports.
     Both ``"type"`` and the legacy ``"kind"`` field are accepted.
     """
     raw_ids = d.get("agent_ids")
@@ -33,6 +39,8 @@ def _to_rule(d: dict) -> PolicyRule:
     rule_id: str | None = (
         None if raw_id is None or raw_id == "" else str(raw_id)
     )
+    raw_phase = d.get("phase")
+    phase = raw_phase if raw_phase in _VALID_PHASES else "both"
     return PolicyRule(
         id=rule_id,
         name=d.get("name", ""),
@@ -40,6 +48,7 @@ def _to_rule(d: dict) -> PolicyRule:
         tenant=d.get("tenant"),
         config=dict(d.get("config") or {}),
         agent_ids=agent_ids,
+        phase=phase,
     )
 
 

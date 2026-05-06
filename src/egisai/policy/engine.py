@@ -23,6 +23,15 @@ class PolicyRule:
     ``deny_regex``, …); ``config`` carries the type-specific knobs.
     ``agent_ids`` scopes the rule to specific agents — empty means
     "applies to every agent".
+
+    ``phase`` selects which side of the call the rule runs on:
+
+    - ``"pre_model"``  — evaluated against the user prompt before the
+      model is called (default for input-side detectors).
+    - ``"post_model"`` — evaluated against the model's response after
+      it returns (default for output-side detectors).
+    - ``"both"`` — runs on both sides; only meaningful for rule types
+      that support it (e.g. ``semantic_guard``).
     """
 
     id: str | None
@@ -31,6 +40,7 @@ class PolicyRule:
     tenant: str | None
     config: dict[str, Any]
     agent_ids: tuple[str, ...] = field(default=())
+    phase: str = "both"
 
 
 @dataclass(frozen=True)
@@ -156,6 +166,16 @@ _DETERMINISTIC_KINDS = frozenset(
 _LLM_BACKED_KINDS = frozenset({"semantic_guard"})
 
 
+def _runs_pre_model(rule: PolicyRule) -> bool:
+    """Return True when this rule should fire on the prompt side."""
+    return rule.phase in ("pre_model", "both")
+
+
+def _runs_post_model(rule: PolicyRule) -> bool:
+    """Return True when this rule should fire on the response side."""
+    return rule.phase in ("post_model", "both")
+
+
 def evaluate_policies(
     policies: list[PolicyRule],
     context: PolicyContext,
@@ -173,12 +193,16 @@ def evaluate_policies(
     possibly-masked prompt. A Phase 2 block overrides a Phase 1
     sanitize, but both records are kept on the decision.
 
+    Rules whose ``phase`` is ``"post_model"`` are skipped entirely
+    on this side — they only run during ``evaluate_output_policies``.
+
     The verdict precedence across all matches is
     ``block > sanitize > allow``. ``semantic_blocker`` is optional;
     when ``None``, ``semantic_guard`` rules become no-ops.
     """
-    phase1 = [p for p in policies if p.type in _DETERMINISTIC_KINDS]
-    phase2 = [p for p in policies if p.type in _LLM_BACKED_KINDS]
+    pre_model = [p for p in policies if _runs_pre_model(p)]
+    phase1 = [p for p in pre_model if p.type in _DETERMINISTIC_KINDS]
+    phase2 = [p for p in pre_model if p.type in _LLM_BACKED_KINDS]
 
     phase1_matches = _collect_input_matches(phase1, context, semantic_blocker=None)
 
@@ -444,11 +468,14 @@ def evaluate_output_policies(
 ) -> PolicyDecision:
     """Evaluate output-side policies and return a ``PolicyDecision``.
 
-    Same precedence rule as the input evaluator
-    (``block > sanitize > allow``).
+    Rules whose ``phase`` is ``"pre_model"`` are skipped — they only
+    fire during ``evaluate_policies``. Same precedence rule as the
+    input evaluator (``block > sanitize > allow``).
     """
     records: list[MatchedPolicyRecord] = []
     for policy in policies:
+        if not _runs_post_model(policy):
+            continue
         rec = _evaluate_one_output_policy(policy, context, semantic_blocker)
         if rec is not None:
             records.append(rec)

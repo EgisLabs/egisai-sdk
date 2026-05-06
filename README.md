@@ -115,9 +115,22 @@ Open **[Dashboard → Requests](https://app.egisai.co/dashboard)** to see govern
 
 ## How governance fits your call path
 
-1. **Evaluation** — Before the upstream model runs, the SDK applies your organization’s active policies (cached locally). Rules such as PII detection, regex denylists, model allowlists, and intent-oriented policies are evaluated in a fixed order defined by the product.
-2. **Outcomes** — A call may be **allowed**, **sanitized** (payload adjusted per policy, then forwarded), or **blocked**. Blocked calls never reach the provider when enforcement raises or returns a stub, depending on configuration (see below).
-3. **Telemetry** — Non-blocking delivery of audit metadata to EgisAI so your dashboard stays current without slowing customer-facing inference.
+Each governed call is evaluated in two phases—once before the model runs and once after it returns—so policies can intervene on either side independently.
+
+1. **Pre-model evaluation** — Before the upstream model runs, the SDK applies your organization’s active policies (cached locally) to the prompt. Rules such as PII detection, regex denylists, model allowlists, and intent-oriented policies are evaluated in a fixed order defined by the product.
+2. **Outcomes (pre-model)** — A call may be **allowed**, **sanitized** (payload adjusted per policy, then forwarded), or **blocked**. Blocked calls never reach the provider when enforcement raises or returns a stub, depending on configuration (see below).
+3. **Post-model evaluation** — When the model responds, output-side policies run against the assistant’s text, tool invocations, and connector targets. A blocked response is suppressed before it reaches your code.
+4. **Telemetry** — The audit event records each phase’s decision independently (`prompt_decision`, `response_decision`) so your dashboard can show exactly which side fired and which rules matched. Delivery is non-blocking.
+
+Each policy carries a **phase** that selects which side it runs on:
+
+| Phase | When the rule fires |
+|-------|--------------------|
+| `pre_model`  | Only on the prompt, before the model is called. |
+| `post_model` | Only on the response, after the model returns. |
+| `both`       | On both sides where the rule type is supported. |
+
+Operators choose the phase in the dashboard when they create or edit a rule. Older platform deployments that haven’t shipped the field yet behave as if every rule were `both`, preserving previous semantics.
 
 Sensitive pattern detection intended to catch regulated data is performed locally so raw values are not sent to third-party models as part of governance. Intent-oriented policies operate only after applicable local checks have run on the text that will be judged.
 

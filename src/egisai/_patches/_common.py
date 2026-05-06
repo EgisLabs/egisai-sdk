@@ -82,6 +82,24 @@ def _serialize_matched_policies(
     return out
 
 
+def _decision_block(decision: PolicyDecision) -> dict[str, Any]:
+    """Per-phase decision summary persisted alongside the audit row.
+
+    Two of these are produced per call (``prompt_decision`` and
+    ``response_decision``) so the dashboard can render the pre-model
+    and post-model verdicts independently. The shape mirrors the
+    top-level audit fields one-for-one, plus ``matched_policies``
+    for the per-phase rule list.
+    """
+    return {
+        "verdict": decision.verdict,
+        "reason_code": decision.reason_code,
+        "reason": decision.message,
+        "matched_policy": decision.matched_policy,
+        "matched_policies": _serialize_matched_policies(decision),
+    }
+
+
 _MAX_PREVIEW_LEN = 2048
 
 
@@ -242,7 +260,12 @@ def _run_input_phase(
     stream: bool,
     ev: dict[str, Any],
 ) -> PolicyDecision:
-    """Evaluate input-side policies and stamp the verdict onto ``ev``."""
+    """Evaluate input-side policies and stamp the verdict onto ``ev``.
+
+    Stamps both the legacy top-level fields (``verdict``,
+    ``matched_policies``, …) for older backends and the new
+    structured ``prompt_decision`` block consumed by 0.12.4+.
+    """
     policy_started = time.monotonic()
     decision = evaluate(
         InputCall(
@@ -262,6 +285,7 @@ def _run_input_phase(
     ev["reason"] = decision.message
     ev["matched_policy"] = decision.matched_policy
     ev["matched_policies"] = _serialize_matched_policies(decision)
+    ev["prompt_decision"] = _decision_block(decision)
     return decision
 
 
@@ -299,11 +323,14 @@ def _run_output_phase(
     stream: bool,
     extract_output_signals: ExtractOutputSignals | None,
 ) -> PolicyDecision | None:
-    """Run output-side policies; return a block decision or ``None``.
+    """Run output-side policies; return the full decision or ``None``.
 
-    Allow / sanitize verdicts on the output side are no-ops (we
-    don't rewrite assistant text). Only ``block`` reaches the
-    caller, which handles enqueue + raise/stub.
+    Returns the ``PolicyDecision`` whenever the post-model phase
+    actually executed (allow OR block). Returns ``None`` when the
+    phase was skipped — extractor missing, response empty, or
+    nothing was extractable to evaluate. The caller uses this to
+    decide whether to stamp ``response_decision`` on the audit
+    event.
     """
     if extract_output_signals is None or response is None:
         return None
@@ -320,7 +347,7 @@ def _run_output_phase(
     if not (text or tool_names or tool_calls or mcp_targets):
         return None
 
-    decision = evaluate_output(
+    return evaluate_output(
         OutputCall(
             source=source,
             target=target,
@@ -332,7 +359,6 @@ def _run_output_phase(
             stream=stream,
         )
     )
-    return decision if decision.verdict == "block" else None
 
 
 def _stamp_output_block(
@@ -342,7 +368,9 @@ def _stamp_output_block(
 
     Input-side matches that fired (allow / sanitize) are preserved
     on ``ev["matched_policies"]``; the output match is appended so
-    the audit row carries the full chain.
+    the audit row carries the full chain. The structured
+    ``response_decision`` block carries the post-model verdict alone
+    so the dashboard can render the two phases side-by-side.
     """
     ev["verdict"] = "block"
     ev["reason_code"] = decision.reason_code
@@ -350,6 +378,7 @@ def _stamp_output_block(
     ev["matched_policy"] = decision.matched_policy
     existing = ev.get("matched_policies") or []
     ev["matched_policies"] = list(existing) + _serialize_matched_policies(decision)
+    ev["response_decision"] = _decision_block(decision)
 
 
 def gate_call(
@@ -432,7 +461,7 @@ def gate_call(
             ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
             _stamp_usage(ev, response, extract_usage)
 
-            output_block = _run_output_phase(
+            output_decision = _run_output_phase(
                 response=response,
                 payload=payload,
                 source=source,
@@ -441,14 +470,16 @@ def gate_call(
                 stream=stream,
                 extract_output_signals=extract_output_signals,
             )
-            if output_block is not None:
-                _stamp_output_block(ev, output_block)
+            if output_decision is not None and output_decision.verdict == "block":
+                _stamp_output_block(ev, output_decision)
                 return _block_response(
-                    decision=output_block,
+                    decision=output_decision,
                     ev=ev,
                     model=model,
                     stub_factory=stub_factory,
                 )
+            if output_decision is not None:
+                ev["response_decision"] = _decision_block(output_decision)
 
             enqueue(ev)
             return response
@@ -527,7 +558,7 @@ async def async_gate_call(
             ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
             _stamp_usage(ev, response, extract_usage)
 
-            output_block = _run_output_phase(
+            output_decision = _run_output_phase(
                 response=response,
                 payload=payload,
                 source=source,
@@ -536,14 +567,16 @@ async def async_gate_call(
                 stream=stream,
                 extract_output_signals=extract_output_signals,
             )
-            if output_block is not None:
-                _stamp_output_block(ev, output_block)
+            if output_decision is not None and output_decision.verdict == "block":
+                _stamp_output_block(ev, output_decision)
                 return _block_response(
-                    decision=output_block,
+                    decision=output_decision,
                     ev=ev,
                     model=model,
                     stub_factory=stub_factory,
                 )
+            if output_decision is not None:
+                ev["response_decision"] = _decision_block(output_decision)
 
             enqueue(ev)
             return response

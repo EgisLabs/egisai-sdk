@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.12.4] — 2026-05-05
+
+### Added
+
+- **Two-phase policy enforcement.** Each policy now carries a `phase`
+  field that selects which side of a model call it runs on:
+  `"pre_model"` (the prompt, before the call), `"post_model"` (the
+  response, after the call), or `"both"`. Operators can scope a
+  single rule to either side or keep the legacy "wherever it
+  applies" behaviour. Older platform responses that don't carry the
+  field default to `"both"`, preserving every previous deployment's
+  semantics.
+- **Per-phase decision blocks on the audit event.** The SDK now
+  emits two structured blocks alongside the legacy top-level fields:
+
+  - `prompt_decision` — verdict, reason, and matched policies for
+    the pre-model phase. Always present.
+  - `response_decision` — verdict, reason, and matched policies for
+    the post-model phase. Present only when the phase actually ran
+    (the model returned and an output extractor produced signals to
+    evaluate). Absent when the prompt was blocked, since the model
+    was never called.
+
+  The legacy `verdict` / `matched_policy` / `matched_policies`
+  fields stay for backward compatibility with existing backends.
+
+### Changed
+
+- `evaluate_policies` and `evaluate_output_policies` now filter
+  rules by `phase` before walking them. A rule scoped to
+  `"post_model"` will not fire on the prompt side, and vice versa,
+  even when the rule's *type* is technically valid on the
+  un-scoped side (e.g. `semantic_guard`).
+
+### Internal
+
+- New tests cover phase filtering across both evaluators, the wire
+  parser's default behaviour, and the dual-decision audit shape on
+  allow / pre-model-block / post-model-block paths.
+
+---
+
 ## [0.11.1] — 2026-05-05
 
 ### Added
