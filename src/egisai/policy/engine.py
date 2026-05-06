@@ -158,8 +158,24 @@ class PolicyDecision:
 
 # Deterministic, local-only checks. Adding a new policy kind here
 # means it must not issue any network request.
+#
+# Includes every output-side detector too, because operators can
+# now target any rule type on the pre-model phase: when an
+# output-typed rule lands here it routes through phase 1 (still
+# fully deterministic) and either fires (``deny_output_regex``
+# matches prompt text) or silently no-ops (tool / bash / MCP
+# rules don't have prompt-side signals to evaluate against).
 _DETERMINISTIC_KINDS = frozenset(
-    {"allow_model", "deny_regex", "max_prompt_chars", "pii_scan"}
+    {
+        "allow_model",
+        "deny_regex",
+        "deny_output_regex",
+        "max_prompt_chars",
+        "pii_scan",
+        "deny_tool_call",
+        "deny_bash_command",
+        "deny_mcp_call",
+    }
 )
 
 # Network-issuing checks (LLM judges, embedding lookups, …).
@@ -282,97 +298,45 @@ def _evaluate_one_input_policy(
     context: PolicyContext,
     semantic_blocker: SemanticBlocker | None,
 ) -> MatchedPolicyRecord | None:
-    if policy.type == "allow_model":
-        allowed_models = policy.config.get("models", [])
-        if isinstance(allowed_models, list) and context.model not in allowed_models:
-            return MatchedPolicyRecord(
-                name=policy.name,
-                type=policy.type,
-                verdict="block",
-                reason_code="model_not_allowed",
-                message=policy.config.get(
-                    "message",
-                    f"Model '{context.model}' is not allowed for tenant "
-                    f"'{context.tenant}'.",
-                ),
-            )
-        return None
+    """Evaluate one rule on the prompt side.
 
-    if policy.type == "deny_regex":
-        pattern = policy.config.get("pattern")
-        if isinstance(pattern, str):
-            flags = 0 if policy.config.get("case_sensitive") else re.IGNORECASE
-            if safe_search(pattern, context.prompt_text, flags):
-                return MatchedPolicyRecord(
-                    name=policy.name,
-                    type=policy.type,
-                    verdict="block",
-                    reason_code="prompt_blocked",
-                    message=policy.config.get(
-                        "message",
-                        "Prompt content matched a blocked pattern.",
-                    ),
-                )
-        return None
+    The dispatcher handles every type the engine knows about. Types
+    that have no meaningful prompt-side signal (``deny_tool_call``,
+    ``deny_bash_command``, ``deny_mcp_call``) silently return
+    ``None`` — operators can freely target them on the pre-model
+    phase without breaking the call, but the rule simply doesn't
+    fire here. ``deny_output_regex`` runs on prompt text the same
+    way ``deny_regex`` does so an operator who picked it on the
+    pre-model side still gets prompt-pattern enforcement.
+    """
+    if policy.type == "allow_model":
+        return _allow_model_match(policy, context.model, context.tenant)
+
+    if policy.type in ("deny_regex", "deny_output_regex"):
+        return _deny_pattern_match(
+            policy,
+            text=context.prompt_text,
+            reason_code="prompt_blocked",
+            default_message="Prompt content matched a blocked pattern.",
+        )
 
     if policy.type == "max_prompt_chars":
-        max_chars = policy.config.get("max_chars")
-        if isinstance(max_chars, int) and context.prompt_chars > max_chars:
-            return MatchedPolicyRecord(
-                name=policy.name,
-                type=policy.type,
-                verdict="block",
-                reason_code="prompt_too_large",
-                message=policy.config.get(
-                    "message",
-                    f"Prompt size exceeds the allowed limit of {max_chars} characters.",
-                ),
-            )
-        return None
+        return _max_chars_match(
+            policy,
+            chars=context.prompt_chars,
+            reason_code="prompt_too_large",
+            default_message_template=(
+                "Prompt size exceeds the allowed limit of "
+                "{max_chars} characters."
+            ),
+        )
 
     if policy.type == "pii_scan":
-        threshold = policy.config.get("threshold", 0.5)
-        enabled_kinds = policy.config.get("kinds")
-        action = policy.config.get("action", "block")
-        mask_char_cfg = policy.config.get("mask_char", "#")
-        mask_char = (
-            mask_char_cfg if isinstance(mask_char_cfg, str) and mask_char_cfg
-            else "#"
-        )
-        findings = pii_scanner.scan(context.prompt_text)
-        if enabled_kinds and isinstance(enabled_kinds, list):
-            findings = [f for f in findings if f.kind in enabled_kinds]
-        if not findings:
-            return None
-        risk = pii_scanner.compute_risk_score(findings)
-        if risk < threshold:
-            return None
-        detected_kinds = sorted({f.kind for f in findings})
-        if action == "sanitize":
-            return MatchedPolicyRecord(
-                name=policy.name,
-                type=policy.type,
-                verdict="sanitize",
-                reason_code="pii_sanitized",
-                message=policy.config.get(
-                    "message",
-                    f"PII redacted before forwarding ({', '.join(detected_kinds)}).",
-                ),
-                sanitize_kinds=tuple(detected_kinds),
-                sanitize_mask_char=mask_char,
-            )
-        labels = ", ".join(
-            f"{f.kind}({f.value_redacted})" for f in findings[:5]
-        )
-        return MatchedPolicyRecord(
-            name=policy.name,
-            type=policy.type,
-            verdict="block",
-            reason_code="pii_detected",
-            message=policy.config.get(
-                "message",
-                f"PII detected (risk={risk:.2f}): {labels}",
-            ),
+        return _pii_scan_match(
+            policy,
+            text=context.prompt_text,
+            allow_sanitize=True,
+            block_reason_code="pii_detected",
         )
 
     if policy.type == "semantic_guard":
@@ -383,6 +347,12 @@ def _evaluate_one_input_policy(
             side="prompt",
         )
 
+    # Tool / bash / MCP rules need response-side signals
+    # (tool_names, tool_calls, mcp_targets) that ``PolicyContext``
+    # does not carry today. Operators may still target them on the
+    # pre-model phase via the open phase picker; the rule silently
+    # no-ops here so the call isn't broken. They fire normally
+    # when ``phase`` includes ``post_model``.
     return None
 
 
@@ -458,6 +428,146 @@ def _semantic_guard_match(
     )
 
 
+# ── Shared per-type evaluators (phase-symmetric) ────────────────────────
+#
+# Each helper takes the rule's ``config`` plus whichever signals it
+# needs (text, char count, model name) and returns a match record
+# or ``None``. Both ``_evaluate_one_input_policy`` and
+# ``_evaluate_one_output_policy`` call into these so a rule
+# behaves identically on either phase, with the only side-specific
+# difference being the ``reason_code`` (``prompt_blocked`` vs
+# ``output_blocked``, etc.) — which downstream copy templates use
+# to phrase the audit narrative correctly.
+
+
+def _allow_model_match(
+    policy: PolicyRule,
+    model: str,
+    tenant: str,
+) -> MatchedPolicyRecord | None:
+    """Block when the call's model isn't on the operator's allow-list."""
+    allowed_models = policy.config.get("models", [])
+    if isinstance(allowed_models, list) and model not in allowed_models:
+        return MatchedPolicyRecord(
+            name=policy.name,
+            type=policy.type,
+            verdict="block",
+            reason_code="model_not_allowed",
+            message=policy.config.get(
+                "message",
+                f"Model '{model}' is not allowed for tenant '{tenant}'.",
+            ),
+        )
+    return None
+
+
+def _deny_pattern_match(
+    policy: PolicyRule,
+    *,
+    text: str,
+    reason_code: str,
+    default_message: str,
+) -> MatchedPolicyRecord | None:
+    """Block when ``text`` matches the operator's regex pattern."""
+    pattern = policy.config.get("pattern")
+    if not isinstance(pattern, str):
+        return None
+    flags = 0 if policy.config.get("case_sensitive") else re.IGNORECASE
+    if not safe_search(pattern, text, flags):
+        return None
+    return MatchedPolicyRecord(
+        name=policy.name,
+        type=policy.type,
+        verdict="block",
+        reason_code=reason_code,
+        message=policy.config.get("message", default_message),
+    )
+
+
+def _max_chars_match(
+    policy: PolicyRule,
+    *,
+    chars: int,
+    reason_code: str,
+    default_message_template: str,
+) -> MatchedPolicyRecord | None:
+    """Block when the relevant text exceeds the configured cap."""
+    max_chars = policy.config.get("max_chars")
+    if not isinstance(max_chars, int) or chars <= max_chars:
+        return None
+    return MatchedPolicyRecord(
+        name=policy.name,
+        type=policy.type,
+        verdict="block",
+        reason_code=reason_code,
+        message=policy.config.get(
+            "message",
+            default_message_template.format(max_chars=max_chars),
+        ),
+    )
+
+
+def _pii_scan_match(
+    policy: PolicyRule,
+    *,
+    text: str,
+    allow_sanitize: bool,
+    block_reason_code: str,
+) -> MatchedPolicyRecord | None:
+    """Scan ``text`` for PII and translate the operator's action.
+
+    ``allow_sanitize`` controls whether ``action="sanitize"`` from
+    the rule's config is honored (the prompt side wires
+    sanitization through to the patched provider call) or coerced
+    to block (the response side has no sanitization plumbing yet).
+    ``block_reason_code`` lets each side stamp its own reason code
+    so audit narratives can phrase the outcome correctly.
+    """
+    threshold = policy.config.get("threshold", 0.5)
+    enabled_kinds = policy.config.get("kinds")
+    action = policy.config.get("action", "block")
+    mask_char_cfg = policy.config.get("mask_char", "#")
+    mask_char = (
+        mask_char_cfg if isinstance(mask_char_cfg, str) and mask_char_cfg
+        else "#"
+    )
+    findings = pii_scanner.scan(text)
+    if enabled_kinds and isinstance(enabled_kinds, list):
+        findings = [f for f in findings if f.kind in enabled_kinds]
+    if not findings:
+        return None
+    risk = pii_scanner.compute_risk_score(findings)
+    if risk < threshold:
+        return None
+    detected_kinds = sorted({f.kind for f in findings})
+    if action == "sanitize" and allow_sanitize:
+        return MatchedPolicyRecord(
+            name=policy.name,
+            type=policy.type,
+            verdict="sanitize",
+            reason_code="pii_sanitized",
+            message=policy.config.get(
+                "message",
+                f"PII redacted before forwarding ({', '.join(detected_kinds)}).",
+            ),
+            sanitize_kinds=tuple(detected_kinds),
+            sanitize_mask_char=mask_char,
+        )
+    labels = ", ".join(
+        f"{f.kind}({f.value_redacted})" for f in findings[:5]
+    )
+    return MatchedPolicyRecord(
+        name=policy.name,
+        type=policy.type,
+        verdict="block",
+        reason_code=block_reason_code,
+        message=policy.config.get(
+            "message",
+            f"PII detected (risk={risk:.2f}): {labels}",
+        ),
+    )
+
+
 # ── Output-side evaluator ───────────────────────────────────────────────────
 
 
@@ -466,20 +576,73 @@ def evaluate_output_policies(
     context: OutputPolicyContext,
     semantic_blocker: SemanticBlocker | None = None,
 ) -> PolicyDecision:
-    """Evaluate output-side policies and return a ``PolicyDecision``.
+    """Evaluate output-side policies in two phases.
 
-    Rules whose ``phase`` is ``"pre_model"`` are skipped — they only
-    fire during ``evaluate_policies``. Same precedence rule as the
-    input evaluator (``block > sanitize > allow``).
+    Mirrors ``evaluate_policies`` exactly: deterministic local
+    checks run first, LLM-backed checks (``semantic_guard``) run
+    afterwards — and only when Phase 1 didn't already block. This
+    is the same security contract the prompt side honors
+    (security-and-compliance.mdc §2): no LLM call, no token spend,
+    no chance of forwarding sensitive content to a judge once a
+    local rule has already refused the response.
+
+    Rules whose ``phase`` is ``"pre_model"`` are skipped — they
+    only fire during ``evaluate_policies``. Verdict precedence
+    across all matches is ``block > sanitize > allow``.
     """
-    records: list[MatchedPolicyRecord] = []
+    post_model = [p for p in policies if _runs_post_model(p)]
+    phase1 = [p for p in post_model if p.type in _DETERMINISTIC_KINDS]
+    phase2 = [p for p in post_model if p.type in _LLM_BACKED_KINDS]
+
+    # Phase 1 — every match is deterministic and local. The judge
+    # is intentionally not threaded in here so a misclassified type
+    # never reaches the network during this phase.
+    phase1_matches = _collect_output_matches(
+        phase1, context, semantic_blocker=None
+    )
+
+    # Hard short-circuit on a Phase 1 block: never call the judge
+    # after a local rule has already refused the response.
+    # Sanitize on the output side is coerced to block by
+    # ``_pii_scan_match`` (the SDK can't safely rewrite provider
+    # responses), so a Phase 1 sanitize is impossible by
+    # construction — but the ``has_block`` guard here mirrors the
+    # prompt side regardless, so the contract reads identically.
+    if phase1_matches.has_block:
+        return _synthesize_decision(phase1_matches.records)
+
+    if not phase2:
+        return _synthesize_decision(phase1_matches.records)
+
+    phase2_matches = _collect_output_matches(
+        phase2, context, semantic_blocker=semantic_blocker
+    )
+
+    return _synthesize_decision(
+        phase1_matches.records + phase2_matches.records
+    )
+
+
+def _collect_output_matches(
+    policies: list[PolicyRule],
+    context: OutputPolicyContext,
+    semantic_blocker: SemanticBlocker | None,
+) -> _PhaseMatches:
+    """Walk a list of post-model rules and accumulate matches.
+
+    Symmetrical to ``_collect_input_matches``. Used by the
+    two-phase ``evaluate_output_policies`` to walk Phase 1 with a
+    ``None`` blocker (no network) and Phase 2 with the live
+    blocker. Each phase's records are appended to the same
+    ``_PhaseMatches`` shape used on the input side, so the
+    downstream synthesizer is one path for both evaluators.
+    """
+    out = _PhaseMatches()
     for policy in policies:
-        if not _runs_post_model(policy):
-            continue
         rec = _evaluate_one_output_policy(policy, context, semantic_blocker)
         if rec is not None:
-            records.append(rec)
-    return _synthesize_decision(records)
+            out.add(rec)
+    return out
 
 
 def _evaluate_one_output_policy(
@@ -487,22 +650,53 @@ def _evaluate_one_output_policy(
     context: OutputPolicyContext,
     semantic_blocker: SemanticBlocker | None,
 ) -> MatchedPolicyRecord | None:
-    if policy.type == "deny_output_regex":
-        pattern = policy.config.get("pattern")
-        if isinstance(pattern, str):
-            flags = 0 if policy.config.get("case_sensitive") else re.IGNORECASE
-            if safe_search(pattern, context.text, flags):
-                return MatchedPolicyRecord(
-                    name=policy.name,
-                    type=policy.type,
-                    verdict="block",
-                    reason_code="output_blocked",
-                    message=policy.config.get(
-                        "message",
-                        "Model output matched a blocked pattern.",
-                    ),
-                )
-        return None
+    """Evaluate one rule on the response side.
+
+    Mirror image of ``_evaluate_one_input_policy``. Every type the
+    engine knows about is handled — including the input-side text
+    detectors (``pii_scan``, ``deny_regex``, ``max_prompt_chars``,
+    ``allow_model``) so operators can target them post-model and
+    have the rule actually fire on the response.
+
+    ``pii_scan`` post-model with ``action="sanitize"`` is coerced
+    to ``block``: the SDK can mutate prompts before they ship, but
+    rewriting a provider's response payload safely across every
+    framework is out of scope, so the operator's intent (catch
+    leaked PII) is preserved by refusing the response instead of
+    silently letting it through.
+    """
+    if policy.type == "allow_model":
+        return _allow_model_match(policy, context.model, context.tenant)
+
+    if policy.type in ("deny_regex", "deny_output_regex"):
+        return _deny_pattern_match(
+            policy,
+            text=context.text,
+            reason_code="output_blocked",
+            default_message="Model output matched a blocked pattern.",
+        )
+
+    if policy.type == "max_prompt_chars":
+        return _max_chars_match(
+            policy,
+            chars=len(context.text),
+            reason_code="output_too_large",
+            default_message_template=(
+                "Response size exceeds the allowed limit of "
+                "{max_chars} characters."
+            ),
+        )
+
+    if policy.type == "pii_scan":
+        # Output-side sanitization isn't wired through provider
+        # patches yet; coerce to block so PII detected in the
+        # response stops the call instead of slipping past.
+        return _pii_scan_match(
+            policy,
+            text=context.text,
+            allow_sanitize=False,
+            block_reason_code="pii_in_output",
+        )
 
     if policy.type == "deny_tool_call":
         patterns = policy.config.get("patterns", [])

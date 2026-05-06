@@ -24,7 +24,7 @@ class EgisaiConfig:
     flush_batch_size: int = 50
     enable_sse: bool = True
     enable_http_fallback: bool = True
-    sdk_version: str = "0.12.4"
+    sdk_version: str = "0.12.5"
     timeout_seconds: float = 10.0
     org_id: str | None = None
     agent_id: str | None = None

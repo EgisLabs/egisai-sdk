@@ -72,6 +72,40 @@ def _gate(payload: dict[str, Any], response: Any) -> Any:
     )
 
 
+def _gate_with_counter(
+    payload: dict[str, Any], response: Any
+) -> tuple[Any, dict[str, int]]:
+    """Like ``_gate`` but threads a counter through ``forward``.
+
+    The returned dict's ``"calls"`` entry is the exact number of
+    times the wrapper invoked the upstream provider. Tests that
+    care about the "blocked prompt → provider never called"
+    contract assert ``counter["calls"] == 0``.
+    """
+    from egisai._patches._common import gate_call
+
+    counter = {"calls": 0}
+
+    def _forward() -> Any:
+        counter["calls"] += 1
+        return response
+
+    try:
+        result = gate_call(
+            source="openai",
+            target="openai.chat.completions.create",
+            model="gpt-4o",
+            prompt_text=payload.get("messages", [{}])[-1].get("content", ""),
+            stream=False,
+            payload=payload,
+            extract_output_signals=extract_openai_chat,
+            forward=_forward,
+        )
+    except PermissionError:
+        return None, counter
+    return result, counter
+
+
 # ── Allow path: both phases ran cleanly ─────────────────────────────
 
 
@@ -104,21 +138,37 @@ def test_allow_path_emits_two_decision_blocks(fake_backend) -> None:
 
 def test_pre_model_block_omits_response_decision(fake_backend) -> None:
     """When the prompt is blocked, the model is never called, so
-    there is no post-model phase to record. ``response_decision``
-    must be absent — the dashboard reads its absence as
-    "post-model not evaluated"."""
+    there is no post-model phase to record.
+
+    Three contracts are asserted simultaneously:
+
+    1. The wrapper raises (input-side block, ``on_block="raise"``).
+    2. The upstream ``forward`` callable was invoked **zero times** —
+       the provider is never contacted.
+    3. The audit row carries ``prompt_decision.verdict == "block"``
+       and **no** ``response_decision`` field — the dashboard reads
+       its absence as "post-model not evaluated."
+    """
     _init(fake_backend, [_pii_block_rule()], etag='"p"')
     safe_response = {"choices": [{"message": {"content": "..."}}]}
 
-    with pytest.raises(PermissionError):
-        _gate(
-            {
-                "messages": [
-                    {"role": "user", "content": "My SSN is 123-45-6789."}
-                ]
-            },
-            safe_response,
-        )
+    result, counter = _gate_with_counter(
+        {
+            "messages": [
+                {"role": "user", "content": "My SSN is 123-45-6789."}
+            ]
+        },
+        safe_response,
+    )
+
+    # Block path returns ``None`` from the test helper because
+    # ``on_block="raise"`` was caught. The interesting assertion
+    # is that ``forward`` never fired.
+    assert result is None
+    assert counter["calls"] == 0, (
+        "Pre-model block must not reach the upstream provider — "
+        "and therefore must not run post-model evaluation either."
+    )
 
     from egisai import shutdown
 

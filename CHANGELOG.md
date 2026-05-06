@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.12.5] — 2026-05-06
+
+### Changed
+
+- **Post-model evaluation now runs deterministic-first, LLM-second.**
+  `evaluate_output_policies` was refactored to mirror
+  `evaluate_policies` exactly: local checks (`pii_scan`,
+  `deny_output_regex`, `max_prompt_chars`, `allow_model`,
+  `deny_tool_call`, `deny_bash_command`, `deny_mcp_call`) all
+  run as Phase 1 against the response, and `semantic_guard`
+  runs as Phase 2 only if Phase 1 didn't already block. Same
+  security contract the prompt side has always honored
+  (`security-and-compliance.mdc` §2): once a deterministic rule
+  refuses a response, the LLM judge is never consulted — no
+  network call, no token spend, no chance of the response
+  reaching an external model. List order is irrelevant; the
+  split is entirely type-driven.
+- **Phase × type matrix is fully open.** Every rule type now
+  accepts every phase (`pre_model`, `post_model`, `both`).
+  Operators can target any rule on either side of a call without
+  the dashboard refusing the combination. The engine evaluates
+  each rule on whichever side it has meaningful signals for and
+  silently no-ops the rest, so the freedom can't break the gate.
+- **Phase-symmetric evaluators.** Rule types that look at text or
+  the model name now fire on either side, with side-specific
+  reason codes so the audit narrative reads correctly:
+
+  - `pii_scan` — runs on the response too (`pii_in_output`
+    reason). `action="sanitize"` on the response side is coerced
+    to block; the SDK can't safely rewrite provider response
+    payloads, so the operator's intent is preserved by refusing
+    the response.
+  - `deny_regex` / `deny_output_regex` — interchangeable; on the
+    prompt side both emit `prompt_blocked`, on the response side
+    both emit `output_blocked`.
+  - `max_prompt_chars` — caps response size when scoped to
+    `post_model` (`output_too_large` reason).
+  - `allow_model` — identical check on either side
+    (`model_not_allowed` reason).
+  - `semantic_guard` — already symmetric; unchanged.
+
+  Tool/bash/MCP rules (`deny_tool_call`, `deny_bash_command`,
+  `deny_mcp_call`) still need response-side signals, so they
+  silently no-op when an operator targets them on `pre_model`.
+  They fire normally whenever the phase includes `post_model`.
+
+### Internal
+
+- New `tests/test_cross_side_evaluators.py` pins the symmetry
+  contract: 18 assertions covering each type × side combination,
+  the side-specific reason codes, and the silent no-ops on the
+  prompt side for tool/bash/MCP rules.
+- New `tests/test_post_model_two_phase.py` pins the deterministic-
+  before-LLM contract on the response side: a recording stub
+  blocker proves the judge is never invoked when Phase 1 blocks
+  via `pii_scan`, `deny_output_regex`, or `deny_tool_call`, and
+  is invoked exactly once when Phase 1 allows. Order of rules in
+  the policy list is varied to confirm the split is type-driven.
+
+---
+
 ## [0.12.4] — 2026-05-05
 
 ### Added
