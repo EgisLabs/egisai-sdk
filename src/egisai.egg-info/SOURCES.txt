@@ -23,6 +23,7 @@ src/egisai.egg-info/top_level.txt
 src/egisai/_patches/__init__.py
 src/egisai/_patches/_common.py
 src/egisai/_patches/anthropic.py
+src/egisai/_patches/genai.py
 src/egisai/_patches/google.py
 src/egisai/_patches/http.py
 src/egisai/_patches/openai.py
@@ -40,6 +41,7 @@ tests/test_lazy_app_registration.py
 tests/test_nested_calls_no_duplicate_logs.py
 tests/test_output_side_policies.py
 tests/test_patches.py
+tests/test_patches_genai.py
 tests/test_phase_ordering_and_pii_robustness.py
 tests/test_pii_blocking.py
 tests/test_pii_reserved_domains.py

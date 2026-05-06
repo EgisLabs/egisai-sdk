@@ -25,7 +25,7 @@ This document is the canonical SDK guide for **[PyPI](https://pypi.org/project/e
 
 1. **Python 3.11+**
 2. An **[EgisAI](https://app.egisai.co)** account and an **SDK API key** (dashboard → **API Keys** → create). Keys look like `egis_live_…`.
-3. The AI SDK(s) you already use (`openai`, `anthropic`, `google-generativeai`, …).
+3. The AI SDK(s) you already use (`openai`, `anthropic`, `google-genai`, …).
 
 ---
 
@@ -40,10 +40,13 @@ Optional extras (smaller installs):
 ```bash
 pip install "egisai[openai]"
 pip install "egisai[anthropic]"
-pip install "egisai[google]"
+pip install "egisai[google]"          # google-genai
+pip install "egisai[google-legacy]"   # google-generativeai
 ```
 
-Only frameworks present in your environment are activated at runtime.
+Only frameworks present in your environment are activated at runtime. The
+`google` and `google-legacy` extras are independent and can both be installed
+when an application uses both SDKs.
 
 ---
 
@@ -89,6 +92,18 @@ response = client.messages.create(
     model="claude-sonnet-4-20250514",
     max_tokens=1024,
     messages=[{"role": "user", "content": "Hello"}],
+)
+```
+
+**Google Gemini**
+
+```python
+from google import genai
+
+client = genai.Client()  # picks up GEMINI_API_KEY from the environment
+response = client.models.generate_content(
+    model="gemini-2.0-flash",
+    contents="Hello",
 )
 ```
 
@@ -209,7 +224,8 @@ A short summary suitable for architecture reviews:
 |---------|--------|
 | `openai` ≥ 1.40 | Chat Completions, Responses API, streaming where supported by the adapter. |
 | `anthropic` ≥ 0.40 | Messages API, streaming. |
-| `google-generativeai` ≥ 0.8 | `GenerativeModel.generate_content`, streaming. |
+| `google-genai` ≥ 1.0 | `client.models.generate_content`, async, streaming. |
+| `google-generativeai` ≥ 0.8 | `GenerativeModel.generate_content`, streaming. Install via `egisai[google-legacy]`. |
 | `httpx` / `requests` | Optional broad HTTP capture when the fallback is enabled. |
 
 Minimum versions are guidance; pin in your own `requirements.txt` for reproducible builds.

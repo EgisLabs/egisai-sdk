@@ -4,7 +4,7 @@ pydantic<3.0,>=2.9.0
 [all]
 openai>=1.40.0
 anthropic>=0.40.0
-google-generativeai>=0.8.0
+google-genai>=1.0.0
 
 [anthropic]
 anthropic>=0.40.0
@@ -19,6 +19,9 @@ build>=1.2.0
 twine>=5.1.0
 
 [google]
+google-genai>=1.0.0
+
+[google-legacy]
 google-generativeai>=0.8.0
 
 [openai]

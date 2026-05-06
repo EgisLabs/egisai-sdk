@@ -16,6 +16,7 @@ from egisai._config import EgisaiConfig, get_config_optional, set_config, update
 from egisai._logger import start_worker as start_logger
 from egisai._logger import stop_worker as stop_logger
 from egisai._patches import anthropic as patch_anthropic
+from egisai._patches import genai as patch_genai
 from egisai._patches import google as patch_google
 from egisai._patches import http as patch_http
 from egisai._patches import openai as patch_openai
@@ -154,6 +155,8 @@ def init(
             enabled.append("openai")
         if patch_anthropic.apply():
             enabled.append("anthropic")
+        if patch_genai.apply():
+            enabled.append("google.genai")
         if patch_google.apply():
             enabled.append("google.generativeai")
         if enable_http_fallback and patch_http.apply():

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.11.1] — 2026-05-05
+
+### Added
+
+- **Support for `google-genai`.** The Google Gen AI SDK
+  (`from google import genai`) is now patched directly. Both
+  `client.models.generate_content(...)` and the async sibling on
+  `client.aio.models.generate_content(...)` are governed end-to-end, including
+  the streaming variants. The `google-generativeai` patcher continues to
+  operate alongside it.
+
+### Changed
+
+- The `google` extra now installs `google-genai`. Use
+  `pip install "egisai[google]"` for `google-genai` or
+  `pip install "egisai[google-legacy]"` for `google-generativeai`. Both
+  extras are independent and can be installed together.
+- Documentation and integration guides updated to cover both Google SDKs.
+
+### Internal
+
+- New patcher module `egisai._patches.genai`, mirroring the structure of
+  the existing patchers and registered alongside them in `egisai.init()`.
+- Tests added for sync, async, allow, block (raise), block (stub), idempotent
+  re-apply, and the no-op behavior when `google.genai` is not installed.
+
+---
+
 ## [0.11.0] — 2026-05-05
 
 ### Added

@@ -1,15 +1,11 @@
-"""Google Generative AI (Gemini) patcher.
+"""``google.generativeai`` patcher.
 
 Targets ``google.generativeai.GenerativeModel.generate_content`` and
 the async sibling ``generate_content_async``.
 
-.. deprecated::
-   Google's ``google.generativeai`` package is being replaced by
-   ``google.genai`` (`google-genai` on PyPI). This module continues
-   to govern apps that still use the legacy package. Apps already on
-   ``google.genai`` are governed via the ``httpx`` fallback patcher
-   today; first-class ``google.genai`` support is on the roadmap
-   for a future minor release.
+The ``google.genai`` package is patched separately by
+``egisai._patches.genai``; both patchers run side-by-side when both
+packages are installed.
 """
 
 from __future__ import annotations
