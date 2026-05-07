@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.13.4] — 2026-05-07
+
+### Added
+
+- **Runtime governance expansion** — argument-aware enforcement for
+  the post-model side. Five policy types now reason about *what*
+  the model is asking the agent to do, not just *which* tool it's
+  invoking:
+
+  - **`deny_tool_call` (extended)** — three independent matching
+    axes per rule. ``patterns`` continues to match tool names;
+    ``argument_patterns`` is a new regex list run against each
+    live tool call's serialized arguments (catches dangerous use
+    of an otherwise-legitimate tool, e.g. ``http_get`` pointed at
+    an internal IP); ``argument_max_chars`` caps the size of any
+    single tool call's argument blob.
+  - **`deny_bash_command` (extended)** — set
+    ``block_dangerous_defaults: true`` to union in a curated
+    preset of high-confidence patterns (recursive ``rm -rf``,
+    fork bombs, ``curl … | sh``, ``sudo``, ``chmod +s``, ``dd
+    if=``, …) without re-discovering them from first principles.
+    Operator patterns still take precedence in evaluation order.
+  - **`deny_mcp_call` (extended)** — adds a deny-by-default
+    ``allowed_servers`` allowlist (substring match) plus a
+    separate ``denied_resources`` regex axis scoped to MCP
+    resource paths. The original ``patterns`` denylist still
+    works; the three axes can be combined freely.
+  - **`deny_db_query` (new)** — content-based detection of
+    SQL-shaped tool calls. Works regardless of which tool wraps
+    the query (``run_sql``, ``execute_query``, ``db_run``…).
+    Three axes: ``query_patterns`` (operator regex against
+    arguments), ``denied_tables`` (word-boundary table-name
+    matching that tolerates backticks / quoted / bracketed /
+    backslash-escaped identifiers), and ``dangerous_operations``
+    (default-on list of DROP / TRUNCATE / DELETE / ALTER /
+    GRANT / REVOKE / CREATE USER / DROP USER, with multi-word
+    op support). Tool-name scoping via ``tool_patterns`` is
+    optional.
+  - **`deny_financial_action` (new)** — block tool calls that
+    look like money movement above operator-defined risk
+    appetite. Four axes: ``action_patterns`` (regex against
+    tool name; defaults to a curated set of payment verbs that
+    handles snake_case + camelCase via letter-boundary regex),
+    ``amount_threshold`` + ``amount_field`` (recursive walk of
+    parsed JSON arguments to find amount-shaped values, even
+    when nested), ``denied_destinations`` (regex against
+    serialized arguments), and ``allowed_currencies`` (case-
+    insensitive currency allowlist applied to ``currency`` keys
+    anywhere in the arguments tree).
+
+  All five policy kinds remain in **Phase 1** of the two-phase
+  policy contract — pure-Python regex + JSON walking, no network,
+  no LLM judge. They short-circuit cleanly so a Phase 1 block
+  never lets a request reach Phase 2 (`semantic_guard`),
+  preserving the security-and-compliance.mdc §2 contract.
+
+### Backwards compatibility
+
+- Pure additions. Existing rules with no new keys behave
+  identically. ``deny_bash_command`` defaults remain
+  operator-supplied unless ``block_dangerous_defaults`` is set;
+  ``deny_db_query`` and ``deny_financial_action`` default to
+  their curated lists when the corresponding config is omitted
+  (operators turn them off explicitly with empty lists).
+
+---
+
 ## [0.13.3] — 2026-05-07
 
 ### Fixed

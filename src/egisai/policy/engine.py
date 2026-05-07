@@ -163,8 +163,9 @@ class PolicyDecision:
 # now target any rule type on the pre-model phase: when an
 # output-typed rule lands here it routes through phase 1 (still
 # fully deterministic) and either fires (``deny_output_regex``
-# matches prompt text) or silently no-ops (tool / bash / MCP
-# rules don't have prompt-side signals to evaluate against).
+# matches prompt text) or silently no-ops (tool / bash / MCP /
+# database / financial rules don't have prompt-side signals to
+# evaluate against).
 _DETERMINISTIC_KINDS = frozenset(
     {
         "allow_model",
@@ -175,11 +176,104 @@ _DETERMINISTIC_KINDS = frozenset(
         "deny_tool_call",
         "deny_bash_command",
         "deny_mcp_call",
+        "deny_db_query",
+        "deny_financial_action",
     }
 )
 
 # Network-issuing checks (LLM judges, embedding lookups, …).
 _LLM_BACKED_KINDS = frozenset({"semantic_guard"})
+
+
+# ── Curated defaults for the runtime-governance policies ────────────
+#
+# These are battle-tested seed patterns that block the most common
+# classes of agentic damage. Operators turn them on by setting
+# ``block_dangerous_defaults: true`` in the rule config; they can
+# still add their own ``command_patterns`` / ``query_patterns`` /
+# ``action_patterns`` on top. The defaults are deliberately
+# conservative — false-positives are easier to debug than the
+# alternative.
+
+# Bash / shell command patterns that almost always indicate
+# destructive intent. Used by ``deny_bash_command`` when
+# ``block_dangerous_defaults`` is set.
+_DEFAULT_DANGEROUS_BASH_PATTERNS: tuple[str, ...] = (
+    # Recursive force-deletes — the textbook agent footgun.
+    r"\brm\s+(-\w*r\w*\s+)+",
+    r"\brm\s+-rf?\b",
+    # Disk-wreckers.
+    r"\bdd\s+if=",
+    r"\bmkfs(\.\w+)?\b",
+    r"\bshred\b",
+    # Fork-bombs and unbounded background loops.
+    r":\(\)\s*\{\s*:\|:&\s*\}\s*;",
+    # "Pipe a script from the internet straight into a shell."
+    r"\bcurl\s+[^|]*\|\s*(bash|sh|zsh)\b",
+    r"\bwget\s+[^|]*\|\s*(bash|sh|zsh)\b",
+    # Privilege escalation + remote code exec primitives.
+    r"\bsudo\s+",
+    r"\bchmod\s+(?:\+s|[0-7]?7[0-7][0-7])\b",
+    r"\beval\s+\$",
+    # Common lateral-movement / credential-leak verbs.
+    r"\bnetcat\b|\bnc\s+-",
+    r"\b(scp|rsync)\s+.*@",
+)
+
+# SQL operations that mutate or destroy data at scale. Used by
+# ``deny_db_query`` when ``dangerous_operations`` isn't set
+# explicitly.
+_DEFAULT_DANGEROUS_DB_OPERATIONS: tuple[str, ...] = (
+    "DROP",
+    "TRUNCATE",
+    "DELETE",
+    "ALTER",
+    "GRANT",
+    "REVOKE",
+    "CREATE USER",
+    "DROP USER",
+)
+
+# Financial / money-movement verbs. The default list of action
+# patterns scanned against tool names by ``deny_financial_action``
+# when the rule's ``action_patterns`` is empty. Conservative
+# enough to fire on real money flows but not generic CRUD.
+#
+# We use *letter* boundaries (``(?<![a-zA-Z])`` / ``(?![a-zA-Z])``)
+# instead of regex ``\b`` because tool names commonly use
+# ``snake_case`` (``stripe_payout``, ``acme_transfer``) and
+# ``camelCase`` (``transferFunds``); ``\b`` treats ``_`` as a
+# word character, so ``\btransfer\b`` would NOT match
+# ``stripe_transfer`` — the most common real-world naming.
+# Letter boundaries match all four conventions while still
+# rejecting partial matches like ``transferred``.
+_DEFAULT_FINANCIAL_VERBS: tuple[str, ...] = (
+    r"(?<![a-zA-Z])transfer(?![a-zA-Z])",
+    r"(?<![a-zA-Z])charge(?![a-zA-Z])",
+    r"(?<![a-zA-Z])refund(?![a-zA-Z])",
+    r"(?<![a-zA-Z])payout(?![a-zA-Z])",
+    r"(?<![a-zA-Z])withdraw(?![a-zA-Z])",
+    r"(?<![a-zA-Z])wire(?![a-zA-Z])",
+    r"(?<![a-zA-Z])ach(?![a-zA-Z])",
+    r"(?<![a-zA-Z])debit(?![a-zA-Z])",
+    r"send[_\s-]*money",
+    r"(?<![a-zA-Z])purchase(?![a-zA-Z])",
+    r"initiate[_\s-]*payment",
+)
+
+# JSON-argument-shaped fields most financial APIs use to carry
+# the amount. Operators can override via ``amount_field`` in the
+# rule config; we walk the parsed JSON for any of these on a
+# best-effort basis.
+_DEFAULT_AMOUNT_FIELD_NAMES: tuple[str, ...] = (
+    "amount",
+    "amount_usd",
+    "amount_cents",
+    "value",
+    "total",
+    "sum",
+    "price",
+)
 
 
 def _runs_pre_model(rule: PolicyRule) -> bool:
@@ -699,82 +793,19 @@ def _evaluate_one_output_policy(
         )
 
     if policy.type == "deny_tool_call":
-        patterns = policy.config.get("patterns", [])
-        if isinstance(patterns, list):
-            tool_names = list(context.tool_names)
-            tool_names.extend(
-                tool_call.get("name", "")
-                for tool_call in context.tool_calls
-                if isinstance(tool_call.get("name"), str)
-            )
-            for tool_name in tool_names:
-                for pattern in patterns:
-                    if isinstance(pattern, str) and safe_search(
-                        pattern, tool_name, re.IGNORECASE
-                    ):
-                        return MatchedPolicyRecord(
-                            name=policy.name,
-                            type=policy.type,
-                            verdict="block",
-                            reason_code="tool_call_blocked",
-                            message=policy.config.get(
-                                "message",
-                                f"Tool call '{tool_name}' was blocked.",
-                            ),
-                        )
-        return None
+        return _deny_tool_call_match(policy, context)
 
     if policy.type == "deny_bash_command":
-        command_patterns = policy.config.get("command_patterns", [])
-        tool_patterns = policy.config.get(
-            "tool_patterns", [r"^bash$", r"^shell$"]
-        )
-        if isinstance(command_patterns, list) and isinstance(tool_patterns, list):
-            for tool_call in context.tool_calls:
-                tool_name = tool_call.get("name", "")
-                arguments = tool_call.get("arguments", "")
-                if not isinstance(tool_name, str) or not isinstance(arguments, str):
-                    continue
-                if not any(
-                    isinstance(tp, str) and safe_search(tp, tool_name, re.IGNORECASE)
-                    for tp in tool_patterns
-                ):
-                    continue
-                for pattern in command_patterns:
-                    if isinstance(pattern, str) and safe_search(
-                        pattern, arguments, re.IGNORECASE
-                    ):
-                        return MatchedPolicyRecord(
-                            name=policy.name,
-                            type=policy.type,
-                            verdict="block",
-                            reason_code="bash_command_blocked",
-                            message=policy.config.get(
-                                "message",
-                                f"Bash command in tool call '{tool_name}' was blocked.",
-                            ),
-                        )
-        return None
+        return _deny_bash_command_match(policy, context)
 
     if policy.type == "deny_mcp_call":
-        patterns = policy.config.get("patterns", [])
-        if isinstance(patterns, list):
-            for target in context.mcp_targets:
-                for pattern in patterns:
-                    if isinstance(pattern, str) and safe_search(
-                        pattern, target, re.IGNORECASE
-                    ):
-                        return MatchedPolicyRecord(
-                            name=policy.name,
-                            type=policy.type,
-                            verdict="block",
-                            reason_code="mcp_call_blocked",
-                            message=policy.config.get(
-                                "message",
-                                f"MCP call '{target}' was blocked.",
-                            ),
-                        )
-        return None
+        return _deny_mcp_call_match(policy, context)
+
+    if policy.type == "deny_db_query":
+        return _deny_db_query_match(policy, context)
+
+    if policy.type == "deny_financial_action":
+        return _deny_financial_action_match(policy, context)
 
     if policy.type == "semantic_guard":
         return _semantic_guard_match(
@@ -785,3 +816,597 @@ def _evaluate_one_output_policy(
         )
 
     return None
+
+
+# ── Runtime-governance evaluators ───────────────────────────────────────
+#
+# These four evaluators implement the "runtime control plane" surface
+# the platform exposes via the ``deny_tool_call`` / ``deny_bash_command``
+# / ``deny_mcp_call`` / ``deny_db_query`` / ``deny_financial_action``
+# policy types. They share three properties:
+#
+# 1. **Local-only.** Pure-Python regex against signals already extracted
+#    in ``_output_signals.py``. No network, no LLM judge, no extra
+#    state — they fit cleanly in Phase 1 of the two-phase contract.
+# 2. **Best-effort.** Each evaluator inspects the structured
+#    ``tool_calls`` / ``mcp_targets`` lists the patches collected. When
+#    a provider didn't ship those signals (older providers, bare HTTP
+#    fallback) the rule silently no-ops — fail-open on availability
+#    per the SDK design philosophy.
+# 3. **Argument-aware.** Where it makes sense (tool args, SQL query
+#    strings, financial amounts) the evaluator parses the
+#    JSON-serialized ``arguments`` blob the patches normalize so a
+#    rule can introspect *what* the tool was being called with, not
+#    just *whether* the tool exists. A tool name allow-list isn't
+#    enough on its own — ``send_message(text="DROP TABLE users")``
+#    looks innocuous on the name alone.
+
+
+def _config_str_list(config: dict[str, Any], key: str) -> list[str]:
+    """Read a config value that should be ``list[str]``, defensively.
+
+    Returns ``[]`` for any malformed value (None, dict, mixed list,
+    string-instead-of-list). Mismatched config never raises here —
+    the rule simply does nothing, matching the SDK's fail-open-on-
+    availability contract. The same helper is used by every
+    runtime-governance evaluator so a typo in a single rule's config
+    can't break the whole policy walk.
+    """
+    raw = config.get(key)
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, str) and item]
+
+
+def _parse_tool_arguments(arguments: str) -> Any:
+    """Parse a tool-call ``arguments`` JSON string into a Python value.
+
+    The patches in ``_output_signals.py`` always coerce arguments to
+    a JSON string (sometimes via ``json.dumps`` of a dict the
+    provider already structured). Returns ``None`` when the string
+    isn't valid JSON — the caller treats that as "no structured
+    args available" and skips structural checks.
+    """
+    if not arguments:
+        return None
+    try:
+        import json as _json
+
+        return _json.loads(arguments)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _walk_amount_values(obj: Any, field_names: tuple[str, ...]) -> list[float]:
+    """Collect every numeric value in ``obj`` keyed by one of
+    ``field_names`` (recursive).
+
+    Used by ``deny_financial_action`` to find an amount-shaped value
+    inside a tool's arguments without committing to a single schema —
+    every payment provider names the field a little differently
+    (``amount``, ``amount_cents``, ``value``…). Strings that parse
+    as numbers (``"100.00"``) are accepted; non-numeric strings,
+    ``None``, and booleans are skipped silently.
+    """
+    out: list[float] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(k, str) and k.lower() in {f.lower() for f in field_names}:
+                if isinstance(v, bool):
+                    # ``bool`` is a subclass of ``int``; skip it
+                    # explicitly so ``True``/``False`` don't read as
+                    # 1/0 amounts.
+                    continue
+                if isinstance(v, int | float):
+                    out.append(float(v))
+                elif isinstance(v, str):
+                    try:
+                        out.append(float(v))
+                    except ValueError:
+                        pass
+            else:
+                out.extend(_walk_amount_values(v, field_names))
+    elif isinstance(obj, list):
+        for item in obj:
+            out.extend(_walk_amount_values(item, field_names))
+    return out
+
+
+def _deny_tool_call_match(
+    policy: PolicyRule,
+    context: OutputPolicyContext,
+) -> MatchedPolicyRecord | None:
+    """Block when the model invokes (or registers) a tool that
+    matches one of the operator's patterns.
+
+    Three independent matching axes:
+
+    * ``patterns`` — regex against the tool *name* (definition or
+      live call). The original behavior, retained verbatim.
+    * ``argument_patterns`` — regex against the JSON-serialized
+      ``arguments`` blob of each live tool call. Catches dangerous
+      usage of an otherwise-legitimate tool (e.g. an allow-listed
+      ``http_get`` being pointed at an internal IP). Empty / missing
+      list = skipped.
+    * ``argument_max_chars`` — integer cap on the size of any
+      single tool call's serialized arguments. Stops accidental /
+      adversarial dumps from hitting downstream side-effects.
+    """
+    name_patterns = _config_str_list(policy.config, "patterns")
+    arg_patterns = _config_str_list(policy.config, "argument_patterns")
+    raw_max_args = policy.config.get("argument_max_chars")
+    arg_max_chars: int | None = (
+        int(raw_max_args)
+        if isinstance(raw_max_args, int) and not isinstance(raw_max_args, bool)
+        else None
+    )
+
+    # Axis 1: tool name (definition + live call). Walk both lists.
+    candidate_names = list(context.tool_names)
+    candidate_names.extend(
+        tc.get("name", "") for tc in context.tool_calls
+        if isinstance(tc.get("name"), str)
+    )
+    for tool_name in candidate_names:
+        for pattern in name_patterns:
+            if safe_search(pattern, tool_name, re.IGNORECASE):
+                return MatchedPolicyRecord(
+                    name=policy.name,
+                    type=policy.type,
+                    verdict="block",
+                    reason_code="tool_call_blocked",
+                    message=policy.config.get(
+                        "message",
+                        f"Tool call '{tool_name}' was blocked.",
+                    ),
+                )
+
+    # Axes 2 + 3: per-call argument inspection. Only meaningful for
+    # *live* tool calls — definitions don't carry arguments.
+    if arg_patterns or arg_max_chars is not None:
+        for tc in context.tool_calls:
+            tool_name = tc.get("name", "") or ""
+            arguments = tc.get("arguments", "") or ""
+            if not isinstance(arguments, str):
+                continue
+            if (
+                arg_max_chars is not None
+                and len(arguments) > arg_max_chars
+            ):
+                return MatchedPolicyRecord(
+                    name=policy.name,
+                    type=policy.type,
+                    verdict="block",
+                    reason_code="tool_call_blocked",
+                    message=policy.config.get(
+                        "message",
+                        f"Tool call '{tool_name}' arguments exceed "
+                        f"the {arg_max_chars}-char limit.",
+                    ),
+                )
+            for pattern in arg_patterns:
+                if safe_search(pattern, arguments, re.IGNORECASE):
+                    return MatchedPolicyRecord(
+                        name=policy.name,
+                        type=policy.type,
+                        verdict="block",
+                        reason_code="tool_call_blocked",
+                        message=policy.config.get(
+                            "message",
+                            f"Tool call '{tool_name}' arguments "
+                            f"matched a blocked pattern.",
+                        ),
+                    )
+    return None
+
+
+def _deny_bash_command_match(
+    policy: PolicyRule,
+    context: OutputPolicyContext,
+) -> MatchedPolicyRecord | None:
+    """Block shell-shaped tool invocations when their command matches
+    a dangerous pattern.
+
+    ``tool_patterns`` (default ``[r"^bash$", r"^shell$"]``) gates
+    *which* tools count as a shell. ``command_patterns`` is the
+    operator's regex list against each call's argument string.
+    Setting ``block_dangerous_defaults: true`` also unions in the
+    curated ``_DEFAULT_DANGEROUS_BASH_PATTERNS`` list — the
+    "everyone wants this" preset that catches ``rm -rf``, fork
+    bombs, ``curl | sh``, sudo, etc., without making the operator
+    re-discover the patterns from first principles.
+    """
+    tool_patterns = _config_str_list(policy.config, "tool_patterns") or [
+        r"^bash$", r"^shell$",
+    ]
+    command_patterns = _config_str_list(policy.config, "command_patterns")
+    if policy.config.get("block_dangerous_defaults"):
+        # Append the curated defaults; preserve operator additions
+        # at the front so explicit patterns still take precedence
+        # in the matching order.
+        command_patterns = list(command_patterns) + list(
+            _DEFAULT_DANGEROUS_BASH_PATTERNS
+        )
+
+    if not command_patterns:
+        return None
+
+    for tool_call in context.tool_calls:
+        tool_name = tool_call.get("name", "")
+        arguments = tool_call.get("arguments", "")
+        if not isinstance(tool_name, str) or not isinstance(arguments, str):
+            continue
+        if not any(
+            safe_search(tp, tool_name, re.IGNORECASE) for tp in tool_patterns
+        ):
+            continue
+        for pattern in command_patterns:
+            if safe_search(pattern, arguments, re.IGNORECASE):
+                return MatchedPolicyRecord(
+                    name=policy.name,
+                    type=policy.type,
+                    verdict="block",
+                    reason_code="bash_command_blocked",
+                    message=policy.config.get(
+                        "message",
+                        f"Bash command in tool call '{tool_name}' was blocked.",
+                    ),
+                )
+    return None
+
+
+def _deny_mcp_call_match(
+    policy: PolicyRule,
+    context: OutputPolicyContext,
+) -> MatchedPolicyRecord | None:
+    """Govern MCP traffic on three independent axes.
+
+    * ``patterns`` — regex blocklist against MCP target strings.
+      The original behavior, retained.
+    * ``allowed_servers`` — *allowlist* of substring-match server
+      identifiers. When non-empty, ANY MCP target that doesn't
+      match at least one entry is blocked. This is the "deny by
+      default" mode — the safer posture for production agents.
+    * ``denied_resources`` — additional regex blocklist scoped to
+      MCP resource paths / URIs (a separate axis from server
+      identity, useful when one server hosts multiple resources
+      with different sensitivity).
+    """
+    deny_patterns = _config_str_list(policy.config, "patterns")
+    allowed_servers = _config_str_list(policy.config, "allowed_servers")
+    denied_resources = _config_str_list(policy.config, "denied_resources")
+
+    if not context.mcp_targets:
+        return None
+
+    for target in context.mcp_targets:
+        # Allowlist pass: when configured, the target MUST match
+        # at least one entry. Substring (case-insensitive) is the
+        # operator-friendly default; an entry like ``"prod"``
+        # allows ``"prod.acme.io/db"`` but blocks
+        # ``"staging.acme.io/db"``.
+        if allowed_servers:
+            target_lc = target.lower()
+            if not any(s.lower() in target_lc for s in allowed_servers):
+                return MatchedPolicyRecord(
+                    name=policy.name,
+                    type=policy.type,
+                    verdict="block",
+                    reason_code="mcp_call_blocked",
+                    message=policy.config.get(
+                        "message",
+                        f"MCP server '{target}' is not on the allowlist.",
+                    ),
+                )
+
+        # Denylist passes: explicit patterns override.
+        for pattern in deny_patterns:
+            if safe_search(pattern, target, re.IGNORECASE):
+                return MatchedPolicyRecord(
+                    name=policy.name,
+                    type=policy.type,
+                    verdict="block",
+                    reason_code="mcp_call_blocked",
+                    message=policy.config.get(
+                        "message",
+                        f"MCP call '{target}' was blocked.",
+                    ),
+                )
+        for pattern in denied_resources:
+            if safe_search(pattern, target, re.IGNORECASE):
+                return MatchedPolicyRecord(
+                    name=policy.name,
+                    type=policy.type,
+                    verdict="block",
+                    reason_code="mcp_call_blocked",
+                    message=policy.config.get(
+                        "message",
+                        f"MCP resource '{target}' is on the denied list.",
+                    ),
+                )
+    return None
+
+
+def _deny_db_query_match(
+    policy: PolicyRule,
+    context: OutputPolicyContext,
+) -> MatchedPolicyRecord | None:
+    """Block SQL-shaped tool calls that touch dangerous tables /
+    operations.
+
+    Detection is **content-based**, not tool-name-based: agents
+    invoke databases under a thousand different tool wrappers
+    (``run_sql``, ``execute_query``, ``db.query``, ``snowflake_run``).
+    Looking only at tool names misses the long tail. We instead
+    scan the arguments blob of every tool call for SQL-like text.
+
+    Three independent matching axes:
+
+    * ``query_patterns`` — operator's full-regex list against the
+      argument string of each tool call.
+    * ``denied_tables`` — table names. We match
+      ``\\b(FROM|UPDATE|INTO|TABLE)\\s+["`]?<table>\\b``.
+    * ``dangerous_operations`` — top-level SQL verbs (default:
+      DROP / TRUNCATE / DELETE / ALTER / GRANT). Set
+      ``block_dangerous_defaults: false`` to disable.
+
+    Operators can scope this to specific tools via ``tool_patterns``
+    (default: any tool whose call arguments look SQL-shaped).
+    """
+    query_patterns = _config_str_list(policy.config, "query_patterns")
+    denied_tables = _config_str_list(policy.config, "denied_tables")
+    raw_ops = policy.config.get("dangerous_operations")
+    if isinstance(raw_ops, list):
+        dangerous_ops = [o for o in raw_ops if isinstance(o, str)]
+    elif policy.config.get("block_dangerous_defaults", True):
+        # Default-on: most operators want the curated list to fire
+        # automatically when this rule is created. Opt-out by
+        # setting ``dangerous_operations: []`` explicitly.
+        dangerous_ops = list(_DEFAULT_DANGEROUS_DB_OPERATIONS)
+    else:
+        dangerous_ops = []
+
+    if not (query_patterns or denied_tables or dangerous_ops):
+        return None
+
+    tool_patterns = _config_str_list(policy.config, "tool_patterns")
+
+    for tool_call in context.tool_calls:
+        tool_name = tool_call.get("name", "") or ""
+        arguments = tool_call.get("arguments", "") or ""
+        if not isinstance(arguments, str) or not arguments:
+            continue
+        # Optional tool-name scoping; default applies to any tool.
+        if tool_patterns and not any(
+            safe_search(tp, tool_name, re.IGNORECASE) for tp in tool_patterns
+        ):
+            continue
+
+        # Axis 1: explicit operator regex.
+        for pattern in query_patterns:
+            if safe_search(pattern, arguments, re.IGNORECASE):
+                return MatchedPolicyRecord(
+                    name=policy.name,
+                    type=policy.type,
+                    verdict="block",
+                    reason_code="db_query_blocked",
+                    message=policy.config.get(
+                        "message",
+                        f"Database query in '{tool_name}' was blocked.",
+                    ),
+                )
+
+        # Axis 2: dangerous operations. We use word-boundary anchors
+        # so 'DROP' fires on 'DROP TABLE' but not on 'tear-DROP-shaped'.
+        for op in dangerous_ops:
+            # Build a tolerant pattern: word-boundary on each side,
+            # and treat operator-supplied multi-word strings ("CREATE
+            # USER") as literal whitespace runs.
+            op_re = r"\b" + r"\s+".join(
+                re.escape(part) for part in op.split()
+            ) + r"\b"
+            if safe_search(op_re, arguments, re.IGNORECASE):
+                return MatchedPolicyRecord(
+                    name=policy.name,
+                    type=policy.type,
+                    verdict="block",
+                    reason_code="db_query_blocked",
+                    message=policy.config.get(
+                        "message",
+                        f"Dangerous SQL operation '{op}' in tool '{tool_name}' "
+                        f"was blocked.",
+                    ),
+                )
+
+        # Axis 3: denied tables. We look for the table name appearing
+        # in a SQL position that mutates / reads from it. Backticks /
+        # double-quotes / brackets are tolerated, and so are
+        # backslash-escaped quotes that appear when the SQL string
+        # arrives JSON-encoded inside the tool's arguments
+        # (``"sql": "SELECT * FROM \"users\""``).
+        for table in denied_tables:
+            tbl_re = (
+                r"\b(?:FROM|UPDATE|INTO|TABLE|JOIN)\s+"
+                r"\\*['`\"\[]?"
+                + re.escape(table)
+                + r"\\*['`\"\]]?\b"
+            )
+            if safe_search(tbl_re, arguments, re.IGNORECASE):
+                return MatchedPolicyRecord(
+                    name=policy.name,
+                    type=policy.type,
+                    verdict="block",
+                    reason_code="db_query_blocked",
+                    message=policy.config.get(
+                        "message",
+                        f"Database query against table '{table}' "
+                        f"in tool '{tool_name}' was blocked.",
+                    ),
+                )
+    return None
+
+
+def _deny_financial_action_match(
+    policy: PolicyRule,
+    context: OutputPolicyContext,
+) -> MatchedPolicyRecord | None:
+    """Block tool calls that look like money movement above the
+    operator's risk appetite.
+
+    Three independent matching axes — any one match blocks:
+
+    * ``action_patterns`` — regex against the tool *name*. Default
+      list (``transfer``, ``charge``, ``refund``, ``payout``,
+      ``withdraw``, …) catches the vast majority of payment
+      vendor naming conventions; operator can replace or extend.
+    * ``amount_threshold`` — when set, any matching tool call whose
+      arguments contain an amount-shaped field above this number
+      blocks. Field names default to a curated set
+      (``amount``/``amount_cents``/``value``/…) but can be
+      narrowed via ``amount_field``.
+    * ``denied_destinations`` — regex against destination-shaped
+      fields in the arguments (``to_account``, ``recipient``,
+      ``destination``, ``iban``).
+    * ``allowed_currencies`` — when set, any call whose arguments
+      include a ``currency`` field NOT in this list blocks.
+
+    Detection again uses argument introspection (parsed JSON) so
+    a generic tool like ``http_post`` to a payments endpoint is
+    caught when its body contains the financial primitives.
+    """
+    action_patterns = _config_str_list(policy.config, "action_patterns")
+    if not action_patterns:
+        # Default-on if no operator list provided; most operators
+        # creating this rule WANT the default list to fire.
+        action_patterns = list(_DEFAULT_FINANCIAL_VERBS)
+
+    raw_threshold = policy.config.get("amount_threshold")
+    threshold: float | None = None
+    if isinstance(raw_threshold, int | float) and not isinstance(
+        raw_threshold, bool
+    ):
+        threshold = float(raw_threshold)
+
+    raw_fields = policy.config.get("amount_field")
+    if isinstance(raw_fields, str) and raw_fields:
+        amount_fields: tuple[str, ...] = (raw_fields,)
+    elif isinstance(raw_fields, list):
+        amount_fields = tuple(
+            f for f in raw_fields if isinstance(f, str) and f
+        ) or _DEFAULT_AMOUNT_FIELD_NAMES
+    else:
+        amount_fields = _DEFAULT_AMOUNT_FIELD_NAMES
+
+    denied_destinations = _config_str_list(policy.config, "denied_destinations")
+    allowed_currencies_raw = _config_str_list(policy.config, "allowed_currencies")
+    allowed_currencies = {c.upper() for c in allowed_currencies_raw}
+
+    for tool_call in context.tool_calls:
+        tool_name = tool_call.get("name", "") or ""
+        arguments = tool_call.get("arguments", "") or ""
+        if not isinstance(tool_name, str):
+            continue
+        # The financial axis ONLY fires for tool calls that look
+        # financial — a name match. This prevents the rule from
+        # blocking unrelated tools that happen to carry an
+        # "amount" field (e.g. an analytics ``track_event`` with
+        # ``{"amount": 1}``).
+        if not any(
+            safe_search(p, tool_name, re.IGNORECASE) for p in action_patterns
+        ):
+            continue
+
+        # Axis 1: matched on name alone. If neither threshold nor
+        # destination filtering is configured, the name match alone
+        # is enough — block immediately. Most operators creating a
+        # ``deny_financial_action`` rule mean "no money tools."
+        no_secondary_filter = (
+            threshold is None
+            and not denied_destinations
+            and not allowed_currencies
+        )
+        if no_secondary_filter:
+            return MatchedPolicyRecord(
+                name=policy.name,
+                type=policy.type,
+                verdict="block",
+                reason_code="financial_action_blocked",
+                message=policy.config.get(
+                    "message",
+                    f"Financial action '{tool_name}' was blocked.",
+                ),
+            )
+
+        parsed = _parse_tool_arguments(arguments) if arguments else None
+
+        # Axis 2: amount threshold. Walk parsed arguments for any
+        # amount-shaped field over the configured cap.
+        if threshold is not None and parsed is not None:
+            amounts = _walk_amount_values(parsed, amount_fields)
+            offending = [a for a in amounts if a > threshold]
+            if offending:
+                return MatchedPolicyRecord(
+                    name=policy.name,
+                    type=policy.type,
+                    verdict="block",
+                    reason_code="financial_action_blocked",
+                    message=policy.config.get(
+                        "message",
+                        f"Financial action '{tool_name}' exceeded the "
+                        f"amount threshold ({offending[0]} > {threshold}).",
+                    ),
+                )
+
+        # Axis 3: denied destinations. Matches against the
+        # serialized arguments string (operator-supplied regex
+        # already encodes the field shape).
+        if denied_destinations and isinstance(arguments, str):
+            for pattern in denied_destinations:
+                if safe_search(pattern, arguments, re.IGNORECASE):
+                    return MatchedPolicyRecord(
+                        name=policy.name,
+                        type=policy.type,
+                        verdict="block",
+                        reason_code="financial_action_blocked",
+                        message=policy.config.get(
+                            "message",
+                            f"Financial action '{tool_name}' targets a "
+                            f"denied destination.",
+                        ),
+                    )
+
+        # Axis 4: currency allowlist. Walk parsed arguments looking
+        # for a ``currency`` field; block when present and not in
+        # the allowed set.
+        if allowed_currencies and parsed is not None:
+            for currency in _walk_currency_values(parsed):
+                if currency.upper() not in allowed_currencies:
+                    return MatchedPolicyRecord(
+                        name=policy.name,
+                        type=policy.type,
+                        verdict="block",
+                        reason_code="financial_action_blocked",
+                        message=policy.config.get(
+                            "message",
+                            f"Financial action '{tool_name}' uses a "
+                            f"non-allowed currency '{currency}'.",
+                        ),
+                    )
+    return None
+
+
+def _walk_currency_values(obj: Any) -> list[str]:
+    """Collect every string value keyed by ``currency`` in a parsed
+    arguments tree. Used by ``deny_financial_action``'s currency
+    allowlist."""
+    out: list[str] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(k, str) and k.lower() == "currency" and isinstance(v, str):
+                out.append(v)
+            else:
+                out.extend(_walk_currency_values(v))
+    elif isinstance(obj, list):
+        for item in obj:
+            out.extend(_walk_currency_values(item))
+    return out
