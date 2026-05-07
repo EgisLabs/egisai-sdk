@@ -96,8 +96,28 @@ def _detect_serverless_hint() -> str | None:
     return None
 
 
+# Process-lifetime cache. The fingerprint is built from values that
+# CAN'T change inside a running process (Python version, OS, machine,
+# container/serverless-platform env, installed framework versions).
+# Walking ``importlib.metadata`` for four framework names + reading
+# ``/proc/1/cgroup`` on every per-prompt agent registration would
+# burn measurable CPU on a multi-agent app — for a value that's
+# byte-for-byte identical between calls. Cache once.
+_CACHED: dict[str, Any] | None = None
+_CACHED_SDK_VERSION: str | None = None
+
+
 def collect_runtime_fingerprint(*, sdk_version: str) -> dict[str, Any]:
-    """Return the JSON-friendly runtime blob shipped to the backend."""
+    """Return the JSON-friendly runtime blob shipped to the backend.
+
+    Cached for the lifetime of the SDK process. Subsequent calls
+    return the same dict (defensively copied so callers can't mutate
+    the cache).
+    """
+    global _CACHED, _CACHED_SDK_VERSION
+    if _CACHED is not None and _CACHED_SDK_VERSION == sdk_version:
+        return dict(_CACHED)
+
     framework_versions: dict[str, str] = {}
     for name in ("openai", "anthropic", "google.genai", "google-generativeai"):
         v = _safe_distribution_version(name)
@@ -107,7 +127,7 @@ def collect_runtime_fingerprint(*, sdk_version: str) -> dict[str, Any]:
     container = _detect_container()
     serverless = _detect_serverless_hint()
 
-    return {
+    blob: dict[str, Any] = {
         "sdk_version": sdk_version,
         "python": ".".join(str(p) for p in sys.version_info[:3]),
         "implementation": platform.python_implementation(),
@@ -118,3 +138,13 @@ def collect_runtime_fingerprint(*, sdk_version: str) -> dict[str, Any]:
         "serverless": serverless,
         "frameworks": framework_versions,
     }
+    _CACHED = blob
+    _CACHED_SDK_VERSION = sdk_version
+    return dict(blob)
+
+
+def reset_runtime_cache() -> None:
+    """Test hook — drop the cached fingerprint so a fresh collect runs."""
+    global _CACHED, _CACHED_SDK_VERSION
+    _CACHED = None
+    _CACHED_SDK_VERSION = None

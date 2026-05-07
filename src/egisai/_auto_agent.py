@@ -124,13 +124,27 @@ def resolve_agent_id(identity_hash: str, display_name: str) -> str | None:
         try:
             from egisai._backend import ensure_agent
             from egisai._config import get_config_optional
+            from egisai._runtime import collect_runtime_fingerprint
 
             cfg = get_config_optional()
             if cfg is None:
                 return None
+            # Ship the runtime fingerprint on every agent registration —
+            # not just explicit ``set_context(agent=…)`` calls. Without
+            # this, the most common path (auto-detection from a unique
+            # system prompt) registers agents with an empty Provenance
+            # card on the dashboard. Cached inside ``_runtime`` so this
+            # is a dict-copy, not a fresh import-walk.
+            try:
+                runtime = collect_runtime_fingerprint(
+                    sdk_version=cfg.sdk_version,
+                )
+            except Exception:  # noqa: BLE001
+                runtime = None
             payload = ensure_agent(
                 name=display_name,
                 description=f"Auto-detected by SDK from system prompt fingerprint {identity_hash[:8]}",
+                runtime=runtime,
             )
             agent_id = payload.get("id")
             if isinstance(agent_id, str) and agent_id:

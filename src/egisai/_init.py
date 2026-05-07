@@ -129,7 +129,7 @@ def init(
 
             rt_blob: dict[str, Any] | None
             try:
-                rt_blob = collect_runtime_fingerprint()
+                rt_blob = collect_runtime_fingerprint(sdk_version=__version__)
             except Exception:  # noqa: BLE001
                 rt_blob = None
             hs = handshake(

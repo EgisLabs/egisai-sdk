@@ -143,3 +143,20 @@ def test_end_to_end_anthropic_payload_registers_subagent(fake_backend) -> None:
     assert registered == ["Copywriter", "Python Developer"], (
         f"expected exactly two unique sub-agents to register, got {registered}"
     )
+
+    # Every auto-registered agent MUST ship the runtime fingerprint —
+    # otherwise the dashboard's Provenance card stays blank for the
+    # most common path (system-prompt fingerprinting). Regression
+    # guard for the 0.13.2 fix.
+    ensure_bodies = fake_backend.ensure_requests
+    assert ensure_bodies, "expected at least one /v1/sdk/agents/ensure call"
+    for body in ensure_bodies:
+        rt = body.get("runtime")
+        assert isinstance(rt, dict) and rt, (
+            f"runtime fingerprint missing on ensure call: {body!r}"
+        )
+        # Spot-check the keys the dashboard renders so a key-rename
+        # in _runtime.collect_runtime_fingerprint can't silently
+        # blank out the Provenance card.
+        for key in ("sdk_version", "python", "os", "frameworks"):
+            assert key in rt, f"runtime missing {key!r}: {rt!r}"

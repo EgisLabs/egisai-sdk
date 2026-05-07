@@ -98,6 +98,12 @@ class FakeBackend:
         self.etag: str = '"empty"'
         self.handshake_calls = 0
         self.ensured_agents: list[dict[str, Any]] = []
+        # Raw request bodies hitting /v1/sdk/agents/ensure — useful
+        # for tests that need to assert what the SDK actually shipped
+        # (e.g. that runtime fingerprint was included). Indexed in
+        # call order; one entry per HTTP request.
+        self.ensure_requests: list[dict[str, Any]] = []
+        self.handshake_requests: list[dict[str, Any]] = []
         self._next_agent_serial = 100
 
     def set_rules(self, rules: list[dict[str, Any]], etag: str = '"new"') -> None:
@@ -108,6 +114,15 @@ class FakeBackend:
         path = request.url.path
         if path.endswith("/v1/sdk/handshake"):
             self.handshake_calls += 1
+            try:
+                import json
+
+                if request.content:
+                    self.handshake_requests.append(
+                        json.loads(request.content.decode())
+                    )
+            except Exception:
+                pass
             return httpx.Response(
                 200,
                 json={
@@ -127,6 +142,7 @@ class FakeBackend:
             import json
 
             body = json.loads(request.content.decode())
+            self.ensure_requests.append(body)
             name = body["name"]
             existing = next(
                 (a for a in self.ensured_agents if a["name"] == name), None

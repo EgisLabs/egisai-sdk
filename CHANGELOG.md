@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.13.2] — 2026-05-07
+
+### Fixed
+
+- **Auto-detected agents now show full Provenance.** Sub-agents
+  registered via system-prompt fingerprinting (the most common path
+  in any multi-agent app) were calling `/v1/sdk/agents/ensure`
+  *without* the runtime blob, so their Provenance card on the
+  dashboard stayed blank — no Python version, no OS, no framework
+  versions, no host-class badge. Fixed: every agent registration
+  path (`set_context`, system-prompt auto-detect, handshake) now
+  ships the same fingerprint.
+- **Runtime fingerprint cached for the SDK process.** Walking
+  `importlib.metadata` for four framework names + reading
+  `/proc/1/cgroup` is no longer repeated on every per-prompt
+  registration; the values can't change inside a process so we
+  collect once, return defensive copies thereafter.
+
+---
+
 ## [0.13.1] — 2026-05-06
 
 ### Added
