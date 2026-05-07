@@ -9,6 +9,7 @@ import atexit
 import logging
 import os
 import threading
+from typing import Any
 
 from egisai import __version__
 from egisai._backend import close_client, handshake
@@ -124,7 +125,19 @@ def init(
 
         handshake_ok = False
         try:
-            hs = handshake(app=app, env=env, sdk_version=__version__)
+            from egisai._runtime import collect_runtime_fingerprint
+
+            rt_blob: dict[str, Any] | None
+            try:
+                rt_blob = collect_runtime_fingerprint()
+            except Exception:  # noqa: BLE001
+                rt_blob = None
+            hs = handshake(
+                app=app,
+                env=env,
+                sdk_version=__version__,
+                runtime=rt_blob,
+            )
             cfg = update_config(org_id=hs.get("org_id"), agent_id=hs.get("agent_id"))
             handshake_ok = True
         except Exception as exc:  # noqa: BLE001

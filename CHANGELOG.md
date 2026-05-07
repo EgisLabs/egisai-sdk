@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.13.1] — 2026-05-06
+
+### Added
+
+- **Runtime fingerprint shipped on `/v1/sdk/handshake`.** When the
+  API key is bound to a specific agent, the handshake now stamps
+  the platform-side runtime blob onto that agent's Provenance card
+  immediately — without waiting for the first `set_context(agent=…)`
+  call. Sub-agents continue to be captured via
+  `/v1/sdk/agents/ensure` as before. Older backends ignore the
+  field; older SDKs against new backends behave identically to
+  pre-0.13.1.
+
+### Changed
+
+- `egisai._backend.handshake()` accepts an optional `runtime`
+  kwarg. Internal API; user code is unaffected.
+
+---
+
 ## [0.13.0] — 2026-05-10
 
 ### Added

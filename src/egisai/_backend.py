@@ -96,13 +96,31 @@ def _http_error(*, op: str, status: int) -> BackendError:
     return BackendError(f"{op} failed (HTTP {status})")
 
 
-def handshake(*, app: str, env: str, sdk_version: str) -> dict[str, Any]:
+def handshake(
+    *,
+    app: str,
+    env: str,
+    sdk_version: str,
+    runtime: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Authenticate the API key and (optionally) stamp runtime.
+
+    ``runtime`` (added in 0.13.1) is the same platform-side fingerprint
+    blob shipped by :func:`ensure_agent`. Sending it on handshake
+    populates the Provenance card for an API-key-bound agent on first
+    contact, without waiting for a sub-agent ``set_context`` call.
+    Older backends ignore the field.
+    """
+    payload: dict[str, Any] = {
+        "app": app,
+        "env": env,
+        "sdk_version": sdk_version,
+    }
+    if runtime:
+        payload["runtime"] = runtime
     r = _retry_on_429(
         "handshake",
-        lambda: get_client().post(
-            "/v1/sdk/handshake",
-            json={"app": app, "env": env, "sdk_version": sdk_version},
-        ),
+        lambda: get_client().post("/v1/sdk/handshake", json=payload),
     )
     if r.status_code != 200:
         raise _http_error(op="handshake", status=r.status_code)
