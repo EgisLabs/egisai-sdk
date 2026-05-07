@@ -163,6 +163,20 @@ def ensure_agent(
         payload["description"] = description
     if runtime:
         payload["runtime"] = runtime
+    # DEBUG breadcrumb so a developer staring at an empty Provenance
+    # card on the dashboard can confirm "yes, the SDK actually shipped
+    # the fingerprint" without reaching for tcpdump. Off by default;
+    # opt-in via the standard logging config (set ``egisai.backend``
+    # to DEBUG) or the ``EGISAI_DEBUG=1`` env var honoured elsewhere
+    # in the SDK.
+    if LOGGER.isEnabledFor(logging.DEBUG):
+        rt_keys = sorted(runtime.keys()) if runtime else []
+        LOGGER.debug(
+            "ensure_agent name=%r description=%s runtime_keys=%s",
+            name,
+            "set" if description else "none",
+            rt_keys,
+        )
     r = _retry_on_429(
         "ensure_agent",
         lambda: get_client().post("/v1/sdk/agents/ensure", json=payload),

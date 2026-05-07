@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.13.3] — 2026-05-07
+
+### Fixed
+
+- **Runtime fingerprint cache is now thread-safe.** Two threads
+  racing to populate the cache on the first auto-registered
+  sub-agent could each walk `importlib.metadata` and write the
+  cache concurrently. The cache is now guarded by a lock with a
+  double-checked-read on the hot path, so steady-state lookups stay
+  lock-free while the first miss is serialized. No behavioural
+  change for single-threaded apps.
+
+---
+
 ## [0.13.2] — 2026-05-07
 
 ### Fixed
@@ -24,6 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/proc/1/cgroup` is no longer repeated on every per-prompt
   registration; the values can't change inside a process so we
   collect once, return defensive copies thereafter.
+
+### Added
+
+- **Debug breadcrumb on agent registration.** `egisai.backend`
+  logger now emits a one-line DEBUG record per
+  `/v1/sdk/agents/ensure` call listing the runtime keys shipped.
+  Off by default; turn on with `logging.getLogger("egisai.backend")
+  .setLevel("DEBUG")` to verify from the SDK side that the
+  fingerprint left the building.
 
 ---
 

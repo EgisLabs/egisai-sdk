@@ -42,6 +42,7 @@ import logging
 import os
 import platform
 import sys
+import threading
 from typing import Any
 
 LOGGER = logging.getLogger("egisai.runtime")
@@ -103,8 +104,15 @@ def _detect_serverless_hint() -> str | None:
 # ``/proc/1/cgroup`` on every per-prompt agent registration would
 # burn measurable CPU on a multi-agent app — for a value that's
 # byte-for-byte identical between calls. Cache once.
+#
+# The cache is guarded by a lock so two threads racing to populate
+# it on first init produce one collected blob (rather than two
+# concurrent ``importlib.metadata`` walks). The cache value itself
+# is read lock-free via the double-checked pattern in the body —
+# the lock only matters on the first miss.
 _CACHED: dict[str, Any] | None = None
 _CACHED_SDK_VERSION: str | None = None
+_CACHE_LOCK = threading.Lock()
 
 
 def collect_runtime_fingerprint(*, sdk_version: str) -> dict[str, Any]:
@@ -114,37 +122,55 @@ def collect_runtime_fingerprint(*, sdk_version: str) -> dict[str, Any]:
     return the same dict (defensively copied so callers can't mutate
     the cache).
     """
+    cached = _CACHED
+    if cached is not None and _CACHED_SDK_VERSION == sdk_version:
+        return dict(cached)
+    with _CACHE_LOCK:
+        # Double-check after acquiring the lock — another thread may
+        # have populated the cache while we were waiting.
+        if _CACHED is not None and _CACHED_SDK_VERSION == sdk_version:
+            return dict(_CACHED)
+
+        framework_versions: dict[str, str] = {}
+        for name in (
+            "openai", "anthropic", "google.genai", "google-generativeai",
+        ):
+            v = _safe_distribution_version(name)
+            if v:
+                framework_versions[name] = v
+
+        container = _detect_container()
+        serverless = _detect_serverless_hint()
+
+        blob: dict[str, Any] = {
+            "sdk_version": sdk_version,
+            "python": ".".join(str(p) for p in sys.version_info[:3]),
+            "implementation": platform.python_implementation(),
+            "os": platform.system(),
+            "platform": platform.release(),
+            "machine": platform.machine(),
+            "container": container,
+            "serverless": serverless,
+            "frameworks": framework_versions,
+        }
+        _set_cache(blob, sdk_version)
+        return dict(blob)
+
+
+def _set_cache(blob: dict[str, Any], sdk_version: str) -> None:
+    """Internal helper to mutate module-level cache state.
+
+    Pulled out so the lock-protected critical section reads cleanly
+    and so :func:`reset_runtime_cache` doesn't reach in directly.
+    """
     global _CACHED, _CACHED_SDK_VERSION
-    if _CACHED is not None and _CACHED_SDK_VERSION == sdk_version:
-        return dict(_CACHED)
-
-    framework_versions: dict[str, str] = {}
-    for name in ("openai", "anthropic", "google.genai", "google-generativeai"):
-        v = _safe_distribution_version(name)
-        if v:
-            framework_versions[name] = v
-
-    container = _detect_container()
-    serverless = _detect_serverless_hint()
-
-    blob: dict[str, Any] = {
-        "sdk_version": sdk_version,
-        "python": ".".join(str(p) for p in sys.version_info[:3]),
-        "implementation": platform.python_implementation(),
-        "os": platform.system(),
-        "platform": platform.release(),
-        "machine": platform.machine(),
-        "container": container,
-        "serverless": serverless,
-        "frameworks": framework_versions,
-    }
     _CACHED = blob
     _CACHED_SDK_VERSION = sdk_version
-    return dict(blob)
 
 
 def reset_runtime_cache() -> None:
     """Test hook — drop the cached fingerprint so a fresh collect runs."""
     global _CACHED, _CACHED_SDK_VERSION
-    _CACHED = None
-    _CACHED_SDK_VERSION = None
+    with _CACHE_LOCK:
+        _CACHED = None
+        _CACHED_SDK_VERSION = None
