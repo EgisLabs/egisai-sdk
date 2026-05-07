@@ -54,6 +54,11 @@ def build_event(
         "user_role": ctx.user_role,
         "session_id": ctx.session_id,
         "workflow_id": ctx.workflow_id,
+        # Opaque end-user id used by the platform for per-end-user
+        # behavioral roll-ups. The wire shape is post-hash where
+        # callers follow the docs; the backend hashes again on
+        # intake so a paste of a real customer-id never persists raw.
+        "end_user_id": ctx.end_user_id,
         "source": source,
         "target": target,
         "model": model,

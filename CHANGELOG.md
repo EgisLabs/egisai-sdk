@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.13.0] — 2026-05-10
+
+### Added
+
+- **Agent Identity capture on `/v1/sdk/agents/ensure`.** Every
+  call to `set_context(agent="…")` now ships a small platform-side
+  *runtime fingerprint* (Python version, OS, framework versions,
+  container / serverless hints, SDK version) alongside the agent
+  name. The platform stamps it onto the agent's Provenance card
+  on the dashboard, refreshes it on every redeploy, and uses
+  deltas to detect `runtime_change` anomalies. Privacy: see the
+  `egisai/_runtime.py` module docstring — no hostname, no IP, no
+  env vars, no user paths leave the process.
+- **`set_context(end_user_id="…")`.** New optional context field
+  that ties a governed call to an opaque end-user identifier.
+  The platform hashes it on intake; the SDK encourages callers to
+  ship a SHA-256 already (e.g.
+  `hashlib.sha256(customer_id.encode()).hexdigest()`) so a real
+  customer-id never lands in a network call. Powers per-end-user
+  behavioral roll-ups inside the new Agent Identity modal on the
+  dashboard.
+- **Agent codename + glyph (server-side).** The platform now
+  derives a deterministic, human-friendly codename
+  (e.g. *Crimson-Falcon*) and a stable visual glyph seed from
+  every agent's UUID. Both surface on the dashboard's Agents
+  table and the new Agent Identity modal. No SDK changes
+  required — the SDK's own contract is unchanged for callers
+  not interested in identity surfaces.
+
+### Changed
+
+- **`ensure_agent` SDK helper signature.**
+  `egisai._backend.ensure_agent(name, description=None)` gains an
+  optional `runtime: dict | None = None` parameter. Older backends
+  silently ignore unknown payload keys, so calling 0.13.0 against
+  a 0.12.x platform is safe (the runtime blob is dropped on the
+  floor, identity gracefully falls back to UUID-derived defaults).
+
+### Notes
+
+- This release adds *capture* — the platform-side analyzer
+  (anomaly detection, twin detection, behavioral classification)
+  ships in the same platform release (0030) and reads only the
+  post-sanitization fields (`payload_preview`, `response_preview`,
+  `policy_reason`, `verdict`, `model`) per the security contract
+  in `security-and-compliance.mdc`. No raw prompt or response
+  text leaves the SDK boundary, ever.
+
+---
+
 ## [0.12.5] — 2026-05-06
 
 ### Changed

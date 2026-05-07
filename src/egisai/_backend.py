@@ -126,11 +126,25 @@ def fetch_policies(etag: str | None = None) -> tuple[str | None, list[dict] | No
     return body.get("etag"), body.get("rules", [])
 
 
-def ensure_agent(*, name: str, description: str | None = None) -> dict[str, Any]:
-    """Find-or-create an agent in the caller's org by name. Idempotent."""
+def ensure_agent(
+    *,
+    name: str,
+    description: str | None = None,
+    runtime: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Find-or-create an agent in the caller's org by name. Idempotent.
+
+    ``runtime`` (added in 0.13.0) is the platform-side fingerprint
+    blob produced by :func:`egisai._runtime.collect_runtime_fingerprint`.
+    The backend stamps it onto the agent's Provenance card and uses
+    deltas to spot ``runtime_change`` anomalies. Sending it is
+    optional; older backends ignore unknown keys.
+    """
     payload: dict[str, Any] = {"name": name}
     if description:
         payload["description"] = description
+    if runtime:
+        payload["runtime"] = runtime
     r = _retry_on_429(
         "ensure_agent",
         lambda: get_client().post("/v1/sdk/agents/ensure", json=payload),

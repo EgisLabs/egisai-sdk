@@ -26,6 +26,13 @@ class EgisaiContext:
     agent_name: str | None = None
     session_id: str | None = None
     workflow_id: str | None = None
+    # Opaque, operator-supplied identifier for the *end-user* the
+    # agent is currently serving. The backend hashes it on intake;
+    # the SDK is encouraged to ship a hash already (e.g. a
+    # SHA-256 of the customer-id) so a real PII paste never
+    # leaves the process. Powers per-end-user behavioral roll-ups
+    # inside the Agent Identity modal.
+    end_user_id: str | None = None
 
 
 _ctx: contextvars.ContextVar[EgisaiContext] = contextvars.ContextVar(
@@ -67,6 +74,7 @@ def _resolve_agent_id(name: str) -> str | None:
         try:
             from egisai._backend import ensure_agent
             from egisai._config import get_config_optional
+            from egisai._runtime import collect_runtime_fingerprint
 
             cfg = get_config_optional()
             if cfg is None:
@@ -77,7 +85,8 @@ def _resolve_agent_id(name: str) -> str | None:
                     name,
                 )
                 return None
-            payload = ensure_agent(name=name)
+            runtime = collect_runtime_fingerprint(sdk_version=cfg.sdk_version)
+            payload = ensure_agent(name=name, runtime=runtime)
             agent_id = payload.get("id")
             if isinstance(agent_id, str) and agent_id:
                 _agent_id_cache[name] = agent_id
@@ -115,6 +124,7 @@ def set_context(
     agent_id: str | None = None,
     session_id: str | None = None,
     workflow_id: str | None = None,
+    end_user_id: str | None = None,
 ) -> None:
     """Attach request-level metadata to all subsequent governed calls.
 
@@ -122,6 +132,13 @@ def set_context(
     friendly role name registered with the platform on first use.
     ``agent_id`` is an escape hatch for callers that already know
     the UUID.
+
+    ``end_user_id`` (added in 0.13.0) is an opaque identifier for
+    the *end-user* the agent is currently serving. The platform
+    hashes it on intake; the SDK already encourages callers to
+    ship a hash (e.g. ``hashlib.sha256(customer_id.encode()).hexdigest()``)
+    so a real customer-id never leaves the process. Powers per-end-user
+    behavioral roll-ups inside the Agent Identity modal.
     """
     cur = _ctx.get()
     resolved_id = agent_id
@@ -137,6 +154,9 @@ def set_context(
             agent_name=resolved_name,
             session_id=session_id if session_id is not None else cur.session_id,
             workflow_id=workflow_id if workflow_id is not None else cur.workflow_id,
+            end_user_id=(
+                end_user_id if end_user_id is not None else cur.end_user_id
+            ),
         )
     )
 
