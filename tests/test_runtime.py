@@ -35,6 +35,11 @@ def test_fingerprint_has_every_key_dashboard_reads() -> None:
         "machine",
         "container",
         "serverless",
+        # ``cloud`` drives the agent's Provenance ASN field on the
+        # dashboard. A rename here would silently blank that chip
+        # — see test_runtime_cloud.py for full coverage of the
+        # detection logic.
+        "cloud",
         "frameworks",
     ):
         assert key in rt, f"missing {key!r} in {rt!r}"

@@ -97,6 +97,73 @@ def _detect_serverless_hint() -> str | None:
     return None
 
 
+def _detect_cloud_provider() -> str | None:
+    """Best-effort cloud-provider detector via env vars.
+
+    Distinct from :func:`_detect_serverless_hint` — that one
+    answers "is the agent on a serverless runtime, and which?"
+    and drives the ``host_class`` badge. This one answers
+    "which cloud provider owns this network?" and drives the
+    ``ASN`` field on the agent's Provenance card. The two
+    signals are orthogonal: a Lambda function is both
+    ``serverless = "lambda"`` AND ``cloud = "aws"``; a bare
+    EC2 box is ``serverless = None`` but still ``cloud = "aws"``.
+
+    Detection is purely env-var-based — no metadata-service
+    HTTP calls, no socket probes, no DNS. The SDK design
+    philosophy bans network calls in ``init()``; the IMDS
+    endpoint that would otherwise give us the most authoritative
+    answer is intentionally off the table for that reason.
+
+    Returns a stable, low-cardinality token (``aws``, ``gcp``,
+    ``azure``, ``vercel``, …). Tokens MUST stay in sync with
+    ``backend/app/services/asn_lookup.py::_RUNTIME_HINT_TO_ASN``.
+    """
+    env = os.environ.get
+
+    if (
+        env("AWS_LAMBDA_FUNCTION_NAME")
+        or env("AWS_EXECUTION_ENV")
+        or env("ECS_CONTAINER_METADATA_URI")
+        or env("ECS_CONTAINER_METADATA_URI_V4")
+        or env("AWS_BATCH_JOB_ID")
+    ):
+        return "aws"
+    if (
+        env("K_SERVICE")
+        or env("FUNCTION_TARGET")
+        or env("GOOGLE_CLOUD_PROJECT")
+        or env("GCLOUD_PROJECT")
+    ):
+        return "gcp"
+    if (
+        env("WEBSITE_SITE_NAME")
+        or env("AZURE_FUNCTIONS_ENVIRONMENT")
+        or env("MSI_ENDPOINT")
+    ):
+        return "azure"
+
+    # PaaS providers — surface them by name even though they
+    # lease IPs from the underlying clouds. The Provenance card
+    # is more useful when it says "Vercel" than "AWS" for an app
+    # the operator deployed via ``vercel deploy``.
+    if env("VERCEL"):
+        return "vercel"
+    if env("NETLIFY"):
+        return "netlify"
+    if env("FLY_APP_NAME"):
+        return "fly"
+    if env("RAILWAY_ENVIRONMENT"):
+        return "railway"
+    if env("RENDER"):
+        return "render"
+    if env("DYNO"):
+        return "heroku"
+    if env("DIGITALOCEAN_APP_NAME"):
+        return "digitalocean"
+    return None
+
+
 # Process-lifetime cache. The fingerprint is built from values that
 # CAN'T change inside a running process (Python version, OS, machine,
 # container/serverless-platform env, installed framework versions).
@@ -141,6 +208,7 @@ def collect_runtime_fingerprint(*, sdk_version: str) -> dict[str, Any]:
 
         container = _detect_container()
         serverless = _detect_serverless_hint()
+        cloud = _detect_cloud_provider()
 
         blob: dict[str, Any] = {
             "sdk_version": sdk_version,
@@ -151,6 +219,13 @@ def collect_runtime_fingerprint(*, sdk_version: str) -> dict[str, Any]:
             "machine": platform.machine(),
             "container": container,
             "serverless": serverless,
+            # Backend uses ``cloud`` to populate the agent's
+            # ASN (Provenance card). Cheap to ship — single
+            # short string — and dramatically more reliable
+            # than guessing from the request IP, which mis-
+            # attributes PaaS workloads to the underlying
+            # cloud they happen to be running on.
+            "cloud": cloud,
             "frameworks": framework_versions,
         }
         _set_cache(blob, sdk_version)

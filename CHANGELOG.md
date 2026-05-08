@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.14.0] — 2026-05-07
+
+### Added
+
+- **Cloud-provider auto-detection in the runtime fingerprint.**
+  ``init()`` now probes a small set of platform-set env vars
+  (``AWS_LAMBDA_FUNCTION_NAME``, ``K_SERVICE``,
+  ``WEBSITE_SITE_NAME``, ``VERCEL``, ``FLY_APP_NAME``, ``DYNO``,
+  …) and emits a stable ``cloud`` token (``aws`` / ``gcp`` /
+  ``azure`` / ``vercel`` / ``netlify`` / ``fly`` / ``railway`` /
+  ``render`` / ``heroku`` / ``digitalocean``) in the runtime
+  blob shipped to the backend on every handshake / agent
+  registration. The backend uses this token to populate the
+  agent's ``first_seen_asn`` field (the ASN chip in the Identity
+  modal header and the Provenance card row), which previously
+  rendered ``—`` on every customer because no path computed it.
+
+  Detection is purely env-var-based — no network calls, no IMDS
+  probes, no DNS — so the SDK design philosophy's "no network
+  calls in init()" rule is preserved. Customers running on
+  unrecognised platforms (bare metal, on-prem, an exotic cloud)
+  see ``cloud: null`` and the field stays empty rather than
+  showing a fabricated value.
+
+  The new ``cloud`` key is purely additive to the runtime blob;
+  no public API change, no behaviour change for existing code.
+
+---
+
 ## [0.13.4] — 2026-05-07
 
 ### Added
