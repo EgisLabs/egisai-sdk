@@ -25,6 +25,7 @@ from egisai._policy_cache import refresh_now
 from egisai._redact import redact_api_key
 from egisai._refresher import start_worker as start_refresher
 from egisai._refresher import stop_worker as stop_refresher
+from egisai.policy import _pii_loader
 
 LOGGER = logging.getLogger("egisai")
 
@@ -177,6 +178,15 @@ def init(
 
         start_logger()
         start_refresher()
+        # Kick off Presidio + spaCy NER warm-up in a daemon thread.
+        # Idempotent. Until the analyzer is ready (1–3 s after import,
+        # plus a one-time ~750 MB download on first install), the PII
+        # path falls back to deterministic regex+checksum detection
+        # for SSN / credit_card / IBAN / email / phone / api_key. So
+        # PII protection is **never** off — only the NER-derived
+        # entities (names, addresses, GDPR special-category text)
+        # are temporarily unavailable while the model loads.
+        _pii_loader.prime_analyzer_async(quiet=quiet)
         atexit.register(shutdown)
 
         if not quiet:

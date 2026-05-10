@@ -247,18 +247,18 @@ def test_fullwidth_ssn_is_detected() -> None:
     from egisai.policy.pii import scan
 
     findings = scan("My SSN is １２３-４５-６７８９")
-    kinds = {f.kind for f in findings}
-    assert "ssn" in kinds
+    types = {f.type for f in findings}
+    assert "ssn" in types
 
 
 def test_fullwidth_ssn_is_sanitized() -> None:
     from egisai.policy.pii import sanitize
 
-    text, records = sanitize("私のSSN: １２３-４５-６７８９ です", kinds=["ssn"])
+    text, records = sanitize("私のSSN: １２３-４５-６７８９ です", types=["ssn"])
     assert "１２３-４５-６７８９" not in text
     assert "123-45-6789" not in text
     assert "###-##-####" in text
-    assert any(r.kind == "ssn" for r in records)
+    assert any(r.type == "ssn" for r in records)
 
 
 def test_arabic_indic_digits_are_detected() -> None:
@@ -266,7 +266,7 @@ def test_arabic_indic_digits_are_detected() -> None:
     from egisai.policy.pii import scan
 
     findings = scan("Tax ID: ١٢٣-٤٥-٦٧٨٩")
-    assert any(f.kind == "ssn" for f in findings)
+    assert any(f.type == "ssn" for f in findings)
 
 
 # ── 3. Word-form (English) digit detection ────────────────────────
@@ -278,8 +278,8 @@ def test_word_form_ssn_is_detected() -> None:
     findings = scan(
         "my social is one two three four five six seven eight nine"
     )
-    kinds = {f.kind for f in findings}
-    assert "ssn" in kinds
+    types = {f.type for f in findings}
+    assert "ssn" in types
 
 
 def test_word_form_ssn_is_sanitized() -> None:
@@ -287,11 +287,11 @@ def test_word_form_ssn_is_sanitized() -> None:
 
     text, records = sanitize(
         "my SSN: one two three four five six seven eight nine please",
-        kinds=["ssn"],
+        types=["ssn"],
     )
     assert "one two three" not in text.lower()
     assert "###-##-####" in text
-    assert records[0].kind == "ssn"
+    assert records[0].type == "ssn"
     assert records[0].count == 1
 
 
@@ -302,7 +302,7 @@ def test_word_form_ssn_with_alternate_zero_words() -> None:
     findings = scan(
         "social: zero zero one two three four five six seven"
     )
-    assert any(f.kind == "ssn" for f in findings)
+    assert any(f.type == "ssn" for f in findings)
 
 
 def test_word_form_credit_card_is_detected_and_luhn_validated() -> None:
@@ -312,7 +312,7 @@ def test_word_form_credit_card_is_detected_and_luhn_validated() -> None:
     findings = scan(
         "card: four one one one one one one one one one one one one one one one"
     )
-    assert any(f.kind == "credit_card" for f in findings)
+    assert any(f.type == "credit_card" for f in findings)
 
 
 def test_word_form_credit_card_invalid_luhn_is_ignored() -> None:
@@ -323,7 +323,7 @@ def test_word_form_credit_card_invalid_luhn_is_ignored() -> None:
     findings = scan(
         "number: one one one one one one one one one one one one one one one one"
     )
-    cc = [f for f in findings if f.kind == "credit_card"]
+    cc = [f for f in findings if f.type == "credit_card"]
     assert cc == []
 
 
@@ -332,7 +332,7 @@ def test_word_form_ssn_does_not_match_short_run() -> None:
     from egisai.policy.pii import scan
 
     findings = scan("I'd like one of two options or three; up to four total.")
-    assert all(f.kind != "ssn" for f in findings)
+    assert all(f.type != "ssn" for f in findings)
 
 
 # ── 4. End-to-end: word-form blocked through the engine ───────────

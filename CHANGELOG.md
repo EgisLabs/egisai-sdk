@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.15.0] — 2026-05-10
+
+### Added
+
+- **Microsoft Presidio is now the default PII engine.** Ships ~60
+  checksum-validated detectors out of the box — SSN, passport, IBAN,
+  driver's license, national ID, bank account, crypto wallet,
+  multi-country tax IDs, medical IDs, vehicle plates, plus spaCy
+  Named Entity Recognition for names / locations / addresses.
+  Everything runs LOCALLY inside the SDK process — no network calls
+  reach Microsoft or any third party at detection time. The
+  ``en_core_web_lg`` spaCy model auto-downloads on first
+  ``egisai.init()`` in a background daemon thread; until it's warm a
+  regex + checksum fast path keeps the hot path online so detection
+  never blocks the user's call.
+
+- **Canonical PII type taxonomy** exposed through a new
+  ``GET /v1/sdk/pii-types`` backend endpoint. The dashboard's
+  ``pii_scan`` policy modal now renders the catalog as a
+  category-grouped checkbox grid (Identity / Contact / Financial /
+  Medical / Credentials / Network / Vehicle), so an operator can
+  never silently configure a policy against a type the engine
+  doesn't know how to detect — that's the bug that produced zero
+  detections in production when "passport" was typed into the old
+  free-form ``kinds`` field.
+
+- **Custom recognizers ported from the legacy engine.** API-key
+  Shannon-entropy detection, reserved-domain email allowlist
+  (``example.com`` and the RFC 6761 test domains), date-of-birth
+  filtering, and word-form digit detection (``"one two three…"`` →
+  SSN / credit card) all run inside Presidio's pipeline; nothing
+  the old engine caught regresses.
+
+### Changed
+
+- **Renamed ``kind`` → ``type`` across the PII surface** so the
+  SDK, the backend, the dashboard, and the persisted JSONB all
+  speak one vocabulary. The legacy attribute / parameter / config
+  keys are kept as aliases for one release (~3 months):
+  - ``Sanitization.kind`` is now a ``@property`` on top of
+    ``Sanitization.type``.
+  - ``pii.sanitize(text, types=[...])`` is the canonical
+    signature; ``kinds=[...]`` is still accepted.
+  - ``pii_scan`` policy config keys on ``config.types``;
+    ``config.kinds`` is still accepted on the wire.
+  - ``MatchedPolicyRecord.sanitize_types`` is the canonical
+    field; ``sanitize_kinds`` is a property alias.
+- Audit-event payloads ship ``sanitizations[*].type`` exclusively
+  on this release going forward.
+
+### Deprecated
+
+- The ``kind`` / ``kinds`` / ``sanitize_kinds`` field names will
+  be removed in 0.16.x. New code should use ``type`` / ``types`` /
+  ``sanitize_types``.
+
+---
+
 ## [0.14.0] — 2026-05-07
 
 ### Added

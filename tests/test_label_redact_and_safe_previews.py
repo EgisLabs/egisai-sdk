@@ -86,7 +86,7 @@ def test_label_redact_kinds_filter() -> None:
 
     raw = "ssn 123-45-6789 and email jane@acme.com"
     # Only SSN — email left alone.
-    out = label_redact(raw, kinds=["ssn"])
+    out = label_redact(raw, types=["ssn"])
     assert "<SSN>" in out
     assert "jane@acme.com" in out
     assert "<EMAIL>" not in out

@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from egisai.policy import _pii_taxonomy
 from egisai.policy import pii as pii_scanner
 from egisai.policy._regex_safe import safe_search
 from egisai.policy.semantic import SemanticBlocker
@@ -73,7 +74,7 @@ class MatchedPolicyRecord:
 
     ``verdict`` is what this rule would have returned in isolation
     (``'block'`` or ``'sanitize'``); the final ``PolicyDecision.verdict``
-    is computed across all matches. ``sanitize_kinds`` and
+    is computed across all matches. ``sanitize_types`` and
     ``sanitize_mask_char`` are only meaningful for sanitize matches.
     """
     name: str
@@ -81,8 +82,18 @@ class MatchedPolicyRecord:
     verdict: str
     reason_code: str
     message: str
-    sanitize_kinds: tuple[str, ...] = ()
+    # Operator-facing PII type ids (``"ssn"``, ``"credit_card"``, …)
+    # to mask before forwarding. Renamed from ``sanitize_kinds`` —
+    # the SDK now consistently uses ``type`` to refer to PII
+    # categories. ``sanitize_kinds`` is exposed via a backward-
+    # compat property on ``PolicyDecision`` for one release.
+    sanitize_types: tuple[str, ...] = ()
     sanitize_mask_char: str = "#"
+
+    @property
+    def sanitize_kinds(self) -> tuple[str, ...]:
+        """Deprecated alias for ``sanitize_types``."""
+        return self.sanitize_types
 
 
 @dataclass(frozen=True)
@@ -104,8 +115,18 @@ class PolicyDecision:
     message: str | None
     matched_policy: str | None
     matched_policies: tuple[MatchedPolicyRecord, ...] = ()
-    sanitize_kinds: list[str] = field(default_factory=list)
+    sanitize_types: list[str] = field(default_factory=list)
     sanitize_mask_char: str = "#"
+
+    @property
+    def sanitize_kinds(self) -> list[str]:
+        """Deprecated alias for ``sanitize_types``.
+
+        Removed in a future release; kept for one release while
+        consumers (the audit-event serializer, the framework
+        patches) migrate to ``sanitize_types``.
+        """
+        return self.sanitize_types
 
     @classmethod
     def allow(cls) -> PolicyDecision:
@@ -137,21 +158,33 @@ class PolicyDecision:
     def sanitize(
         cls,
         *,
-        kinds: list[str],
+        types: list[str] | None = None,
         reason_code: str,
         message: str,
         matched_policy: str,
         mask_char: str = "#",
         matched_policies: tuple[MatchedPolicyRecord, ...] = (),
+        kinds: list[str] | None = None,
     ) -> PolicyDecision:
-        """The call should forward, but with these PII kinds masked."""
+        """The call should forward, but with these PII types masked.
+
+        ``types`` is the canonical operator-facing list. ``kinds`` is
+        accepted as a deprecated alias for one release so older
+        callers keep compiling — passing both raises.
+        """
+        if types is None and kinds is not None:
+            types = kinds
+        elif types is not None and kinds is not None:
+            raise ValueError(
+                "PolicyDecision.sanitize: pass either types= or kinds=, not both."
+            )
         return cls(
             verdict="sanitize",
             reason_code=reason_code,
             message=message,
             matched_policy=matched_policy,
             matched_policies=matched_policies,
-            sanitize_kinds=list(kinds),
+            sanitize_types=list(types or []),
             sanitize_mask_char=mask_char or "#",
         )
 
@@ -323,7 +356,7 @@ def evaluate_policies(
     if phase1_matches.has_sanitize:
         text_for_phase2, _ = pii_scanner.sanitize(
             text_for_phase2,
-            kinds=phase1_matches.sanitize_kinds or None,
+            types=phase1_matches.sanitize_types or None,
             mask_char=phase1_matches.sanitize_mask_char,
         )
 
@@ -351,7 +384,7 @@ def evaluate_policies(
 class _PhaseMatches:
     """Mutable accumulator for a single-phase walk."""
     records: list[MatchedPolicyRecord] = field(default_factory=list)
-    sanitize_kinds: list[str] = field(default_factory=list)  # union, ordered
+    sanitize_types: list[str] = field(default_factory=list)  # union, ordered
     sanitize_mask_char: str = "#"
 
     @property
@@ -365,9 +398,9 @@ class _PhaseMatches:
     def add(self, rec: MatchedPolicyRecord) -> None:
         self.records.append(rec)
         if rec.verdict == "sanitize":
-            for k in rec.sanitize_kinds:
-                if k not in self.sanitize_kinds:
-                    self.sanitize_kinds.append(k)
+            for t in rec.sanitize_types:
+                if t not in self.sanitize_types:
+                    self.sanitize_types.append(t)
             if not any(
                 r.verdict == "sanitize" for r in self.records[:-1]
             ):
@@ -475,13 +508,13 @@ def _synthesize_decision(
     sanitizes = [r for r in records if r.verdict == "sanitize"]
     if sanitizes:
         primary = sanitizes[0]
-        union_kinds: list[str] = []
+        union_types: list[str] = []
         for r in sanitizes:
-            for k in r.sanitize_kinds:
-                if k not in union_kinds:
-                    union_kinds.append(k)
+            for t in r.sanitize_types:
+                if t not in union_types:
+                    union_types.append(t)
         return PolicyDecision.sanitize(
-            kinds=union_kinds,
+            types=union_types,
             mask_char=primary.sanitize_mask_char,
             reason_code=primary.reason_code,
             message=primary.message,
@@ -616,24 +649,48 @@ def _pii_scan_match(
     to block (the response side has no sanitization plumbing yet).
     ``block_reason_code`` lets each side stamp its own reason code
     so audit narratives can phrase the outcome correctly.
+
+    Config field names: ``types`` is the canonical operator-facing
+    list; ``kinds`` is accepted as a deprecated alias for one
+    release. When neither is set we run every detector. We also
+    surface a single warning to stderr if the operator listed a
+    type the engine doesn't know how to detect — that's the bug
+    that used to silently no-op when ``"passport"`` was typed into
+    the legacy free-text ``kinds`` field.
     """
     threshold = policy.config.get("threshold", 0.5)
-    enabled_kinds = policy.config.get("kinds")
+    enabled_types_raw = policy.config.get("types") or policy.config.get("kinds")
     action = policy.config.get("action", "block")
     mask_char_cfg = policy.config.get("mask_char", "#")
     mask_char = (
         mask_char_cfg if isinstance(mask_char_cfg, str) and mask_char_cfg
         else "#"
     )
+
+    enabled_types: list[str] | None = None
+    if enabled_types_raw and isinstance(enabled_types_raw, list):
+        enabled_types = [str(t) for t in enabled_types_raw if isinstance(t, str)]
+        unknown = _pii_taxonomy.unknown_types(enabled_types)
+        if unknown:
+            # Warn loudly so misconfigurations surface — this used to
+            # silently drop and return zero findings, leaving the
+            # operator wondering why the policy never fired.
+            print(
+                f"⚠ [egisai] policy {policy.name!r} references unknown PII "
+                f"types {unknown!r}; ignoring those entries. Supported types: "
+                "see GET /v1/sdk/pii-types on the platform.",
+                flush=True,
+            )
+
     findings = pii_scanner.scan(text)
-    if enabled_kinds and isinstance(enabled_kinds, list):
-        findings = [f for f in findings if f.kind in enabled_kinds]
+    if enabled_types is not None:
+        findings = [f for f in findings if f.type in enabled_types]
     if not findings:
         return None
     risk = pii_scanner.compute_risk_score(findings)
     if risk < threshold:
         return None
-    detected_kinds = sorted({f.kind for f in findings})
+    detected_types = sorted({f.type for f in findings})
     if action == "sanitize" and allow_sanitize:
         return MatchedPolicyRecord(
             name=policy.name,
@@ -642,13 +699,13 @@ def _pii_scan_match(
             reason_code="pii_sanitized",
             message=policy.config.get(
                 "message",
-                f"PII redacted before forwarding ({', '.join(detected_kinds)}).",
+                f"PII redacted before forwarding ({', '.join(detected_types)}).",
             ),
-            sanitize_kinds=tuple(detected_kinds),
+            sanitize_types=tuple(detected_types),
             sanitize_mask_char=mask_char,
         )
     labels = ", ".join(
-        f"{f.kind}({f.value_redacted})" for f in findings[:5]
+        f"{f.type}({f.value_redacted})" for f in findings[:5]
     )
     return MatchedPolicyRecord(
         name=policy.name,

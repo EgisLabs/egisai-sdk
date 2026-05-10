@@ -60,7 +60,12 @@ def _serialize_matched_policies(
                 "verdict": r.verdict,
                 "reason_code": r.reason_code,
                 "message": r.message,
-                "sanitize_kinds": list(r.sanitize_kinds),
+                # Wire field is now ``sanitize_types`` (matches the
+                # operator-facing terminology). The backend accepts
+                # both ``sanitize_types`` and the legacy
+                # ``sanitize_kinds`` for one release while older SDKs
+                # are still in the field.
+                "sanitize_types": list(r.sanitize_types),
                 "sanitize_mask_char": r.sanitize_mask_char,
             }
         )
@@ -75,7 +80,7 @@ def _serialize_matched_policies(
                 "verdict": decision.verdict,
                 "reason_code": decision.reason_code or "",
                 "message": decision.message or "",
-                "sanitize_kinds": list(decision.sanitize_kinds),
+                "sanitize_types": list(decision.sanitize_types),
                 "sanitize_mask_char": decision.sanitize_mask_char,
             }
         )
@@ -156,16 +161,16 @@ def _apply_sanitization(
     def _transform(text: str) -> str:
         new_text, records = pii_sanitize(
             text,
-            kinds=decision.sanitize_kinds or None,
+            types=decision.sanitize_types or None,
             mask_char=decision.sanitize_mask_char,
         )
         for rec in records:
-            existing = aggregated.get(rec.kind)
+            existing = aggregated.get(rec.type)
             if existing is None:
-                aggregated[rec.kind] = rec
+                aggregated[rec.type] = rec
             else:
-                aggregated[rec.kind] = Sanitization(
-                    kind=rec.kind,
+                aggregated[rec.type] = Sanitization(
+                    type=rec.type,
                     count=existing.count + rec.count,
                     pattern=existing.pattern,
                 )
@@ -181,8 +186,12 @@ def _apply_sanitization(
     after_text = extract_payload_text(payload)
     ev["prompt_preview"] = _safe_text_preview(after_text)
 
+    # Wire field is now ``type`` (matches the operator-facing
+    # terminology used everywhere else). Backend accepts both
+    # ``type`` and the legacy ``kind`` on inbound audit events for
+    # one release.
     ev["sanitizations"] = [
-        {"kind": s.kind, "count": s.count, "pattern": s.pattern}
+        {"type": s.type, "count": s.count, "pattern": s.pattern}
         for s in aggregated.values()
     ]
 

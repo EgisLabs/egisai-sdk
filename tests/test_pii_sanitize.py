@@ -34,7 +34,7 @@ def test_sanitize_masks_ssn_preserving_shape() -> None:
     assert "123-45-6789" not in text
     assert "###-##-####" in text
     assert len(records) == 1
-    assert records[0].kind == "ssn"
+    assert records[0].type == "ssn"
     assert records[0].count == 1
     assert records[0].pattern == "###-##-####"
 
@@ -44,12 +44,12 @@ def test_sanitize_only_kinds_filter_skips_others() -> None:
     from egisai.policy.pii import sanitize
 
     raw = "SSN 123-45-6789 and card 4111-1111-1111-1111"
-    text, records = sanitize(raw, kinds=["ssn"])
+    text, records = sanitize(raw, types=["ssn"])
 
     assert "###-##-####" in text
     assert "4111-1111-1111-1111" in text  # CC untouched
-    kinds = {r.kind for r in records}
-    assert kinds == {"ssn"}
+    types = {r.type for r in records}
+    assert types == {"ssn"}
 
 
 def test_sanitize_clean_prompt_is_no_op() -> None:
@@ -68,13 +68,13 @@ def test_sanitize_records_count_when_multiple_matches() -> None:
     # Both SSNs have valid area numbers (≠ 0/666/900-999) so the
     # SSA-rule validator accepts them as real SSNs to redact.
     raw = "SSNs: 123-45-6789 and 222-33-4444"
-    text, records = sanitize(raw, kinds=["ssn"])
+    text, records = sanitize(raw, types=["ssn"])
 
     assert "123-45-6789" not in text
     assert "222-33-4444" not in text
     assert len(records) == 1
     # Single rolled-up record per kind, but with the full count.
-    assert records[0].kind == "ssn"
+    assert records[0].type == "ssn"
     assert records[0].count == 2
 
 
@@ -83,7 +83,7 @@ def test_sanitize_does_not_log_original_value() -> None:
     from egisai.policy.pii import sanitize
 
     raw = "John Doe SSN 123-45-6789"
-    _, records = sanitize(raw, kinds=["ssn"])
+    _, records = sanitize(raw, types=["ssn"])
 
     blob = repr(records)
     assert "123-45-6789" not in blob
@@ -348,7 +348,8 @@ def test_gate_emits_sanitize_event(fake_backend) -> None:
     # Audit record carries the count + pattern, never the raw value.
     sanitizations = ev.get("sanitizations") or []
     assert len(sanitizations) == 1
-    assert sanitizations[0]["kind"] == "ssn"
+    # Wire field is now ``type`` (renamed from ``kind`` in this release).
+    assert sanitizations[0]["type"] == "ssn"
     assert sanitizations[0]["count"] == 1
     assert sanitizations[0]["pattern"] == "###-##-####"
     # Crucial compliance assertion: the original SSN is nowhere in

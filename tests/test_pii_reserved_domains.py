@@ -8,11 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from egisai.policy.pii import (
-    _is_reserved_email_domain,
-    sanitize,
-    scan,
-)
+from egisai.policy._pii_helpers import is_reserved_email_domain
+from egisai.policy.pii import sanitize, scan
 
 
 @pytest.mark.parametrize(
@@ -31,7 +28,7 @@ from egisai.policy.pii import (
     ],
 )
 def test_reserved_domain_recognised(domain: str) -> None:
-    assert _is_reserved_email_domain(domain) is True
+    assert is_reserved_email_domain(domain) is True
 
 
 @pytest.mark.parametrize(
@@ -46,7 +43,7 @@ def test_reserved_domain_recognised(domain: str) -> None:
     ],
 )
 def test_real_domain_not_treated_as_reserved(domain: str) -> None:
-    assert _is_reserved_email_domain(domain) is False
+    assert is_reserved_email_domain(domain) is False
 
 
 @pytest.mark.parametrize(
@@ -61,25 +58,25 @@ def test_real_domain_not_treated_as_reserved(domain: str) -> None:
 )
 def test_scan_skips_reserved_email_addresses(address: str) -> None:
     findings = scan(address)
-    assert "email" not in {f.kind for f in findings}, (
+    assert "email" not in {f.type for f in findings}, (
         f"reserved address {address!r} should not be flagged as PII"
     )
 
 
 def test_scan_detects_real_email() -> None:
     findings = scan("contact alice@acmecorp.com for details")
-    assert "email" in {f.kind for f in findings}
+    assert "email" in {f.type for f in findings}
 
 
 def test_sanitize_leaves_reserved_address_intact() -> None:
     text = "see alice@example.net for an example"
-    redacted, records = sanitize(text, kinds=["email"])
+    redacted, records = sanitize(text, types=["email"])
     assert "alice@example.net" in redacted
     assert records == []
 
 
 def test_sanitize_redacts_real_address_but_keeps_reserved() -> None:
     text = "real bob@acme.com vs placeholder alice@example.net"
-    redacted, _records = sanitize(text, kinds=["email"])
+    redacted, _records = sanitize(text, types=["email"])
     assert "bob@acme.com" not in redacted
     assert "alice@example.net" in redacted

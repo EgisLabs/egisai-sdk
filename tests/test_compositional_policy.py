@@ -40,13 +40,13 @@ def _pii(
     name: str,
     *,
     action: str,
-    kinds: list[str] | None = None,
+    types: list[str] | None = None,
     mask_char: str = "#",
     threshold: float = 0.3,
 ) -> PolicyRule:
     cfg: dict[str, Any] = {"action": action, "threshold": threshold}
-    if kinds is not None:
-        cfg["kinds"] = kinds
+    if types is not None:
+        cfg["types"] = types
     if mask_char != "#":
         cfg["mask_char"] = mask_char
     return PolicyRule(id=None, name=name, type="pii_scan", tenant=None, config=cfg)
@@ -81,8 +81,8 @@ def test_two_sanitize_policies_merge_kinds() -> None:
     # {ssn, credit_card}, both matches recorded.
     prompt = "my SSN is 123-45-6789 and card 4111-1111-1111-1111"
     rules = [
-        _pii("sanitize-ssn", action="sanitize", kinds=["ssn"]),
-        _pii("sanitize-cc", action="sanitize", kinds=["credit_card"]),
+        _pii("sanitize-ssn", action="sanitize", types=["ssn"]),
+        _pii("sanitize-cc", action="sanitize", types=["credit_card"]),
     ]
     d = evaluate_policies(rules, _ctx(prompt))
     assert d.verdict == "sanitize"
@@ -101,8 +101,8 @@ def test_first_sanitize_policy_wins_mask_char() -> None:
     # in priority order wins. Deterministic for operators.
     prompt = "ssn 123-45-6789 cc 4111-1111-1111-1111"
     rules = [
-        _pii("first-X", action="sanitize", kinds=["ssn"], mask_char="X"),
-        _pii("second-0", action="sanitize", kinds=["credit_card"], mask_char="0"),
+        _pii("first-X", action="sanitize", types=["ssn"], mask_char="X"),
+        _pii("second-0", action="sanitize", types=["credit_card"], mask_char="0"),
     ]
     d = evaluate_policies(rules, _ctx(prompt))
     assert d.verdict == "sanitize"
@@ -121,8 +121,8 @@ def test_block_overrides_sanitize_but_both_recorded() -> None:
     # masked — both rules saw the data."
     prompt = "card 4111-1111-1111-1111 and ssn 123-45-6789"
     rules = [
-        _pii("block-cc", action="block", kinds=["credit_card"]),
-        _pii("sanitize-ssn", action="sanitize", kinds=["ssn"]),
+        _pii("block-cc", action="block", types=["credit_card"]),
+        _pii("sanitize-ssn", action="sanitize", types=["ssn"]),
     ]
     d = evaluate_policies(rules, _ctx(prompt))
     assert d.verdict == "block"
@@ -152,7 +152,7 @@ def test_first_block_wins_when_multiple_blocks() -> None:
 
 def test_allow_when_no_policies_match() -> None:
     rules = [
-        _pii("block-cc", action="block", kinds=["credit_card"]),
+        _pii("block-cc", action="block", types=["credit_card"]),
         _allow_model("approved", models=["gpt-4o-mini"]),
     ]
     d = evaluate_policies(rules, _ctx("hello world"))
@@ -166,8 +166,8 @@ def test_allow_when_no_policies_match() -> None:
 
 def test_matched_policy_singular_is_set_to_primary_block() -> None:
     rules = [
-        _pii("block-cc", action="block", kinds=["credit_card"]),
-        _pii("sanitize-ssn", action="sanitize", kinds=["ssn"]),
+        _pii("block-cc", action="block", types=["credit_card"]),
+        _pii("sanitize-ssn", action="sanitize", types=["ssn"]),
     ]
     d = evaluate_policies(rules, _ctx("card 4111-1111-1111-1111"))
     assert d.verdict == "block"
@@ -176,8 +176,8 @@ def test_matched_policy_singular_is_set_to_primary_block() -> None:
 
 def test_matched_policy_singular_is_set_to_primary_sanitize() -> None:
     rules = [
-        _pii("sanitize-A", action="sanitize", kinds=["ssn"]),
-        _pii("sanitize-B", action="sanitize", kinds=["email"]),
+        _pii("sanitize-A", action="sanitize", types=["ssn"]),
+        _pii("sanitize-B", action="sanitize", types=["email"]),
     ]
     d = evaluate_policies(
         rules,
@@ -217,7 +217,7 @@ def test_phase2_block_overrides_phase1_sanitize_records_both() -> None:
     # block from P2.
     prompt = "ssn 123-45-6789 please-block-this"
     rules = [
-        _pii("sanitize-ssn", action="sanitize", kinds=["ssn"]),
+        _pii("sanitize-ssn", action="sanitize", types=["ssn"]),
         PolicyRule(
             id=None,
             name="guard-injection",
@@ -243,7 +243,7 @@ def test_phase1_block_short_circuits_phase2() -> None:
     # is never reached. Audit reflects only the Phase 1 match.
     prompt = "ssn 123-45-6789 please-block-this"
     rules = [
-        _pii("block-ssn", action="block", kinds=["ssn"]),
+        _pii("block-ssn", action="block", types=["ssn"]),
         PolicyRule(
             id=None,
             name="guard-injection",
