@@ -460,7 +460,13 @@ def _redact_value(op_type: str, raw: str) -> str:
     placeholder.
     """
     if op_type == "ssn":
-        return f"***-**-{re.sub(r'\\D', '', raw)[-4:].zfill(4)}"
+        # NOTE: the inner ``re.sub`` is extracted into a local so the
+        # f-string body stays free of backslash escapes — Python 3.11
+        # (one of our supported runtimes) disallows ``\`` inside
+        # ``{ ... }`` expression slots. Python 3.12+ added support;
+        # we keep the workaround to stay 3.11-compatible.
+        last4 = re.sub(r"\D", "", raw)[-4:].zfill(4)
+        return f"***-**-{last4}"
     if op_type == "credit_card":
         digits = re.sub(r"\D", "", raw)
         if len(digits) >= 8:

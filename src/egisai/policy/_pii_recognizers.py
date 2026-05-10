@@ -47,7 +47,6 @@ from egisai.policy._pii_helpers import (
     word_run_to_digits,
 )
 
-
 # ── API-key recognizer ─────────────────────────────────────────────
 #
 # Two-pass: first match known prefix patterns (``sk-``, ``pk-``,

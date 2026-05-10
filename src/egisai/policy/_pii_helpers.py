@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import math
 
-
 # ── Reserved / placeholder email domains ────────────────────────────
 #
 # RFC 2606 §3 / RFC 6761 §6 reserved TLDs and SLDs guaranteed never
