@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.15.1] — 2026-05-10
+
+### Changed
+
+- **Quieter PII engine startup.** Removed the ``✓ [egisai] PII engine
+  ready (Presidio + spaCy …)`` confirmation line that printed once
+  per process after the analyzer finished warming up. The main
+  ``✓ [egisai] active …`` banner already confirms the SDK is alive;
+  the PII engine is an implementation detail and shouldn't add a
+  second startup line. Load failures still surface via the existing
+  warning path so misconfigurations remain visible.
+- **Removed the per-call "unknown PII types" warning** from the
+  policy engine. Unknown ids are still filtered out at runtime
+  (the membership check against the canonical taxonomy is
+  unchanged), and the platform's policy create/update endpoint
+  already rejects unknown types with a ``422`` at write time —
+  so live policies are vetted before they hit the SDK. Removing
+  the stderr print stops the noise on every prompt for orgs that
+  still carry legacy ``pii_scan`` rows with stray strings in
+  ``config.kinds``.
+
+---
+
 ## [0.15.0] — 2026-05-10
 
 ### Added

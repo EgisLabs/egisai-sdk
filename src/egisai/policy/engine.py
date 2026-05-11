@@ -10,7 +10,6 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from egisai.policy import _pii_taxonomy
 from egisai.policy import pii as pii_scanner
 from egisai.policy._regex_safe import safe_search
 from egisai.policy.semantic import SemanticBlocker
@@ -669,18 +668,16 @@ def _pii_scan_match(
 
     enabled_types: list[str] | None = None
     if enabled_types_raw and isinstance(enabled_types_raw, list):
+        # We deliberately do NOT validate the configured types against
+        # the canonical taxonomy here. The platform's policy
+        # create/update endpoint rejects unknown types at write time
+        # (see ``backend/app/schemas/policy.py::_normalize_pii_config``),
+        # so live policies on the wire are already vetted. Legacy
+        # rows from before the rename window may still carry display
+        # labels or stray strings — the membership filter below
+        # silently drops anything that doesn't match a real finding
+        # type without printing a per-call warning on the hot path.
         enabled_types = [str(t) for t in enabled_types_raw if isinstance(t, str)]
-        unknown = _pii_taxonomy.unknown_types(enabled_types)
-        if unknown:
-            # Warn loudly so misconfigurations surface — this used to
-            # silently drop and return zero findings, leaving the
-            # operator wondering why the policy never fired.
-            print(
-                f"⚠ [egisai] policy {policy.name!r} references unknown PII "
-                f"types {unknown!r}; ignoring those entries. Supported types: "
-                "see GET /v1/sdk/pii-types on the platform.",
-                flush=True,
-            )
 
     findings = pii_scanner.scan(text)
     if enabled_types is not None:

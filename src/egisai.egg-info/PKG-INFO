@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: egisai
-Version: 0.15.0
+Version: 0.15.1
 Summary: Native runtime governance SDK for AI agents — import egisai; egisai.init() and you're protected.
 Author-email: EgisAI <soheil@egisai.co>
 Maintainer-email: EgisAI <soheil@egisai.co>

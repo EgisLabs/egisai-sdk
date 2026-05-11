@@ -32,7 +32,6 @@ Lifetime:
 from __future__ import annotations
 
 import logging
-import os
 import sys
 import threading
 from dataclasses import dataclass
@@ -207,15 +206,12 @@ def _build_analyzer(*, quiet: bool) -> AnalyzerEngine:
 
     register_custom_recognizers(analyzer.registry)
 
-    if not quiet and "PYTEST_CURRENT_TEST" not in os.environ:
-        # One friendly "everything's online" line per process so
-        # operators can see the warm-up completed. Suppressed in test
-        # environments to keep pytest output clean.
-        print(
-            "✓ [egisai] PII engine ready "
-            f"(Presidio + spaCy {_SPACY_MODEL_NAME} + 4 custom recognizers)",
-            flush=True,
-        )
+    # No success line here: the SDK's main ``✓ [egisai] active …``
+    # banner already confirms the SDK is alive, and the PII engine
+    # is an implementation detail the operator doesn't need to see
+    # on every process start. We still surface failures (a warning
+    # from ``_load_in_background`` when the daemon thread can't load
+    # the analyzer) so misconfigurations remain visible.
     return analyzer
 
 
