@@ -111,12 +111,17 @@ class ApiKeyRecognizer(EntityRecognizer):
             confidence = min(1.0, 0.75 + (entropy - 3.5) * 0.1)
             confidence += _context_boost(text, match.start(), match.end())
             seen_spans.add((match.start(), match.end()))
+            # Presidio's ``AnalysisExplanation.__init__`` only accepts
+            # ``original_score``; it sets ``self.score = original_score``
+            # internally and exposes ``set_improved_score()`` for later
+            # context-based bumps. Passing ``score=`` is a TypeError on
+            # current Presidio releases (and a mypy ``[call-arg]`` even
+            # before runtime catches it). Don't add it back.
             explanation = AnalysisExplanation(
                 recognizer="EgisApiKeyRecognizer",
                 pattern_name="prefix+entropy",
                 pattern=_KEY_PREFIX_RE.pattern,
                 original_score=min(1.0, confidence),
-                score=min(1.0, confidence),
                 textual_explanation=(
                     "Matches a known credential prefix and clears the "
                     f"Shannon-entropy floor ({entropy:.2f} bits/char)."
@@ -166,7 +171,6 @@ class ApiKeyRecognizer(EntityRecognizer):
                         pattern_name="entropy",
                         pattern=_KEY_BLOB_RE.pattern,
                         original_score=confidence,
-                        score=confidence,
                         textual_explanation=(
                             "High-entropy alphanumeric blob "
                             f"({entropy:.2f} bits/char)."
@@ -187,6 +191,77 @@ def _context_boost(text: str, start: int, end: int, window: int = 60) -> float:
     snippet = text[window_start:window_end].lower()
     hits = sum(1 for kw in _KEY_CONTEXT_KEYWORDS if kw in snippet)
     return min(0.15, hits * 0.05)
+
+
+# ── SSN fallback recognizer ─────────────────────────────────────────
+#
+# Presidio's ``UsSsnRecognizer`` ships a hard-coded deny-list of
+# "known fake" SSNs (``000-00-0000``, ``123-45-6789``, ``078-05-1120``,
+# the IRS publication numbers, every-digit-repeated patterns, …).
+# That list is a sensible default for docs / public datasets but
+# **breaks two of our customer realities**:
+#
+# 1. Operator example code that uses ``123-45-6789`` as a literal in
+#    test prompts gets a false NEGATIVE — the SDK silently lets the
+#    "PII" through, and the operator concludes detection is broken.
+#    Since most "is my Egis setup working?" smoke tests use the
+#    canonical test SSN, this looks like an outage to the operator.
+# 2. Real prompts occasionally contain the canonical test SSN
+#    because end users copy-paste from documentation when filling
+#    out forms; we still want to redact those before forwarding to
+#    a third-party LLM.
+#
+# This recognizer fires on **structural** SSN shape only — no
+# deny-list — at a deliberately LOWER confidence (0.55) than
+# Presidio's native ``UsSsnRecognizer`` (0.85). When both fire on
+# the same span ``_apply_results`` deduplicates and keeps the
+# higher-score record, so we don't double-mask real SSNs.
+# When Presidio drops the span via its deny-list, this one still
+# catches it.
+#
+# Entity is published under ``EGIS_US_SSN`` and mapped to the same
+# operator ``ssn`` type in ``_pii_taxonomy.py``.
+
+_SSN_STRUCTURAL_RE = re.compile(
+    r"\b(?!000|666|9\d\d)\d{3}[\-\s]?(?!00)\d{2}[\-\s]?(?!0000)\d{4}\b"
+)
+
+
+class StructuralSsnRecognizer(PatternRecognizer):
+    """SSN-shape catcher that bypasses Presidio's test-SSN deny-list.
+
+    The regex still enforces the SSA's own structural rules — area
+    number ≠ ``000`` / ``666`` / ``9xx``, group ≠ ``00``, serial ≠
+    ``0000`` — so we don't false-fire on every triple-double-quad
+    digit run. Beyond that we don't filter, so test SSNs like
+    ``123-45-6789`` are detected.
+    """
+
+    def __init__(self) -> None:
+        patterns = [
+            Pattern(
+                name="structural_ssn",
+                regex=_SSN_STRUCTURAL_RE.pattern,
+                # Deliberately lower than Presidio's ``UsSsnRecognizer``
+                # (``0.85`` on its hyphenated pattern) so the
+                # higher-confidence native recognizer wins on dedup
+                # when both fire on a real SSN. Floor chosen to clear
+                # ``compute_risk_score``'s default threshold (``0.5``)
+                # solo when this is the only signal — the engine's
+                # aggregation is roughly
+                # ``risk ≈ (0.3·conf + 0.15)/(1.15+0.3·conf)·2`` so a
+                # 0.55 confidence falls below 0.5 and the verdict
+                # silently reverts to ``allow`` even though the SSN
+                # was detected. 0.75 keeps comfortable headroom.
+                score=0.75,
+            )
+        ]
+        super().__init__(
+            supported_entity="EGIS_US_SSN",
+            patterns=patterns,
+            supported_language="en",
+            name="EgisStructuralSsnRecognizer",
+        )
 
 
 # ── Password recognizer ─────────────────────────────────────────────
@@ -328,7 +403,6 @@ class WordFormDigitsRecognizer(EntityRecognizer):
                             pattern_name="word-form-ssn",
                             pattern="<word-form digit run>",
                             original_score=0.95,
-                            score=0.95,
                             textual_explanation=(
                                 "9 digit-words decode to SSN-shape "
                                 f"sequence ({digits})."
@@ -356,7 +430,6 @@ class WordFormDigitsRecognizer(EntityRecognizer):
                             pattern_name="word-form-cc",
                             pattern="<word-form digit run>",
                             original_score=0.95,
-                            score=0.95,
                             textual_explanation=(
                                 "13–19 digit-words decode to a "
                                 "Luhn-valid card number."
@@ -380,15 +453,22 @@ def register_custom_recognizers(registry) -> None:  # type: ignore[no-untyped-de
     Called once during analyzer construction. Idempotent — adding the
     same recognizer twice raises in Presidio, so we check first.
     """
-    existing_names = {r.name for r in registry.recognizers}
+    existing_names = {getattr(r, "name", "") for r in registry.recognizers}
 
     custom_recognizers = (
         ApiKeyRecognizer(),
+        StructuralSsnRecognizer(),
         PasswordRecognizer(),
         DateOfBirthRecognizer(),
         WordFormDigitsRecognizer(),
     )
     for rec in custom_recognizers:
-        if rec.name in existing_names:
+        # ``rec.name`` is set by Presidio's ``EntityRecognizer.__init__``
+        # but its base class doesn't annotate the attribute, so mypy
+        # reports ``has-type`` on direct attribute access. ``getattr``
+        # is the cheapest workaround that preserves the lookup
+        # semantics (and stays correct if Presidio ever drops the
+        # attribute on a future version).
+        if getattr(rec, "name", "") in existing_names:
             continue
         registry.add_recognizer(rec)

@@ -1,5 +1,8 @@
 httpx<1.0,>=0.27.0
 pydantic<3.0,>=2.9.0
+presidio-analyzer<3.0,>=2.2.355
+presidio-anonymizer<3.0,>=2.2.355
+spacy<4.0,>=3.7.0
 
 [all]
 openai>=1.40.0

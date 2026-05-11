@@ -126,7 +126,9 @@ CANONICAL_TYPES: tuple[PiiTypeSpec, ...] = (
             "dashed, and English word-form (\"one two three…\") variants."
         ),
         example="123-45-6789",
-        presidio_entities=frozenset({"US_SSN", "EGIS_WORD_FORM_SSN"}),
+        presidio_entities=frozenset(
+            {"US_SSN", "EGIS_US_SSN", "EGIS_WORD_FORM_SSN"}
+        ),
     ),
     PiiTypeSpec(
         id="passport",

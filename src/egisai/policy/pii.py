@@ -445,10 +445,38 @@ def _label_for(op_type: str) -> str:
 
 
 def _mask_value(op_type: str, raw: str, mask_char: str) -> str:
-    """Shape-preserving mask for digit-shaped PII; placeholder otherwise."""
+    """Shape-preserving mask for digit-shaped PII; placeholder otherwise.
+
+    Special-case: when the operator type is digit-shaped (SSN, credit
+    card, phone) but the raw matched text contains no digits at all,
+    we're masking a word-form spelling (``"one two three four five
+    six seven eight nine"``). ``re.sub(r"\\d", …)`` would be a no-op
+    in that case and the original text would survive. Emit the
+    canonical digit-shape placeholder instead so the masked output
+    actually scrubs the PII and downstream tooling can pattern-match
+    ``###-##-####`` regardless of the input form.
+    """
     if op_type in _DIGIT_SHAPE_TYPES:
-        return re.sub(r"\d", mask_char, raw)
+        if any(ch.isdigit() for ch in raw):
+            return re.sub(r"\d", mask_char, raw)
+        # Word-form (or other zero-digit) match: render the canonical
+        # shape for this type so the masked output is unambiguously
+        # PII-free and uniform across input variants.
+        canonical = _CANONICAL_DIGIT_SHAPE.get(op_type)
+        if canonical is not None:
+            return canonical.replace("#", mask_char)
     return _WORD_PLACEHOLDERS.get(op_type, f"[{op_type}-redacted]")
+
+
+# Canonical "what this PII looks like masked" shape per digit-shaped
+# operator type. Used by ``_mask_value`` when the matched span has
+# zero digits (word-form spelling) — substituting against ``\d`` would
+# leave the original text intact.
+_CANONICAL_DIGIT_SHAPE: dict[str, str] = {
+    "ssn": "###-##-####",
+    "credit_card": "####-####-####-####",
+    "phone": "###-###-####",
+}
 
 
 def _redact_value(op_type: str, raw: str) -> str:
