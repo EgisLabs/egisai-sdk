@@ -659,7 +659,18 @@ def _pii_scan_match(
     """
     threshold = policy.config.get("threshold", 0.5)
     enabled_types_raw = policy.config.get("types") or policy.config.get("kinds")
-    action = policy.config.get("action", "block")
+    # Default action is ``sanitize`` — the less-destructive choice.
+    # Sanitize forwards the call to the model with the PII masked, so
+    # the user's experience continues unaffected while the regulated
+    # values never leave the SDK boundary. Operators who need a hard
+    # refusal (e.g. an explicit "no SSNs in prompts" compliance bar)
+    # opt into ``action: "block"`` in the policy config; the
+    # dashboard's checkbox grid surfaces both options. On the
+    # response side ``allow_sanitize`` is ``False`` and the engine
+    # automatically falls through to block — we can't safely rewrite
+    # provider responses, so a detected leak in the response is
+    # always refused.
+    action = policy.config.get("action", "sanitize")
     mask_char_cfg = policy.config.get("mask_char", "#")
     mask_char = (
         mask_char_cfg if isinstance(mask_char_cfg, str) and mask_char_cfg

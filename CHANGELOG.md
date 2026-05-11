@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.16.0] — 2026-05-10
+
+### Changed
+
+- **``pii_scan`` policies now default to ``action: "sanitize"`` instead
+  of ``"block"``.** Sanitize is the less-destructive choice: the
+  user's call still reaches the model, just with the regulated
+  values masked locally (``#`` by default, configurable via
+  ``mask_char``). The raw PII never leaves the SDK boundary, so the
+  audit row, the policy decision, and the model payload are all
+  PII-free. Operators who need a hard refusal — for example a
+  compliance bar that forbids credit-card text in prompts — opt
+  into ``action: "block"`` explicitly on the policy config; the
+  dashboard's PII policy modal surfaces both options and the new
+  default pre-selects sanitize.
+
+  Existing rules unaffected: every policy that has ``action`` set
+  explicitly (the default for any rule created via the dashboard's
+  modal) keeps its current behaviour. Only policies that OMITTED
+  ``action`` — typically API-created rules — see the new default,
+  and that change is desirable: the previous behaviour would refuse
+  the call even when masking would have preserved the user's
+  workflow without risking a leak.
+
+  On the response side ``action: "sanitize"`` is automatically
+  coerced to a block — we never rewrite provider responses — so the
+  default-flip does NOT change response-phase enforcement.
+
+---
+
 ## [0.15.1] — 2026-05-10
 
 ### Changed

@@ -122,12 +122,21 @@ def _ssn_rule(action: str | None) -> list:
     ]
 
 
-def test_pii_scan_default_still_blocks() -> None:
-    """Backward compat: omitted action == legacy block behavior."""
+def test_pii_scan_default_is_sanitize() -> None:
+    """Omitted action defaults to ``sanitize`` (the less-destructive path).
+
+    Sanitize keeps the user's call flowing — the model sees masked
+    text instead of raw PII — while operators who want a hard refusal
+    opt into ``action: "block"`` explicitly. Previously this defaulted
+    to ``block`` (legacy 0.15.x and earlier); the default flipped in
+    0.16.0 to match the experience the dashboard's policy modal
+    pre-selects for new rules.
+    """
     from egisai.policy import evaluate_policies
 
     decision = evaluate_policies(_ssn_rule(None), _make_ctx("SSN 123-45-6789"))
-    assert decision.verdict == "block"
+    assert decision.verdict == "sanitize"
+    assert "ssn" in decision.sanitize_types
 
 
 def test_pii_scan_action_block_is_explicit_block() -> None:

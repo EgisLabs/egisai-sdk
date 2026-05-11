@@ -10,6 +10,11 @@ def _pii_rule() -> dict:
         "type": "pii_scan",
         "tenant": None,
         "config": {
+            # ``action`` is explicit here because this test exercises
+            # the BLOCK path. Since 0.16.0 the default action is
+            # ``sanitize``; relying on the previous default would
+            # silently change which path this test exercises.
+            "action": "block",
             "threshold": 0.4,
             "kinds": ["credit_card", "ssn"],
             "message": "PII detected — blocked.",

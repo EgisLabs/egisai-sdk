@@ -135,6 +135,118 @@ def test_pii_scan_response_clean_text_passes() -> None:
     assert decision.verdict == "allow"
 
 
+# ── pii_scan: phase="both" — single rule covers prompt + response ────
+
+
+def test_pii_scan_phase_both_sanitizes_prompt_then_blocks_dirty_response() -> None:
+    """A single ``pii_scan`` rule with ``phase="both"`` enforces PII on
+    BOTH sides of the call:
+
+    - Prompt side honors ``action="sanitize"`` (the new 0.16.0
+      default) — the user's text reaches the model with PII masked.
+    - Response side coerces sanitize to block — if the provider's
+      reply itself contains PII, the call is refused.
+
+    The two evaluators share the same ``PolicyRule`` instance via the
+    operator's ``phase="both"`` choice, so this test asserts the
+    rule fires correctly on each side without the operator needing
+    to author two separate policies.
+    """
+    rule = _rule("pii_scan", phase="both", config={"action": "sanitize"})
+
+    prompt_decision = evaluate_policies(
+        [rule], _input_ctx("My SSN is 123-45-6789, please help.")
+    )
+    assert prompt_decision.verdict == "sanitize"
+    assert prompt_decision.reason_code == "pii_sanitized"
+    assert "ssn" in prompt_decision.sanitize_types
+
+    # The response carries a Luhn-valid Visa test number that
+    # ``credit_card`` reliably detects across both Presidio and the
+    # regex fallback. (Avoiding a second SSN here on purpose — the
+    # ``987-xx-xxxx`` area is structurally invalid and the ``9xx``
+    # block is intentionally excluded from our structural fallback.)
+    response_decision = evaluate_output_policies(
+        [rule],
+        _output_ctx(text="Sure — here's the card: 4111 1111 1111 1111."),
+    )
+    assert response_decision.verdict == "block"
+    assert response_decision.reason_code == "pii_in_output"
+
+
+def test_pii_scan_phase_both_clean_prompt_dirty_response_still_blocks() -> None:
+    """``phase="both"`` catches a leak even when the prompt was
+    completely clean — the rule keeps firing on the response.
+    """
+    # ``credit_card`` only — picking a prompt with zero NER hits is
+    # the simplest way to keep this test deterministic across Presidio
+    # spaCy upgrades. Locations / person names elsewhere in the prompt
+    # would themselves fire the rule (``LOCATION`` → ``address``,
+    # ``PERSON`` → ``person_name``) and turn the verdict into
+    # ``sanitize``, which would defeat the "clean prompt" arm of this
+    # test. Scoping to a single non-NER type isolates the contract.
+    rule = _rule(
+        "pii_scan",
+        phase="both",
+        config={"action": "sanitize", "types": ["credit_card"]},
+    )
+
+    prompt_decision = evaluate_policies(
+        [rule], _input_ctx("hello there, what time is it?")
+    )
+    assert prompt_decision.verdict == "allow"
+
+    response_decision = evaluate_output_policies(
+        [rule], _output_ctx(text="By the way, my card is 4242 4242 4242 4242.")
+    )
+    assert response_decision.verdict == "block"
+    assert response_decision.reason_code == "pii_in_output"
+
+
+def test_pii_scan_phase_both_dirty_prompt_clean_response_only_sanitizes() -> None:
+    """The mirror: dirty prompt + clean response → sanitize on the
+    prompt, allow on the response. The rule's ``phase="both"``
+    setting doesn't force a block when the response is clean.
+    """
+    rule = _rule("pii_scan", phase="both", config={"action": "sanitize"})
+
+    # SSN ``123-45-6789`` is reliably caught by the structural
+    # fallback recognizer (Presidio's native ``UsSsnRecognizer``
+    # deny-lists this exact test pattern, see ``_pii_recognizers``).
+    prompt_decision = evaluate_policies(
+        [rule], _input_ctx("My SSN is 123-45-6789, can you remember it?")
+    )
+    assert prompt_decision.verdict == "sanitize"
+    assert prompt_decision.reason_code == "pii_sanitized"
+
+    response_decision = evaluate_output_policies(
+        [rule],
+        _output_ctx(text="Got it — I never store sensitive identifiers."),
+    )
+    assert response_decision.verdict == "allow"
+
+
+def test_pii_scan_phase_both_action_block_refuses_on_both_sides() -> None:
+    """Operators who want a hard refusal everywhere set ``action: "block"``
+    explicitly; the rule then blocks on the prompt side AND on the
+    response side, with phase-specific reason codes for the audit
+    narrative.
+    """
+    rule = _rule("pii_scan", phase="both", config={"action": "block"})
+
+    prompt_decision = evaluate_policies(
+        [rule], _input_ctx("My SSN is 123-45-6789.")
+    )
+    assert prompt_decision.verdict == "block"
+    assert prompt_decision.reason_code == "pii_detected"
+
+    response_decision = evaluate_output_policies(
+        [rule], _output_ctx(text="Your SSN appears to be 123-45-6789.")
+    )
+    assert response_decision.verdict == "block"
+    assert response_decision.reason_code == "pii_in_output"
+
+
 # ── deny_regex: works on either side ─────────────────────────────────
 
 

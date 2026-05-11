@@ -133,7 +133,13 @@ def _pii_rule() -> dict:
         "name": "block-pii",
         "type": "pii_scan",
         "tenant": None,
-        "config": {"threshold": 0.4, "kinds": ["ssn"], "message": "PII"},
+        "config": {
+            # Explicit block — 0.16.0 default flipped to sanitize.
+            "action": "block",
+            "threshold": 0.4,
+            "kinds": ["ssn"],
+            "message": "PII",
+        },
     }
 
 
