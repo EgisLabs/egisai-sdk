@@ -26,6 +26,7 @@ when the framework isn't installed.
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextvars import copy_context
@@ -207,6 +208,86 @@ def wrap_sync_iter_entrypoint(
     return wrapped
 
 
+def wrap_polymorphic_entrypoint(
+    orig: Callable[..., Any],
+    derive: Callable[..., IdentityRecord | None],
+) -> Callable[..., Any]:
+    """Wrap a polymorphic framework entry point.
+
+    Some upstream entry points are *plain* ``def`` functions that
+    inspect their kwargs at runtime and return one of:
+
+    - a **coroutine** to ``await``
+      (e.g. ``agno.Agent.arun(stream=False)``)
+    - an **async iterator** to ``async for``
+      (e.g. ``agno.Agent.arun(stream=True)``,
+       ``claude_agent_sdk.query(...)``)
+    - a **sync iterator** to ``for``
+      (e.g. ``agno.Agent.run(stream=True)``,
+       ``smolagents.MultiStepAgent.run(stream=True)``)
+    - a **plain value**
+      (e.g. ``agno.Agent.run(stream=False)``,
+       ``llamaindex.FunctionAgent.run()`` → ``WorkflowHandler``)
+
+    Treating any of these with the wrong wrap-kind silently corrupts
+    semantics (the bug behind the 0.17.2 ``TypeError: object
+    async_generator can't be used in 'await' expression`` on
+    ``ClaudeSDKClient.query``). This helper introspects ``orig``'s
+    *return value at call-time* and applies the correct scope-wrap so
+    identity is on the stack during the full lifetime of whatever
+    came back — coroutine, async-gen, sync-gen, or just-a-value.
+    """
+
+    @functools.wraps(orig)
+    def wrapped(self_or_first: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            record = derive(self_or_first, *args, **kwargs)
+        except Exception:  # noqa: BLE001
+            LOGGER.debug(
+                "polymorphic identity derive failed", exc_info=True,
+            )
+            record = None
+        if record is None:
+            return orig(self_or_first, *args, **kwargs)
+        # Phase 1 — call orig once under scope so construction-time
+        # work (rare but possible) sees identity.
+        with identity_scope(record):
+            result = orig(self_or_first, *args, **kwargs)
+
+        # Phase 2 — extend scope around the lifetime of what came back.
+        if inspect.iscoroutine(result):
+            async def _coro_scope() -> Any:
+                with identity_scope(record):
+                    return await result
+            return _coro_scope()
+        if inspect.isasyncgen(result):
+            async def _ag_scope() -> AsyncIterator[Any]:
+                ctx = copy_context()
+                with identity_scope(record):
+                    while True:
+                        try:
+                            item = await ctx.run(result.__anext__)
+                        except StopAsyncIteration:
+                            return
+                        yield item
+            return _ag_scope()
+        if inspect.isgenerator(result):
+            def _gen_scope() -> Iterator[Any]:
+                with identity_scope(record):
+                    yield from result
+            return _gen_scope()
+        # Plain value / future-like / handler object. Scope was active
+        # during the call itself; nothing further to extend. (Callers
+        # that hand back an awaitable handle e.g. LlamaIndex's
+        # ``WorkflowHandler`` accept this scope leak today — the
+        # framework's identity is still derivable by Tier 5 from the
+        # system prompt on the inner LLM call.)
+        return result
+
+    wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]
+    return wrapped
+
+
 # ── Class-method patcher ────────────────────────────────────────────
 
 
@@ -220,11 +301,16 @@ def patch_method(
 ) -> bool:
     """Install a wrapped method on a third-party class.
 
-    ``kind`` is one of ``"sync"``, ``"async"``, ``"async_iter"``, or
-    ``"sync_iter"``. Returns ``True`` when the patch lands, ``False``
-    when the target isn't importable / doesn't have the method (we
-    silently degrade so the framework being absent never breaks the
-    SDK).
+    ``kind`` is one of ``"sync"``, ``"async"``, ``"async_iter"``,
+    ``"sync_iter"``, or ``"polymorphic"``. Use ``"polymorphic"`` when
+    the upstream is a plain ``def`` whose return type depends on its
+    kwargs (e.g. agno's ``stream=`` toggle, Claude Agent SDK's
+    module-level ``query``) — see :func:`wrap_polymorphic_entrypoint`
+    for the matrix.
+
+    Returns ``True`` when the patch lands, ``False`` when the target
+    isn't importable / doesn't have the method (we silently degrade
+    so the framework being absent never breaks the SDK).
     """
     try:
         module = __import__(module_path, fromlist=[class_name])
@@ -246,6 +332,8 @@ def patch_method(
         wrapped = wrap_async_iter_entrypoint(orig, derive)
     elif kind == "sync_iter":
         wrapped = wrap_sync_iter_entrypoint(orig, derive)
+    elif kind == "polymorphic":
+        wrapped = wrap_polymorphic_entrypoint(orig, derive)
     else:
         raise ValueError(f"unknown kind: {kind!r}")
     setattr(cls, method_name, wrapped)

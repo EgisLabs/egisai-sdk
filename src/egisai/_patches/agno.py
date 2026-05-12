@@ -33,9 +33,23 @@ def apply() -> bool:
     if not has_module("agno"):
         return False
     any_patched = False
-    if patch_method("agno.agent", "Agent", "run", derive=_derive, kind="sync"):
+    # ``run`` and ``arun`` are *polymorphic dispatchers* — plain ``def``
+    # functions whose return type depends on the ``stream=`` kwarg:
+    #   - ``run(stream=False)``  → RunOutput (plain value)
+    #   - ``run(stream=True)``   → Iterator[RunOutputEvent]
+    #   - ``arun(stream=False)`` → coroutine resolving to RunOutput
+    #   - ``arun(stream=True)``  → AsyncIterator[RunOutputEvent]
+    # The polymorphic wrapper inspects the runtime return and applies
+    # the right scope-extension. Pre-0.17.5 we wrapped ``arun`` as
+    # ``async``, which crashed ``stream=True`` users with
+    # ``TypeError: object async_generator can't be used in 'await'``.
+    if patch_method(
+        "agno.agent", "Agent", "run", derive=_derive, kind="polymorphic"
+    ):
         any_patched = True
-    if patch_method("agno.agent", "Agent", "arun", derive=_derive, kind="async"):
+    if patch_method(
+        "agno.agent", "Agent", "arun", derive=_derive, kind="polymorphic"
+    ):
         any_patched = True
     if patch_method(
         "agno.agent", "Agent", "print_response", derive=_derive, kind="sync"

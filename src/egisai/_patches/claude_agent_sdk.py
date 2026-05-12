@@ -127,9 +127,21 @@ def apply() -> bool:
 
             _sdk.query = wrap_async_iter_entrypoint(orig, _derive)
             any_patched = True
+    # NOTE: ``ClaudeSDKClient.query`` is a **coroutine** (``async def``),
+    # not an async generator — even though the module-level ``query``
+    # above IS an async generator. They share a name but have different
+    # call shapes:
+    #   - Module-level: ``async for msg in claude_agent_sdk.query(...)``
+    #   - Instance:     ``await client.query(prompt)`` then
+    #                   ``async for msg in client.receive_response()``
+    # Wrapping the instance method as ``async_iter`` (which we did in
+    # 0.17.0–0.17.4) replaced the coroutine with an async-generator
+    # function, so ``await client.query(prompt)`` raised
+    # ``TypeError: object async_generator can't be used in 'await'
+    # expression``. Fixed in 0.17.5.
     if patch_method(
         "claude_agent_sdk", "ClaudeSDKClient", "query",
-        derive=_derive, kind="async_iter",
+        derive=_derive, kind="async",
     ):
         any_patched = True
     return any_patched

@@ -7,6 +7,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.17.5] — 2026-05-11
+
+### Fixed — framework patch correctness audit
+
+The Identity v1 patches that shipped in 0.17.2 misclassified the call
+shape of several upstream entry points. Where the wrap-kind didn't
+match the real upstream's signature, calling the patched method
+either crashed with ``TypeError: object async_generator can't be used
+in 'await' expression`` (Claude Agent SDK, Agno streaming) or
+silently swallowed the framework's returned handle inside a
+coroutine (LlamaIndex). Both shipped because the in-repo test stubs
+were hand-rolled and didn't mirror the real upstream's signature
+shape — so the tests passed on the stub but the real packages broke.
+
+This release re-audits every patched entry point against the real
+upstream signature, fixes the mismatches, adds a polymorphic wrapper
+for the dispatcher entry points, and locks the regression class out
+of CI with a signature-parity gate (40+ new test cases) plus an
+opt-in real-libraries audit (``EGIS_AUDIT_REAL_FRAMEWORKS=1``).
+
+**No user-facing API changes** — same ``egisai.init()`` call, same
+``set_context`` / ``agent`` / ``register_agent`` helpers, same
+backend payload shape. Existing users get the fixes for free on
+upgrade.
+
+#### Framework patch fixes
+
+- **Claude Agent SDK** —
+  ``ClaudeSDKClient.query`` was wrapped as ``kind="async_iter"``;
+  the real method is a coroutine (``async def query(self, prompt)``),
+  not an async generator. ``await client.query(prompt)`` now works
+  again. Fixes the ``TypeError`` reported by users running the
+  Anthropic agentic example. Module-level ``claude_agent_sdk.query``
+  (which IS an async generator) is unchanged.
+
+- **Agno** —
+  Both ``Agent.run`` and ``Agent.arun`` are plain ``def`` polymorphic
+  dispatchers: ``stream=False`` returns a value / coroutine,
+  ``stream=True`` returns a sync / async iterator. Pre-0.17.5 they
+  were wrapped as ``sync`` / ``async`` respectively, so any caller
+  using ``stream=True`` crashed (``arun``) or lost identity scope
+  (``run``). Now wrapped with the new ``polymorphic`` kind that
+  resolves the return shape at call time.
+
+- **smolagents** —
+  ``MultiStepAgent.run`` / ``ToolCallingAgent.run`` / ``CodeAgent.run``
+  also support ``stream=True``; same polymorphic wrap.
+
+- **LlamaIndex** —
+  ``FunctionAgent.run`` (and ``ReActAgent.run``, ``CodeActAgent.run``,
+  ``AgentWorkflow.run``) is a plain ``def`` returning a
+  ``WorkflowHandler`` — an awaitable handle whose ``.stream_events()``
+  is the streaming API. Pre-0.17.5 we wrapped it as ``async`` which
+  swallowed the handle inside a coroutine, breaking
+  ``async for ev in agent.run(...).stream_events()``. Now wrapped as
+  ``sync`` and the handle is returned directly. Also added explicit
+  patches for ``ReActAgent`` / ``CodeActAgent`` / ``AgentWorkflow``
+  (only ``FunctionAgent`` was covered previously). Removed the dead
+  ``AgentRunner`` patch reference (the class was removed upstream).
+
+- **LangChain 1.x** —
+  No code change required. ``AgentExecutor`` was removed in
+  LangChain 1.0 in favour of ``langchain.agents.create_agent``, which
+  returns a ``CompiledStateGraph``. That class inherits from
+  ``langgraph.pregel.Pregel``, so our existing LangGraph patches
+  (``invoke`` / ``ainvoke`` / ``stream`` / ``astream``) transparently
+  cover ``create_agent`` calls via Python's MRO. Documented in the
+  patch module's docstring so future maintainers don't try to "fix"
+  the apparent silent no-op.
+
+#### New: polymorphic wrapper
+
+``egisai._patches._framework.wrap_polymorphic_entrypoint`` handles
+the broad class of upstream entry points that are plain ``def``
+functions whose runtime return value depends on kwargs:
+
+  - returns a coroutine          → identity stays on the stack across ``await``
+  - returns an async iterator    → identity stays in scope per ``async for`` yield
+  - returns a sync iterator      → identity stays in scope per ``for`` yield
+  - returns a plain value/handle → identity was on the stack during the call
+
+Adds ``kind="polymorphic"`` to ``patch_method``.
+
+#### Tests
+
+- **``tests/test_framework_patches.py``** rewritten so every stub
+  faithfully mirrors the real upstream signature shape — async
+  generator vs. coroutine, sync generator vs. plain ``def``,
+  polymorphic dispatcher with ``stream=`` kwarg, ``WorkflowHandler``
+  returns. Added stream-toggle paths for Agno / smolagents. Added
+  ``await client.query(prompt)`` regression for the original bug.
+- **``tests/test_framework_signatures.py``** (new, 10 tests) is a
+  signature-parity gate: for every patched method, the wrapped
+  attribute MUST keep the upstream's ``iscoroutinefunction`` /
+  ``isasyncgenfunction`` / ``isgeneratorfunction`` shape. Any future
+  wrong-kind regression fails this gate before the SDK ships.
+- **``tests/test_framework_audit.py``** (new, 28 cases, opt-in via
+  ``EGIS_AUDIT_REAL_FRAMEWORKS=1``) imports the actual third-party
+  libraries — ``claude-agent-sdk``, ``agno``, ``langgraph``,
+  ``langchain``, ``autogen-agentchat``, ``crewai``, ``openai-agents``,
+  ``pydantic-ai``, ``llama-index-core``, ``smolagents``,
+  ``strands-agents``, ``google-adk`` — and verifies the patches don't
+  change the upstream's call shape against the real library. Catches
+  both wrong-kind regressions AND upstream signature drift.
+
+---
+
 ## [0.17.2] — 2026-05-11
 
 ### Fixed

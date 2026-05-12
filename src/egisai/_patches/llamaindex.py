@@ -48,11 +48,31 @@ def apply() -> bool:
     if not has_module("llama_index"):
         return False
     any_patched = False
-    if patch_method(
-        "llama_index.core.agent", "FunctionAgent", "run",
-        derive=_derive, kind="async",
+    # All modern LlamaIndex agents (FunctionAgent, ReActAgent,
+    # CodeActAgent, AgentWorkflow) expose ``run`` as a plain ``def``
+    # that returns a ``WorkflowHandler`` — an awaitable handle whose
+    # ``.stream_events()`` is the streaming API. Wrapping these as
+    # ``async`` (pre-0.17.5) silently swallowed the handle inside our
+    # coroutine, breaking the supported
+    # ``async for ev in agent.run(...).stream_events()`` pattern.
+    # ``sync`` returns the handle as-is — ``await handle`` and
+    # ``handle.stream_events()`` both still work. (Identity falls back
+    # to Tier 5 / system-prompt hash during the streaming events; the
+    # next minor will add a handle-aware wrapper.)
+    for class_name in (
+        "FunctionAgent",
+        "ReActAgent",
+        "CodeActAgent",
+        "AgentWorkflow",
     ):
-        any_patched = True
+        if patch_method(
+            "llama_index.core.agent", class_name, "run",
+            derive=_derive, kind="sync",
+        ):
+            any_patched = True
+    # ``AgentRunner`` was removed in modern LlamaIndex but we keep the
+    # call for older installations — ``patch_method`` returns ``False``
+    # silently when the target is gone.
     if patch_method(
         "llama_index.core.agent", "AgentRunner", "run",
         derive=_derive, kind="sync",

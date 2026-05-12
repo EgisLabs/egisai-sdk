@@ -47,9 +47,12 @@ def apply() -> bool:
     if not has_module("smolagents"):
         return False
     any_patched = False
+    # smolagents agents support a ``stream=True`` kwarg that flips
+    # ``run`` from "return a value" to "return a generator". Wrap as
+    # polymorphic so identity stays in scope for both shapes.
     for class_name in ("MultiStepAgent", "ToolCallingAgent", "CodeAgent"):
         if patch_method(
-            "smolagents", class_name, "run", derive=_derive, kind="sync"
+            "smolagents", class_name, "run", derive=_derive, kind="polymorphic"
         ):
             any_patched = True
     return any_patched

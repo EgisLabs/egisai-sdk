@@ -1,9 +1,20 @@
-"""Identity patch for LangChain legacy AgentExecutor.
+"""Identity patch for LangChain legacy ``AgentExecutor``.
 
 Targets ``langchain.agents.AgentExecutor.invoke`` / ``ainvoke`` /
-``stream``. Legacy LangChain agents typically lack an explicit
-``name``; identity is the composite of the agent's prompt template
-+ tools — Tier 2B.
+``stream``. Legacy LangChain (≤ 0.x) agents typically lack an
+explicit ``name``; identity is the composite of the agent's prompt
+template + tools — Tier 2B.
+
+NOTE on **LangChain 1.x**: ``AgentExecutor`` was removed in
+LangChain 1.0; the modern entry point is ``langchain.agents.create_agent``
+which returns a ``langgraph.graph.state.CompiledStateGraph``. That
+class **inherits from** ``langgraph.pregel.Pregel`` (verified
+empirically; see ``mro()``), so the existing ``langgraph`` patches
+(``Pregel.invoke`` / ``ainvoke`` / ``stream`` / ``astream``)
+transparently cover ``create_agent(...)`` calls via MRO. No
+``langchain.agents.create_agent`` patch is needed — the apparent
+"silent no-op" of this module on LangChain 1.x is the intended
+behaviour because LangGraph picks up the slack.
 """
 
 from __future__ import annotations
