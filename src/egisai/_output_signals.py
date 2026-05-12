@@ -231,3 +231,68 @@ def extract_google(response: Any, payload: Any) -> OutputSignals:
         tool_calls,
         mcp_targets,
     )
+
+
+# ── AWS Bedrock Converse ──────────────────────────────────────────────
+
+
+def _bedrock_tool_definition_names(payload: Any) -> list[str]:
+    """Bedrock Converse uses ``toolConfig.tools[*].toolSpec.name``.
+
+    Differs from OpenAI/Anthropic where definitions live under
+    ``tools[*]`` directly; we honour Bedrock's nested envelope so
+    ``deny_tool_call`` policies that block on definition (not just
+    invocation) fire correctly.
+    """
+    if not isinstance(payload, dict):
+        return []
+    tool_config = payload.get("toolConfig")
+    if not isinstance(tool_config, dict):
+        return []
+    out: list[str] = []
+    for tool in _as_list(tool_config.get("tools")):
+        if not isinstance(tool, dict):
+            continue
+        spec = tool.get("toolSpec")
+        if isinstance(spec, dict):
+            name = spec.get("name")
+            if isinstance(name, str) and name:
+                out.append(name)
+    return out
+
+
+def extract_bedrock_converse(response: Any, payload: Any) -> OutputSignals:
+    """Pull text + tool-use signals out of a Bedrock Converse response.
+
+    Bedrock Converse wraps the assistant turn under
+    ``output.message.content`` — a list of content blocks, each a
+    ``{"text": ...}`` or ``{"toolUse": {"name", "toolUseId",
+    "input"}}``. The shape mirrors Anthropic's ``Messages`` API
+    because Bedrock normalises across providers (Anthropic, Mistral,
+    Cohere, Meta, Amazon) onto one envelope.
+    """
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    mcp_targets: list[str] = []
+
+    output = _read(response, "output")
+    message = _read(output, "message")
+    for block in _as_list(_read(message, "content")):
+        if not isinstance(block, dict):
+            continue
+        text = block.get("text")
+        if isinstance(text, str):
+            text_parts.append(text)
+        tool_use = block.get("toolUse")
+        if isinstance(tool_use, dict):
+            name = tool_use.get("name")
+            args = _coerce_arguments(tool_use.get("input"))
+            if isinstance(name, str) and name:
+                tool_calls.append({"name": name, "arguments": args})
+
+    return (
+        "\n".join(p for p in text_parts if p),
+        _bedrock_tool_definition_names(payload),
+        tool_calls,
+        mcp_targets,
+    )

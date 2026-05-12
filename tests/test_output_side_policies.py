@@ -15,6 +15,7 @@ import pytest
 from egisai._evaluator import OutputCall, evaluate_output
 from egisai._output_signals import (
     extract_anthropic,
+    extract_bedrock_converse,
     extract_google,
     extract_openai_chat,
     extract_openai_responses,
@@ -236,6 +237,47 @@ def test_anthropic_signal_extractor_pulls_tool_use_blocks() -> None:
     assert "policies" in calls[0]["arguments"]
 
 
+def test_bedrock_converse_signal_extractor_pulls_tool_uses() -> None:
+    """Bedrock Converse normalises providers (Anthropic/Mistral/Cohere/
+    Meta/Amazon) onto ``output.message.content`` with text + toolUse
+    blocks. The extractor must pull both so deny_tool_call /
+    deny_output_regex fire post-model — without this, Bedrock-routed
+    traffic skipped the output phase entirely (gap fixed in 0.18.x).
+    """
+    response = {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"text": "I'll handle that now."},
+                    {
+                        "toolUse": {
+                            "toolUseId": "tu_1",
+                            "name": "run_shell",
+                            "input": {"cmd": "ls"},
+                        }
+                    },
+                ],
+            }
+        },
+        "stopReason": "tool_use",
+    }
+    payload = {
+        "toolConfig": {
+            "tools": [
+                {"toolSpec": {"name": "run_shell"}},
+                {"toolSpec": {"name": "search_kb"}},
+            ]
+        }
+    }
+    text, names, calls, mcp = extract_bedrock_converse(response, payload)
+    assert "handle that now" in text
+    assert set(names) == {"run_shell", "search_kb"}
+    assert calls and calls[0]["name"] == "run_shell"
+    assert "ls" in calls[0]["arguments"]
+    assert mcp == []
+
+
 def test_google_signal_extractor_pulls_function_calls() -> None:
     response = {
         "candidates": [
@@ -351,3 +393,63 @@ def test_gate_call_allows_response_when_no_banned_signal(fake_backend) -> None:
         forward=lambda: fake_response,
     )
     assert result is fake_response
+
+
+def test_gate_call_blocks_bedrock_response_with_banned_tool_call(
+    fake_backend,
+) -> None:
+    """End-to-end Bedrock parity with the OpenAI test above. Confirms
+    the output gate fires for Bedrock Converse traffic — closes the
+    0.18.x gap where bedrock_runtime forwarded through ``gate_call``
+    without an ``extract_output_signals`` so output policies silently
+    skipped.
+    """
+    fake_backend.set_rules([_deny_tool_rule()], etag='"bedrock-e2e"')
+
+    import egisai
+
+    egisai.init(
+        api_key="egis_live_test",
+        app="a",
+        env="t",
+        base_url="http://fake",
+        enable_sse=False,
+        on_block="raise",
+    )
+
+    from egisai._patches._common import gate_call
+
+    fake_response = {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "toolUse": {
+                            "toolUseId": "tu_1",
+                            "name": "run_shell",
+                            "input": {},
+                        }
+                    }
+                ],
+            }
+        },
+        "stopReason": "tool_use",
+    }
+
+    with pytest.raises(PermissionError, match="block-shell-tool"):
+        gate_call(
+            source="bedrock_runtime",
+            target="bedrock.converse",
+            model="anthropic.claude-3-5-sonnet-20240620-v1:0",
+            prompt_text="please help",
+            stream=False,
+            payload={
+                "messages": [{"role": "user", "content": [{"text": "help"}]}],
+                "toolConfig": {
+                    "tools": [{"toolSpec": {"name": "search_kb"}}]
+                },
+            },
+            extract_output_signals=extract_bedrock_converse,
+            forward=lambda: fake_response,
+        )

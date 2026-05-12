@@ -25,6 +25,7 @@ from typing import Any
 
 from egisai._auto_agent import _derive_identity_from_system, _hash_bundle
 from egisai._evaluator import extract_anthropic_prompt
+from egisai._output_signals import extract_bedrock_converse
 from egisai._patches import has_module
 from egisai._patches._common import gate_call
 
@@ -111,6 +112,13 @@ def _make_call(orig: Any, model_id: str, kwargs: dict) -> Any:
         stream=False,
         payload=payload,
         extract_usage=_extract_usage,
+        # Output-side enforcement: deny_tool_call / deny_output_regex /
+        # output semantic_guard fire against the assistant turn so a
+        # Bedrock-hosted model can't return PII or invoke a denylisted
+        # tool without the gate seeing it. Without this, the gate's
+        # output phase short-circuits (extractor=None) and policies
+        # silently skip post-model.
+        extract_output_signals=extract_bedrock_converse,
         forward=lambda: orig(**kwargs),
     )
 

@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.18.1] — 2026-05-12
+
+### Fixed — Bedrock output-phase enforcement gap
+
+`bedrock_runtime` (AWS Bedrock Converse API) was the one LLM-level
+adapter that forwarded through `gate_call` *without* an
+`extract_output_signals` extractor. The result: every Bedrock-hosted
+model call silently skipped Phase 3 of the policy engine —
+`deny_tool_call`, `deny_mcp_call`, `deny_output_regex`, and the
+post-model `semantic_guard` policies never fired against Bedrock
+traffic. OpenAI / Anthropic / Google calls were always fully gated;
+Bedrock callers had input-side enforcement only.
+
+This release closes the gap:
+
+- New `extract_bedrock_converse` (in `egisai/_output_signals.py`)
+  parses Bedrock's `output.message.content` blocks for assistant
+  text + `toolUse` invocations, plus `toolConfig.tools[*].toolSpec.name`
+  for definition-side denylist matches. The shape mirrors
+  Anthropic's Messages API because Bedrock normalises across
+  providers (Anthropic / Mistral / Cohere / Meta / Amazon) onto one
+  envelope.
+- `_patches/bedrock_runtime.py` passes `extract_output_signals=
+  extract_bedrock_converse` so every `client.converse(...)` and
+  `client.converse_stream(...)` call runs the output phase.
+- `_patches/bedrock_agent.py` (`InvokeAgent` for AWS-managed
+  agents) now runs `gate_call` so input-side policies (PII,
+  `deny_regex`, `max_prompt_chars`, pre-model `semantic_guard`)
+  fire on the `inputText` parameter before it reaches AWS.
+  Output-side gating remains exempted for this one adapter — the
+  response is a caller-iterated `EventStream` we can't replay
+  without breaking the user's iteration loop. The exemption is
+  declared in `PATCHES_WITHOUT_OUTPUT_EXTRACTOR` and pinned by the
+  audit test below.
+
+### Added — structural audit test that prevents this gap from regressing
+
+`tests/test_output_extractor_audit.py` walks every `_patches/*.py`
+via AST and asserts that any `gate_call` / `async_gate_call` site
+either passes `extract_output_signals=` or appears in an explicit
+exemption list with a justification. This is the test that would
+have caught the original Bedrock gap on its first commit. Any
+future LLM-level patch that forgets to wire the output extractor
+fails the audit at unit-test time.
+
+End-to-end coverage added in `tests/test_output_side_policies.py`:
+`test_gate_call_blocks_bedrock_response_with_banned_tool_call`
+verifies a Bedrock Converse response carrying a denylisted tool
+invocation now raises `PermissionError` exactly like the OpenAI
+path does.
+
+### Fixed — Compliance rule §5 leak in `ClaudeSDKClient.query`
+
+`_patches/claude_agent_sdk.py` was calling `open_run(prompt_text=
+prompt_text[:280])` **before** the input policy phase had run,
+which meant the streaming `run.start` envelope shipped the raw
+prompt to the platform before any sanitization layer had a chance
+to redact PII. That violates rule §5 (audit before persist) and
+rule §1 (no raw PII over the wire) from the security & compliance
+guide.
+
+`open_run` is now called with `prompt_text=None` for the
+`ClaudeSDKClient.query` path. The backend's `_apply_step_to_run`
+promotes the first step's **post-sanitize** `prompt_preview` onto
+the Run's `prompt_text` once the input phase has finished — so the
+dashboard still shows the prompt within the SDK's normal flush
+window (typically sub-second), but the payload that crosses the
+wire never carries the un-redacted original.
+
+The module-level `claude_agent_sdk.query` path was already correct
+(it called `open_run` *after* the input phase, so the value it
+passed was already sanitized). No change there.
+
+### Internal
+
+- SDK suite: **421 passed, 28 skipped** (real-framework audits
+  require the audit venv with all 14 libraries pre-installed).
+- `ruff check .` and `mypy src/egisai` both clean.
+
+---
+
 ## [0.18.0] — 2026-05-11
 
 ### Architecture — Runs & Steps: one row per logical agent task

@@ -28,6 +28,7 @@ from egisai._auto_agent import (
     identity_scope,
 )
 from egisai._patches import has_module
+from egisai._patches._common import gate_call
 
 LOGGER = logging.getLogger("egisai.patches.bedrock_agent")
 
@@ -106,8 +107,35 @@ def _wrap_invoke_agent(orig: Any) -> Any:
             source=FRAMEWORK_SOURCE,  # type: ignore[arg-type]
             push_to_stack=True,
         )
+        # Run the gate around the call so input-side policies fire
+        # (PII / deny_regex / allow_model / max_prompt_chars /
+        # semantic_guard pre-model). ``inputText`` is the user prompt
+        # leaving the Python process — same status as a raw model
+        # call's prompt, so it gets the same input phase.
+        #
+        # We don't pass ``extract_output_signals``: ``invoke_agent``
+        # returns an ``EventStream`` that must be iterated by the
+        # caller exactly once. Wrapping it to extract output signals
+        # would either consume the stream (breaking the caller) or
+        # require building a replay proxy — out of scope for v1.
+        # The model + tool calls inside the managed agent are still
+        # audit-logged via the trace events the EventStream yields
+        # (caller-driven), and the next user turn's input phase will
+        # see whatever text comes back, but ``deny_tool_call`` on
+        # the AWS-side execution is not enforceable from outside
+        # the agent.
+        input_text = kwargs.get("inputText")
+        prompt_text = input_text if isinstance(input_text, str) else ""
         with identity_scope(record):
-            return orig(**kwargs)
+            return gate_call(
+                source="bedrock_agent",
+                target="bedrock_agent.invoke_agent",
+                model=f"bedrock_agent:{agent_id}",
+                prompt_text=prompt_text,
+                stream=True,
+                payload={"input": prompt_text, "agentId": agent_id},
+                forward=lambda: orig(**kwargs),
+            )
 
     wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]
     return wrapped
