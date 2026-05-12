@@ -45,6 +45,7 @@ from egisai._evaluator import (
 )
 from egisai._events import build_event, safe_preview
 from egisai._logger import enqueue
+from egisai._run import StepKind, append_step, current_run
 from egisai.policy import PolicyDecision, label_redact
 from egisai.policy.pii import Sanitization
 from egisai.policy.pii import sanitize as pii_sanitize
@@ -202,16 +203,25 @@ def _apply_sanitization(
 def _attribute_event(ev: dict, payload: Any) -> None:
     """Attribute the event to the right agent identity.
 
-    Reads from the resolver's pushed identity first (set by
-    ``gate_call`` BEFORE this runs, so the ContextVar identity stack
-    typically carries whichever tier resolved). If nothing is pushed
-    yet — direct ``_attribute_event`` callers from older tests, or
-    callers that bypass ``gate_call`` — runs the full 7-tier
-    resolver inline as a fallback so behaviour stays consistent.
+    Reads from the LOCKED Run identity first (a framework wrap above
+    us already opened a Run with a resolved identity — we must not
+    re-derive mid-run, otherwise Tier 5 prompt-hashing drift across
+    turns would register 4 agents for what is logically 1). If no Run
+    is open we fall through to the per-call stack identity, and then
+    to the full 7-tier resolver as a last resort.
 
     See ``egisai._auto_agent.resolve_identity`` for the full tier
     table.
     """
+    # Run-scoped lock — the framework patch resolved identity ONCE at
+    # entry; every inner LLM call shares that identity even if their
+    # per-call payload would have otherwise resolved differently.
+    run = current_run()
+    if run is not None and run.agent_id:
+        ev["agent_id"] = run.agent_id
+        ev["app"] = run.agent_name or ev.get("app")
+        return
+
     ctx = get_context()
     record = current_identity()
     if record is not None and record.agent_id:
@@ -244,6 +254,32 @@ def _attribute_event(ev: dict, payload: Any) -> None:
     cfg = get_config()
     if cfg.agent_id:
         return
+
+
+# ── Run / step dispatch ─────────────────────────────────────────────
+
+
+def _dispatch_step(
+    ev: dict[str, Any],
+    *,
+    started_at: float,
+    ended_at: float | None = None,
+    kind: StepKind = "model_call",
+) -> None:
+    """Send a finished audit event to the right destination.
+
+    When a Run is open (framework wrap above us, or auto-opened by
+    the gate for raw LLM use), the event is recorded as a step under
+    that Run and the streaming ``run.step`` envelope is enqueued.
+    When no Run is open, the legacy single-row event is enqueued —
+    this preserves the older wire format for tests / callers that
+    intentionally bypass the run framework.
+    """
+    if append_step(  # type: ignore[func-returns-value]
+        event=ev, kind=kind, started_at=started_at, ended_at=ended_at,
+    ) is not None:
+        return
+    enqueue(ev)
 
 
 # Output-side signal extractor: ``(response, request_payload) → (text,
@@ -319,14 +355,19 @@ def _block_response(
     ev: dict[str, Any],
     model: str,
     stub_factory: Callable[[PolicyDecision, str, str], Any] | None,
+    step_started: float | None = None,
 ) -> Any:
-    """Enqueue + return-or-raise the framework-shaped block response.
+    """Dispatch the block step + return-or-raise the framework-shaped response.
 
-    ``ev`` is enqueued as-is; the caller is responsible for setting
+    ``ev`` is dispatched as-is; the caller is responsible for setting
     ``ev["latency_ms"]`` first (zero for input-side blocks, real
     elapsed time for output-side blocks).
     """
-    enqueue(ev)
+    _dispatch_step(
+        ev,
+        started_at=step_started if step_started is not None else time.monotonic(),
+        kind="model_call",
+    )
     cfg = get_config()
     msg = (
         f"[egisai] {decision.message or 'blocked by policy'} "
@@ -451,8 +492,8 @@ def gate_call(
 
     ``forward`` is a zero-arg callable invoking the original
     function; it runs only on allow / sanitize verdicts. Events are
-    enqueued after ``forward()`` returns for allowed calls (so
-    latency + tokens are populated), or immediately on block.
+    recorded as a step under the current Run (auto-opened when no
+    framework wrap above us is hosting one).
 
     Output-side policies (``deny_tool_call``, ``deny_mcp_call``,
     ``deny_output_regex``, output-side ``semantic_guard``) run
@@ -521,6 +562,7 @@ def _gate_call_inner(
 
     set_policy_checked(True)
     reset_policy_usage()
+    step_started = time.monotonic()
     try:
         decision = _run_input_phase(
             source=source,
@@ -538,6 +580,7 @@ def _gate_call_inner(
                 ev=ev,
                 model=model,
                 stub_factory=stub_factory,
+                step_started=step_started,
             )
 
         if decision.verdict == "sanitize":
@@ -549,7 +592,7 @@ def _gate_call_inner(
         except BaseException:
             ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
             ev["error"] = "call failed"
-            enqueue(ev)
+            _dispatch_step(ev, started_at=step_started, kind="model_call")
             raise
         ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
         _stamp_usage(ev, response, extract_usage)
@@ -570,11 +613,12 @@ def _gate_call_inner(
                 ev=ev,
                 model=model,
                 stub_factory=stub_factory,
+                step_started=step_started,
             )
         if output_decision is not None:
             ev["response_decision"] = _decision_block(output_decision)
 
-        enqueue(ev)
+        _dispatch_step(ev, started_at=step_started, kind="model_call")
         return response
     finally:
         # Outer `gate_call` guaranteed prev_checked was False
@@ -649,6 +693,7 @@ async def _async_gate_call_inner(
 
     set_policy_checked(True)
     reset_policy_usage()
+    step_started = time.monotonic()
     try:
         decision = _run_input_phase(
             source=source,
@@ -666,6 +711,7 @@ async def _async_gate_call_inner(
                 ev=ev,
                 model=model,
                 stub_factory=stub_factory,
+                step_started=step_started,
             )
 
         if decision.verdict == "sanitize":
@@ -677,7 +723,7 @@ async def _async_gate_call_inner(
         except BaseException:
             ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
             ev["error"] = "call failed"
-            enqueue(ev)
+            _dispatch_step(ev, started_at=step_started, kind="model_call")
             raise
         ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
         _stamp_usage(ev, response, extract_usage)
@@ -698,11 +744,12 @@ async def _async_gate_call_inner(
                 ev=ev,
                 model=model,
                 stub_factory=stub_factory,
+                step_started=step_started,
             )
         if output_decision is not None:
             ev["response_decision"] = _decision_block(output_decision)
 
-        enqueue(ev)
+        _dispatch_step(ev, started_at=step_started, kind="model_call")
         return response
     finally:
         # Outer `async_gate_call` guaranteed prev_checked was

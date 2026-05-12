@@ -38,8 +38,80 @@ from egisai._auto_agent import (
     _hash_bundle,
     identity_scope,
 )
+from egisai._run import close_run, open_run
 
 LOGGER = logging.getLogger("egisai.patches.framework")
+
+
+# ── Run lifecycle helpers ───────────────────────────────────────────
+
+
+def _framework_name(orig: Callable[..., Any]) -> str:
+    """Derive a short framework token from the wrapped callable.
+
+    Used to stamp the ``framework`` field on the run event. Falls back
+    to the qualified name's first segment when the module path doesn't
+    obviously map to a framework token.
+    """
+    mod = getattr(orig, "__module__", "") or ""
+    if mod.startswith("agents."):
+        return "openai_agents"
+    if mod.startswith("claude_agent_sdk"):
+        return "claude_agent_sdk"
+    if mod.startswith("langgraph"):
+        return "langgraph"
+    if mod.startswith("langchain"):
+        return "langchain"
+    if mod.startswith("crewai"):
+        return "crewai"
+    if mod.startswith("autogen"):
+        return "autogen"
+    if mod.startswith("agno"):
+        return "agno"
+    if mod.startswith("strands"):
+        return "strands"
+    if mod.startswith("smolagents"):
+        return "smolagents"
+    if mod.startswith("llama_index"):
+        return "llamaindex"
+    if mod.startswith("google_adk") or mod.startswith("google.adk"):
+        return "google_adk"
+    if mod.startswith("pydantic_ai"):
+        return "pydantic_ai"
+    return mod.split(".")[0] or "framework"
+
+
+class _RunScope:
+    """Open a run on enter, close on exit — identity-record aware."""
+
+    def __init__(self, framework: str, record: IdentityRecord | None) -> None:
+        self.framework = framework
+        self.record = record
+        self.opened = False
+
+    def __enter__(self) -> _RunScope:
+        if self.record is not None:
+            open_run(framework=self.framework, identity=self.record)
+            self.opened = True
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self.opened:
+            close_run(error=repr(exc_val) if exc_val else None)
+
+
+def _safe_derive(
+    derive: Callable[..., IdentityRecord | None],
+    self_or_first: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> IdentityRecord | None:
+    """Run ``derive`` and swallow errors per fail-open philosophy."""
+    try:
+        return derive(self_or_first, *args, **kwargs)
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("framework identity derive failed", exc_info=True)
+        return None
 
 
 # ── Identity construction helpers ───────────────────────────────────
@@ -94,25 +166,25 @@ def wrap_sync_entrypoint(
     orig: Callable[..., Any],
     derive: Callable[..., IdentityRecord | None],
 ) -> Callable[..., Any]:
-    """Wrap a sync framework entry point so it pushes identity first.
+    """Wrap a sync framework entry point so it opens a Run.
 
-    ``derive(self, *args, **kwargs)`` returns the IdentityRecord or
-    ``None``. The wrapper pushes the record and runs the original;
-    if ``derive`` raises, the original still runs (fail-open).
+    On entry, derive the identity, open a Run (which locks the agent
+    for every inner LLM call), and run the original under
+    ``identity_scope``. On exit, close the Run — emits a single
+    ``run.end`` audit event with aggregated tokens/latency/verdict
+    across all the inner steps the gate captured.
+
+    Fail-open: if derive raises or returns None, the original still
+    runs (no run opened) — the SDK never breaks the user's call.
     """
+    framework = _framework_name(orig)
 
     @functools.wraps(orig)
     def wrapped(self_or_first: Any, *args: Any, **kwargs: Any) -> Any:
-        try:
-            record = derive(self_or_first, *args, **kwargs)
-        except Exception:  # noqa: BLE001
-            LOGGER.debug(
-                "framework identity derive failed", exc_info=True,
-            )
-            record = None
+        record = _safe_derive(derive, self_or_first, *args, **kwargs)
         if record is None:
             return orig(self_or_first, *args, **kwargs)
-        with identity_scope(record):
+        with _RunScope(framework, record), identity_scope(record):
             return orig(self_or_first, *args, **kwargs)
 
     wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]
@@ -124,19 +196,14 @@ def wrap_async_entrypoint(
     derive: Callable[..., IdentityRecord | None],
 ) -> Callable[..., Awaitable[Any]]:
     """Async sibling of :func:`wrap_sync_entrypoint`."""
+    framework = _framework_name(orig)
 
     @functools.wraps(orig)
     async def wrapped(self_or_first: Any, *args: Any, **kwargs: Any) -> Any:
-        try:
-            record = derive(self_or_first, *args, **kwargs)
-        except Exception:  # noqa: BLE001
-            LOGGER.debug(
-                "framework identity derive (async) failed", exc_info=True,
-            )
-            record = None
+        record = _safe_derive(derive, self_or_first, *args, **kwargs)
         if record is None:
             return await orig(self_or_first, *args, **kwargs)
-        with identity_scope(record):
+        with _RunScope(framework, record), identity_scope(record):
             return await orig(self_or_first, *args, **kwargs)
 
     wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]
@@ -152,35 +219,41 @@ def wrap_async_iter_entrypoint(
     Critical: async generators run yields on the asyncio task that
     advances them, which is NOT the task that called ``__anext__``
     in the general case. We use ``copy_context`` so the identity
-    stack carries across each yield's task boundary. Without this,
-    ``current_identity()`` reads empty inside the inner LLM call
-    and Tier 5 fingerprinting fires (double-counting the agent).
+    stack AND the run scope carry across each yield's task boundary.
+    Without this, ``current_identity()`` and ``current_run()`` both
+    read empty inside the inner LLM call and Tier 5 fingerprinting
+    fires (double-counting the agent).
+
+    The Run is closed when the iterator exhausts OR when the caller
+    breaks out of the loop early (Python invokes the generator's
+    aclose on garbage collection).
     """
+    framework = _framework_name(orig)
 
     @functools.wraps(orig)
     async def wrapped(self_or_first: Any, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
-        try:
-            record = derive(self_or_first, *args, **kwargs)
-        except Exception:  # noqa: BLE001
-            LOGGER.debug(
-                "framework identity derive (async-iter) failed", exc_info=True,
-            )
-            record = None
+        record = _safe_derive(derive, self_or_first, *args, **kwargs)
         if record is None:
             async for item in orig(self_or_first, *args, **kwargs):
                 yield item
             return
-        ctx = copy_context()
-        with identity_scope(record):
+        with _RunScope(framework, record), identity_scope(record):
+            ctx = copy_context()
             it = orig(self_or_first, *args, **kwargs)
-            while True:
-                try:
-                    # Resume the generator in the captured context so
-                    # the identity scope inherits per yield.
-                    item = await ctx.run(it.__anext__)
-                except StopAsyncIteration:
-                    break
-                yield item
+            try:
+                while True:
+                    try:
+                        item = await ctx.run(it.__anext__)
+                    except StopAsyncIteration:
+                        break
+                    yield item
+            finally:
+                aclose = getattr(it, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()
+                    except Exception:  # noqa: BLE001
+                        pass
 
     wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]
     return wrapped
@@ -191,17 +264,15 @@ def wrap_sync_iter_entrypoint(
     derive: Callable[..., IdentityRecord | None],
 ) -> Callable[..., Iterator[Any]]:
     """Wrap a sync-generator framework entry point (e.g. .stream())."""
+    framework = _framework_name(orig)
 
     @functools.wraps(orig)
     def wrapped(self_or_first: Any, *args: Any, **kwargs: Any) -> Iterator[Any]:
-        try:
-            record = derive(self_or_first, *args, **kwargs)
-        except Exception:  # noqa: BLE001
-            record = None
+        record = _safe_derive(derive, self_or_first, *args, **kwargs)
         if record is None:
             yield from orig(self_or_first, *args, **kwargs)
             return
-        with identity_scope(record):
+        with _RunScope(framework, record), identity_scope(record):
             yield from orig(self_or_first, *args, **kwargs)
 
     wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]
@@ -229,59 +300,71 @@ def wrap_polymorphic_entrypoint(
       (e.g. ``agno.Agent.run(stream=False)``,
        ``llamaindex.FunctionAgent.run()`` → ``WorkflowHandler``)
 
-    Treating any of these with the wrong wrap-kind silently corrupts
-    semantics (the bug behind the 0.17.2 ``TypeError: object
-    async_generator can't be used in 'await' expression`` on
-    ``ClaudeSDKClient.query``). This helper introspects ``orig``'s
-    *return value at call-time* and applies the correct scope-wrap so
-    identity is on the stack during the full lifetime of whatever
-    came back — coroutine, async-gen, sync-gen, or just-a-value.
+    The wrapper opens a Run that spans the *full lifetime* of the
+    returned value — coroutine, async-gen, sync-gen, or plain value.
+    For the plain-value case (LlamaIndex handlers, futures, etc.) we
+    close the Run after the call returns; downstream awaits of the
+    returned handle are out-of-scope for v1 (a follow-up will wrap
+    those handles individually).
     """
+    framework = _framework_name(orig)
 
     @functools.wraps(orig)
     def wrapped(self_or_first: Any, *args: Any, **kwargs: Any) -> Any:
-        try:
-            record = derive(self_or_first, *args, **kwargs)
-        except Exception:  # noqa: BLE001
-            LOGGER.debug(
-                "polymorphic identity derive failed", exc_info=True,
-            )
-            record = None
+        record = _safe_derive(derive, self_or_first, *args, **kwargs)
         if record is None:
             return orig(self_or_first, *args, **kwargs)
-        # Phase 1 — call orig once under scope so construction-time
-        # work (rare but possible) sees identity.
-        with identity_scope(record):
-            result = orig(self_or_first, *args, **kwargs)
+        # Open the run upfront — must close on every code path below.
+        scope = _RunScope(framework, record)
+        scope.__enter__()
+        try:
+            with identity_scope(record):
+                result = orig(self_or_first, *args, **kwargs)
+        except BaseException as exc:
+            scope.__exit__(type(exc), exc, exc.__traceback__)
+            raise
 
-        # Phase 2 — extend scope around the lifetime of what came back.
         if inspect.iscoroutine(result):
             async def _coro_scope() -> Any:
-                with identity_scope(record):
-                    return await result
+                try:
+                    with identity_scope(record):
+                        return await result
+                finally:
+                    scope.__exit__(None, None, None)
             return _coro_scope()
         if inspect.isasyncgen(result):
             async def _ag_scope() -> AsyncIterator[Any]:
                 ctx = copy_context()
-                with identity_scope(record):
-                    while True:
+                try:
+                    with identity_scope(record):
+                        while True:
+                            try:
+                                item = await ctx.run(result.__anext__)
+                            except StopAsyncIteration:
+                                return
+                            yield item
+                finally:
+                    aclose = getattr(result, "aclose", None)
+                    if aclose is not None:
                         try:
-                            item = await ctx.run(result.__anext__)
-                        except StopAsyncIteration:
-                            return
-                        yield item
+                            await aclose()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    scope.__exit__(None, None, None)
             return _ag_scope()
         if inspect.isgenerator(result):
             def _gen_scope() -> Iterator[Any]:
-                with identity_scope(record):
-                    yield from result
+                try:
+                    with identity_scope(record):
+                        yield from result
+                finally:
+                    scope.__exit__(None, None, None)
             return _gen_scope()
-        # Plain value / future-like / handler object. Scope was active
-        # during the call itself; nothing further to extend. (Callers
-        # that hand back an awaitable handle e.g. LlamaIndex's
-        # ``WorkflowHandler`` accept this scope leak today — the
-        # framework's identity is still derivable by Tier 5 from the
-        # system prompt on the inner LLM call.)
+        # Plain value — close the run now. Downstream awaitable handles
+        # (LlamaIndex WorkflowHandler) will be wrapped by a dedicated
+        # proxy in v2; for v1 they emit their inner LLM steps under the
+        # Tier 5 prompt-hash identity (back-compat with 0.17.x).
+        scope.__exit__(None, None, None)
         return result
 
     wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]

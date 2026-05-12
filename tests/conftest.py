@@ -39,6 +39,11 @@ def reset_sdk() -> Iterator[None]:
     _auto_agent._identity_cache.clear()
     _auto_agent._identity_stack.set(())
 
+    # 0.18.0 — clear any open Run that a previous test forgot to close.
+    from egisai import _run
+
+    _run.reset_for_tests()
+
     # The init module also caches whether it's been called via _CONFIG; the
     # logger module's queue persists between tests, so we drain it.
     while not _logger._q.empty():

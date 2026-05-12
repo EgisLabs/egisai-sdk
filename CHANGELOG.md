@@ -7,6 +7,170 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.18.0] — 2026-05-11
+
+### Architecture — Runs & Steps: one row per logical agent task
+
+Solves the "4 tool calls = 4 agents + 5 requests" bug across **all 14
+supported frameworks** (OpenAI, Anthropic, Google Gemini, openai-agents,
+Claude Agent SDK, LangGraph, LangChain, CrewAI, AutoGen, Agno, Strands,
+smolagents, LlamaIndex, Pydantic AI, plus Google ADK, raw httpx/requests/
+boto3). Each framework entry-point invocation
+(`Runner.run(...)`, `Pregel.invoke(...)`, `ClaudeSDKClient.query(...)`,
+`Agent.arun(...)`, `Workflow.run(...)`, …) now ships as **one Run** with
+N **Steps** beneath it instead of N independent audit rows.
+
+Concretely:
+
+- **New SDK module `egisai/_run.py`** — defines `RunContext`,
+  `RunStep`, a `ContextVar`-backed `_current_run`, and an
+  `open_run` / `append_step` / `close_run` lifecycle that's async-
+  / thread-safe via Python's standard context-variable propagation.
+  Identity is **locked at run open**: every inner model call shares
+  the same `agent_id`, even when subsequent payloads would otherwise
+  re-derive a different one. Trace IDs are minted once per Run.
+- **Generic `_framework.py` wrappers** (`wrap_sync_entrypoint`,
+  `wrap_async_entrypoint`, `wrap_async_iter_entrypoint`,
+  `wrap_sync_iter_entrypoint`, `wrap_polymorphic_entrypoint`) all
+  open a Run on entry, run the original framework code inside an
+  `identity_scope` + a `_RunScope`, and close the Run on exit
+  (including on early `break`, exception, `aclose`, GC).
+- **Claude Agent SDK** (`_patches/claude_agent_sdk.py`) opens the
+  Run **before** input policy evaluation so even input-blocked calls
+  emit a complete `run.start → run.step → run.end` triplet — the
+  dashboard never sees an invisible refusal.
+- **Streaming wire protocol** — events are now framed as one of:
+  - `run.start`  — emitted at framework entry (≤ 1 ms after invoke).
+  - `run.step`   — emitted as each LLM / tool call completes.
+  - `run.end`    — emitted when the framework entry-point exits.
+  Long-running agentic tasks (5–50 steps) paint themselves on the
+  dashboard step-by-step instead of waiting for the terminal event.
+
+### Wire format
+
+`POST /v1/sdk/events` now accepts a heterogeneous batch of the
+three envelope kinds above. The backend dispatches on `kind`:
+
+- `run.start` → upserts a `runs` row + publishes `run.logged` SSE.
+- `run.step`  → inserts the `request_logs` row, updates the parent
+                 Run's aggregates (worst-of verdict, sum tokens /
+                 cost / latency, max `step_seq + 1` as step_count),
+                 publishes `run.step.added` SSE with both the
+                 step-local fields and the latest cumulative
+                 Run aggregates.
+- `run.end`   → finalizes Run aggregates from the SDK's canonical
+                 totals + publishes `run.summarized` SSE.
+
+Legacy single-row events from pre-0.18 SDKs are transparently
+synthesised into one-step Runs so dashboards reading `/v1/runs`
+see a uniform shape regardless of SDK age.
+
+### Schema additions (`backend/alembic/versions/20260601_0000_runs_and_steps.py`)
+
+- New `runs` table partitioned by month on `started_at`. Aggregates
+  step_count, worst-of verdict + risk_level, sum tokens / cost /
+  latency, primary model, first-step prompt preview, last-model-
+  step response preview, plus `parent_run_id` for sub-agent /
+  handoff linkage.
+- New columns on `request_logs`: `run_id`, `step_seq`, `step_kind`
+  (`model_call` | `tool_call` | `sub_agent_spawn` | `policy_check`),
+  `framework`, `tool_name`. The existing column set is otherwise
+  unchanged.
+- Chunked SQL backfill (7-day windows) folds historic
+  `request_logs` rows into one-step Runs.
+
+### Dashboard
+
+- **Requests page** is now a list of Runs — one row per logical
+  agent task, with step count, primary model, aggregated tokens /
+  latency / cost, and worst-of verdict.
+- **RunTimelineModal** (click any row) shows the prompt → policy
+  → model → policy → tool → … → final waterfall as a vertical
+  timeline, paint-as-you-go via SSE.
+- **Overview → Recent runs** widget mirrors the Requests page.
+- **/v1/runs** + **/v1/runs/{run_id}** endpoints land alongside
+  the still-supported `/v1/requests` (back-compat shim for one
+  release).
+
+### Tests
+
+- 18 SDK lifecycle tests (`tests/test_run_lifecycle.py`).
+- 6 per-framework integration tests
+  (`tests/test_run_per_framework.py`) — assert exactly one Run
+  with N steps across OpenAI Agents, LangGraph, Agno, sync, async,
+  streaming, polymorphic, and nested-wrap scenarios.
+- 14 backend ingest helper unit tests
+  (`tests/routers/test_sdk_runs_ingest.py`).
+- SDK suite: 417 green.
+- Backend suite: 614 green (600 existing + 14 new).
+
+### Compatibility
+
+- 0.17.x SDK clients keep working unchanged — their single-row
+  events are synthesised into one-step Runs at ingest time.
+- `/v1/requests` keeps its old contract for at least one release.
+
+---
+
+## [0.17.6] — 2026-05-11
+
+### Fixed — Claude Agent SDK policy enforcement (gap fix)
+
+Closes the second half of the Claude Agent SDK bug reported after
+0.17.5: agents registered on the dashboard, but no audit row ever
+landed and no policy ever fired against an `async with
+ClaudeSDKClient(...)` session. The 0.17.5 patch only wrapped the
+*identity* boundary on `ClaudeSDKClient.query`; the LLM call itself
+happens inside a Node.js subprocess (`claude` CLI) that the Python
+package pipes JSON into, so `gate_call` was never invoked — there was
+no `httpx`/`requests` round-trip for our SDK to intercept.
+
+This release moves governance up to the Python-visible boundary:
+
+- **`ClaudeSDKClient.query(prompt)`** now runs the full input gate
+  (`deny_regex`, `pii_scan`, `semantic_guard`, …) on the prompt
+  BEFORE the JSON is shipped to the subprocess. Blocks raise
+  `PermissionError` and the raw prompt never leaves the Python
+  process. Sanitize verdicts mutate the forwarded prompt to the
+  masked copy — security-and-compliance.mdc §1 (raw PII never
+  leaves the SDK boundary) is honoured even though the LLM call
+  lives in another process.
+- **`ClaudeSDKClient.receive_messages()`** accumulates the streamed
+  `AssistantMessage` (text + `ToolUseBlock`) and `ResultMessage`
+  per turn, runs output policies (`deny_tool_call`,
+  `deny_mcp_call`, `deny_output_regex`) on the accumulated
+  signals, stamps the audit event with tokens / cost / latency,
+  and enqueues it for the dashboard. Output-side blocks raise
+  before yielding the `ResultMessage` so iterating loops
+  terminate at the violation.
+- **`ClaudeSDKClient.__aexit__`** flushes any in-flight event when
+  the client context closes without iterating — incomplete turns
+  surface as `error="never_consumed"` in the audit log rather
+  than silently dropping.
+- **Module-level `claude_agent_sdk.query(...)`** (the
+  single-call async generator API) runs the same Phase 1 → forward
+  → Phase 2 pipeline inline.
+
+MCP tools (`mcp__<server>__<tool>` namespacing) are recognised in
+the output gate as `mcp_targets` so `deny_mcp_call` rules match on
+the server portion. Note: tool execution happens *inside* the Node.js
+subprocess before Python sees the `ToolUseBlock`, so blocks are
+detect-and-stop rather than pre-execution; pre-execution gating
+would require forking the MCP transport.
+
+### Tests
+
+- **`tests/test_claude_agent_sdk_governance.py`** — 14 new tests
+  covering audit emission, input policies (block / sanitize /
+  allow), output policies (tool call, MCP target, assistant text),
+  multi-turn audit hygiene, the `never_consumed` flush, and the
+  signature-parity regression check from 0.17.5.
+
+The Claude Agent SDK stays import-guarded and fail-open. Every other
+framework patch is unchanged.
+
+---
+
 ## [0.17.5] — 2026-05-11
 
 ### Fixed — framework patch correctness audit
