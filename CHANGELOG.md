@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.17.2] — 2026-05-11
+
+### Fixed
+
+- Re-publish of 0.17.0. The original ``v0.17.0`` tag fired against
+  a stale commit on the public mirror before the Agent Identity v1
+  changes had been rsynced over, so PyPI received an older wheel
+  under the ``0.17.0`` name. ``0.17.1`` was skipped because that
+  version number was burned during the recovery attempt. The
+  ``0.17.2`` wheel contains every bit of the intended Agent
+  Identity v1 release (see the ``[0.17.0]`` entry below for the
+  full feature list); no other source changes versus that entry.
+
+---
+
 ## [0.17.0] — 2026-05-11
 
 ### Added — Agent Identity v1
