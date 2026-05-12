@@ -114,7 +114,7 @@ def wrap_sync_entrypoint(
         with identity_scope(record):
             return orig(self_or_first, *args, **kwargs)
 
-    setattr(wrapped, "__egisai_wrapped__", True)
+    wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]
     return wrapped
 
 
@@ -138,7 +138,7 @@ def wrap_async_entrypoint(
         with identity_scope(record):
             return await orig(self_or_first, *args, **kwargs)
 
-    setattr(wrapped, "__egisai_wrapped__", True)
+    wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]
     return wrapped
 
 
@@ -181,7 +181,7 @@ def wrap_async_iter_entrypoint(
                     break
                 yield item
 
-    setattr(wrapped, "__egisai_wrapped__", True)
+    wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]
     return wrapped
 
 
@@ -203,7 +203,7 @@ def wrap_sync_iter_entrypoint(
         with identity_scope(record):
             yield from orig(self_or_first, *args, **kwargs)
 
-    setattr(wrapped, "__egisai_wrapped__", True)
+    wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]
     return wrapped
 
 

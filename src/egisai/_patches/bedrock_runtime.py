@@ -122,7 +122,7 @@ def _wrap_converse(orig: Any) -> Any:
         model_id = str(kwargs.get("modelId") or "unknown")
         return _make_call(orig, model_id, kwargs)
 
-    setattr(wrapped, "__egisai_wrapped__", True)
+    wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]
     return wrapped
 
 
@@ -133,7 +133,7 @@ def _wrap_converse_stream(orig: Any) -> Any:
         model_id = str(kwargs.get("modelId") or "unknown")
         return _make_call(orig, model_id, dict(kwargs, _bedrock_stream=True))
 
-    setattr(wrapped, "__egisai_wrapped__", True)
+    wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]
     return wrapped
 
 
@@ -178,6 +178,6 @@ def apply() -> bool:
             patch_client_instance(client)
         return client
 
-    setattr(wrapped_client, "__egisai_wrapped__", True)
+    wrapped_client.__egisai_wrapped__ = True  # type: ignore[attr-defined]
     boto3.client = wrapped_client  # type: ignore[assignment]
     return True

@@ -28,7 +28,6 @@ import pytest
 
 from egisai._auto_agent import current_identity
 
-
 # ── Helpers ─────────────────────────────────────────────────────────
 
 

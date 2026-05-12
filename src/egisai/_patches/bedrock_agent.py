@@ -109,7 +109,7 @@ def _wrap_invoke_agent(orig: Any) -> Any:
         with identity_scope(record):
             return orig(**kwargs)
 
-    setattr(wrapped, "__egisai_wrapped__", True)
+    wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]
     return wrapped
 
 
@@ -146,7 +146,7 @@ def apply() -> bool:
             patch_client_instance(client)
         return client
 
-    setattr(wrapped_client, "__egisai_wrapped__", True)
-    setattr(wrapped_client, "__egisai_bedrock_agent_wrapped__", True)
+    wrapped_client.__egisai_wrapped__ = True  # type: ignore[attr-defined]
+    wrapped_client.__egisai_bedrock_agent_wrapped__ = True  # type: ignore[attr-defined]
     boto3.client = wrapped_client  # type: ignore[assignment]
     return True

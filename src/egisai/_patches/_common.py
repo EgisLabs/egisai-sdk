@@ -21,8 +21,6 @@ from typing import Any
 
 from egisai._auto_agent import (
     current_identity,
-    derive_identity,
-    resolve_agent_id,
     resolve_identity,
 )
 from egisai._config import get_config

@@ -28,10 +28,7 @@ import asyncio
 import sys
 import threading
 import types
-from collections.abc import Iterator
 from typing import Any
-
-import pytest
 
 from egisai._auto_agent import (
     IdentityRecord,
