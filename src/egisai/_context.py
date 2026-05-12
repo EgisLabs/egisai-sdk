@@ -13,6 +13,8 @@ import contextvars
 import logging
 import threading
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 LOGGER = logging.getLogger("egisai.context")
@@ -53,15 +55,25 @@ _policy_usage: contextvars.ContextVar[tuple[int, int]] = contextvars.ContextVar(
     "egisai_policy_usage", default=(0, 0)
 )
 
+# Compat alias — the unified cache lives in ``_auto_agent`` now. Tests
+# in ``conftest.py`` clear ``_agent_id_cache`` explicitly so we keep
+# the symbol bound to the new shared dict to preserve their semantics.
 _agent_id_cache: dict[str, str] = {}
 _agent_cache_lock = threading.Lock()
 
 
 def _resolve_agent_id(name: str) -> str | None:
-    """Get-or-fetch the platform agent_id for a role name.
+    """Get-or-fetch the platform agent_id for an explicit role name.
 
-    Returns ``None`` on failure or when the SDK isn't initialised
-    yet; events are still logged, just without ``agent_id``.
+    Delegates to the unified resolver in ``_auto_agent`` so explicit
+    ``set_context(agent="X")`` calls and auto-detected agents share
+    one cache. The old per-name dict (``_agent_id_cache``) is still
+    here as an in-process fast path *and* mirrors the unified cache
+    so legacy tests that wipe it between cases see fresh state.
+
+    Returns ``None`` on failure or when the SDK isn't initialised yet;
+    the call proceeds and the event is attributed to the API-key-bound
+    agent (if any) per fail-open philosophy.
     """
     cached = _agent_id_cache.get(name)
     if cached:
@@ -72,9 +84,8 @@ def _resolve_agent_id(name: str) -> str | None:
         if cached:
             return cached
         try:
-            from egisai._backend import ensure_agent
+            from egisai._auto_agent import _ensure_agent_id, _hash_bundle
             from egisai._config import get_config_optional
-            from egisai._runtime import collect_runtime_fingerprint
 
             cfg = get_config_optional()
             if cfg is None:
@@ -85,26 +96,15 @@ def _resolve_agent_id(name: str) -> str | None:
                     name,
                 )
                 return None
-            runtime = collect_runtime_fingerprint(sdk_version=cfg.sdk_version)
-            payload = ensure_agent(name=name, runtime=runtime)
-            agent_id = payload.get("id")
-            if isinstance(agent_id, str) and agent_id:
+            agent_id = _ensure_agent_id(
+                display_name=name,
+                identity_key=f"explicit:{name}",
+                identity_hash=_hash_bundle(("explicit", name)),
+                source="explicit",
+            )
+            if agent_id is not None:
                 _agent_id_cache[name] = agent_id
-                created = bool(payload.get("created"))
-                if created:
-                    LOGGER.info(
-                        "[egisai] registered sub-agent %r (id=%s…) — "
-                        "visible on dashboard now",
-                        name,
-                        agent_id[:8],
-                    )
-                else:
-                    LOGGER.debug(
-                        "[egisai] resolved sub-agent %r (id=%s…)",
-                        name,
-                        agent_id[:8],
-                    )
-                return agent_id
+            return agent_id
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning(
                 "[egisai] could not register sub-agent %r: %s — events "
@@ -163,6 +163,64 @@ def set_context(
 
 def get_context() -> EgisaiContext:
     return _ctx.get()
+
+
+@contextmanager
+def agent(name: str) -> Iterator[str]:
+    """Pin an explicit agent identity for the duration of the block.
+
+    The block's identity wins outright over every auto-detection tier
+    (OTEL spans, framework patches, system-prompt hashing, …). Use
+    when you have a long-lived agent role that the SDK can't infer
+    from the call payload — typically because you're using a framework
+    we haven't shipped a patch for, or because your prompt is
+    generated dynamically and you want one stable label::
+
+        with egisai.agent("Triage"):
+            client.chat.completions.create(...)
+
+    Re-entrant: nested ``with`` blocks form an identity stack and the
+    innermost one wins per call. The pushed identity is also visible
+    to ``_auto_agent.current_identity()`` so framework patches inside
+    the block inherit it instead of re-deriving.
+    """
+    # Resolve the backend agent_id first so policy attribution inside
+    # the block knows the id. Failures are swallowed (fail-open) and
+    # the block still pins the display name.
+    from egisai._auto_agent import (
+        IdentityRecord,
+        _hash_bundle,
+        push_identity,
+        reset_identity,
+    )
+
+    resolved_id = _resolve_agent_id(name)
+    record = IdentityRecord(
+        agent_id=resolved_id,
+        display_name=name,
+        identity_key=f"explicit:{name}",
+        identity_hash=_hash_bundle(("explicit", name)),
+        source="explicit",
+        push_to_stack=True,
+    )
+    token = push_identity(record)
+    try:
+        yield resolved_id or ""
+    finally:
+        reset_identity(token)
+
+
+def register_agent(name: str) -> str | None:
+    """Eagerly register an agent and return its platform agent_id.
+
+    Equivalent to ``set_context(agent=…)`` without mutating the
+    current ``EgisaiContext``. Useful when an operator wants to
+    pre-create the dashboard row at startup (so it appears under
+    Agents the moment the app boots, before any traffic flows).
+    Returns ``None`` if the SDK isn't initialised or the backend
+    is unreachable — never raises.
+    """
+    return _resolve_agent_id(name)
 
 
 def ensure_trace_id() -> str:

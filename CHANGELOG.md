@@ -7,6 +7,129 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.17.0] — 2026-05-11
+
+### Added — Agent Identity v1
+
+A full rewrite of how the SDK identifies which agent is making a call.
+Pre-0.17 the SDK leaned almost entirely on a regex-style hash of the
+system prompt; that broke for any flow where users named their agents
+explicitly (we'd shadow their name with `agent-0e431168`) or where two
+agents shared a system prompt but differed in tools / permissions.
+Identity v1 introduces a 7-tier ladder so every flow — chat-style raw
+LLM calls *and* agent-framework runs — is attributed correctly, with
+the same agent never double-counted across processes or async tasks.
+
+The 7 tiers, in priority order:
+
+| Tier | Source                                       | Stable across calls? |
+|------|----------------------------------------------|----------------------|
+| 0    | Explicit `set_context` / `egisai.agent()`    | yes — user-supplied  |
+| 0.5  | OpenTelemetry `gen_ai.agent.{id,name}` span attrs | yes — span-scoped |
+| 1    | Server-issued stable id (OpenAI Responses API `prompt_id`, Gemini `cached_content`, Bedrock `invoke_agent` `agentId`) | yes — server-issued |
+| 2A   | Framework patch reading explicit `agent.name` (OpenAI Agents SDK, Google ADK, AutoGen, Agno, Strands, CrewAI, smolagents, LangGraph) | yes |
+| 2B   | Framework patch fingerprinting a composite bundle (Claude Agent SDK, LlamaIndex, PydanticAI, legacy LangChain `AgentExecutor`) | yes |
+| 3    | Stack-frame hint (`__egisai_agent__`, `agent_name` locals) — opt-in via `auto_stack_hints` | per-call |
+| 4    | Class-name introspection (`self.__class__.__name__` ending in `Agent` / `Bot` / `Worker` / `Specialist` / `Assistant`) | per-call |
+| 5    | System-prompt SHA-256 + spaCy NER name (NER-first, hash fallback) | yes within process |
+| 6    | Init-time `app=` fallback                    | yes within process |
+
+New public surfaces:
+
+- **`egisai.agent("Triage")`** — context manager that pins an explicit
+  identity onto the resolver stack for the duration of the `with`
+  block. Inner LLM calls auto-inherit. Replaces every place where
+  users were tempted to call `set_context(agent=…)` per call.
+- **`egisai.register_agent("Triage")`** — eager one-shot registration
+  for code paths that want the agent row created up-front (e.g. before
+  the first call ever fires). Returns the agent_id or `None` on
+  failure (fail-open).
+- **`auto_stack_hints="strict" | "loose" (default) | "off"`** — new
+  init kwarg controlling Tier 3 stack-frame inspection. `"strict"`
+  only respects the explicit `__egisai_agent__` marker; `"loose"`
+  also picks up natural `agent_name` / `agent` locals; `"off"`
+  disables Tier 3 entirely for security-sensitive deployments that
+  don't want any stack walking.
+
+New framework patches (auto-installed on `egisai.init()` when the
+framework is importable; silent no-op otherwise):
+
+- `openai_agents.py` — OpenAI Agents SDK
+- `claude_agent_sdk.py` — Anthropic Claude Agent SDK
+- `langgraph.py` — LangGraph (Pregel.invoke)
+- `bedrock_runtime.py` — AWS Bedrock Converse API
+- `bedrock_agent.py` — AWS Bedrock InvokeAgent (server-issued agentId)
+- `google_adk.py` — Google Agent Development Kit
+- `autogen.py` — Microsoft AutoGen
+- `crewai.py` — CrewAI
+- `agno.py` — Agno (formerly Phidata)
+- `strands.py` — AWS Strands Agents
+- `smolagents.py` — HuggingFace smolagents
+- `langchain.py` — LangChain legacy `AgentExecutor`
+- `llamaindex.py` — LlamaIndex `FunctionAgent`
+- `pydantic_ai.py` — PydanticAI
+
+Each framework patch wraps the framework's documented entry point,
+derives identity using either explicit name (Tier 2A) or a composite
+SHA-256 bundle hash (Tier 2B), and pushes the resolved identity onto
+a `ContextVar` stack. Inner LLM calls during that invocation read the
+parent's identity instead of re-deriving from a (possibly empty)
+inner-call system prompt. Idempotent: calling `apply()` twice never
+double-wraps.
+
+Backend changes (additive, no breaking schema changes):
+
+- **`agents.identity_hash` `VARCHAR(64) NULL`** — SHA-256 hex of the
+  identity bundle the SDK chose. Used as the primary dedup key by
+  `POST /v1/sdk/agents/ensure`. Nullable so legacy SDKs (< 0.17)
+  keep working unchanged.
+- **`agents.identity_source` `VARCHAR(32) NULL`** — controlled-vocab
+  detection-tier token surfaced in the dashboard's Provenance card.
+- **`agents.name_normalized`** — Postgres `GENERATED ALWAYS AS
+  (lower(btrim(name))) STORED` column with a unique index. Stops the
+  "I created the same agent twice with different cases" failure.
+- **Partial unique index** `(org_id, identity_hash) WHERE
+  identity_hash IS NOT NULL` — the canonical dedup contract for new
+  rows.
+- **`POST /v1/sdk/agents/ensure`** now accepts `identity_hash` +
+  `identity_source` in the payload, prefers them for lookup, and
+  backfills existing rows when a legacy agent gets re-identified
+  under the new scheme.
+
+Frontend:
+
+- `Agent` / `AgentIdentity` types extended with `identity_source` and
+  `identity_hash_prefix` (full hash never crosses the API boundary).
+- Agent Identity modal's Identity section now renders a Provenance
+  row that maps each `identity_source` token to a plain-English
+  explanation an operator (or SOC 2 reviewer) can act on.
+
+Stress / coverage:
+
+- 360 SDK tests pass, including 12 new stress tests (concurrent
+  threads, async tasks, nested scopes, async generators, idempotent
+  `apply()`, fail-open under garbage payloads) and 24 mock-based
+  per-framework patch tests.
+- 600 backend tests pass, including new schema + repository tests
+  pinning `identity_hash` / `identity_source` round-trip and the
+  prefix-derivation contract on `AgentIdentityOut`.
+
+### Fixed
+
+- **Policy attribution gap closed.** Pre-0.17, scoped policy rules
+  (`target_agents=[…]`) only matched when the user had explicitly
+  called `set_context(agent=…)`. The resolver now runs *before*
+  policy evaluation inside `gate_call` / `async_gate_call`, so any
+  auto-detected identity is visible to scoped rules without user
+  intervention. Existing `set_context` callers see no behaviour
+  change (Tier 0 still wins).
+- **HTTP fallback attribution.** The `httpx` / `requests` model-host
+  fallback now also runs identity resolution against the request
+  body before enqueueing the audit event — previously those events
+  inherited only the init-time `agent_id`.
+
+---
+
 ## [0.16.0] — 2026-05-10
 
 ### Changed

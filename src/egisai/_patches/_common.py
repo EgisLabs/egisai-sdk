@@ -19,7 +19,12 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from egisai._auto_agent import derive_identity, resolve_agent_id
+from egisai._auto_agent import (
+    current_identity,
+    derive_identity,
+    resolve_agent_id,
+    resolve_identity,
+)
 from egisai._config import get_config
 from egisai._context import (
     ensure_trace_id,
@@ -199,36 +204,48 @@ def _apply_sanitization(
 def _attribute_event(ev: dict, payload: Any) -> None:
     """Attribute the event to the right agent identity.
 
-    Resolution order (first match wins):
+    Reads from the resolver's pushed identity first (set by
+    ``gate_call`` BEFORE this runs, so the ContextVar identity stack
+    typically carries whichever tier resolved). If nothing is pushed
+    yet — direct ``_attribute_event`` callers from older tests, or
+    callers that bypass ``gate_call`` — runs the full 7-tier
+    resolver inline as a fallback so behaviour stays consistent.
 
-    1. ``set_context(agent="…")`` (already on ``ctx.agent_id``).
-    2. System-prompt fingerprint — auto-register a sub-agent.
-    3. Lazy registration of the init-time ``app`` name.
+    See ``egisai._auto_agent.resolve_identity`` for the full tier
+    table.
     """
     ctx = get_context()
-    if ctx.agent_id:
+    record = current_identity()
+    if record is not None and record.agent_id:
+        ev["agent_id"] = record.agent_id
+        ev["app"] = record.display_name
         return
 
-    messages = payload.get("messages") if isinstance(payload, dict) else None
-    identity = derive_identity(payload, messages)
-    if identity is not None:
-        identity_hash, display_name = identity
-        agent_id = resolve_agent_id(identity_hash, display_name)
-        if agent_id:
-            ev["agent_id"] = agent_id
-            ev["app"] = display_name
+    # No pre-pushed identity — fall through to the resolver. This
+    # path is hit by direct callers (legacy tests) and any patch
+    # that doesn't wrap its forward via ``gate_call``.
+    from egisai._config import get_config_optional
+
+    cfg_opt = get_config_optional()
+    hints = (
+        getattr(cfg_opt, "auto_stack_hints", "loose")
+        if cfg_opt is not None
+        else "loose"
+    )
+    resolved = resolve_identity(payload, auto_stack_hints=hints)
+    if resolved is not None and resolved.agent_id:
+        ev["agent_id"] = resolved.agent_id
+        ev["app"] = resolved.display_name
+        return
+
+    if ctx.agent_id:
+        # set_context(agent_id=…) escape hatch — explicit UUID on the
+        # context with no display name. Keep the legacy behaviour.
         return
 
     cfg = get_config()
     if cfg.agent_id:
         return
-    if not cfg.app:
-        return
-    synthetic_hash = "__app__:" + cfg.app
-    agent_id = resolve_agent_id(synthetic_hash, cfg.app)
-    if agent_id:
-        ev["agent_id"] = agent_id
-        ev["app"] = cfg.app
 
 
 # Output-side signal extractor: ``(response, request_payload) → (text,
@@ -390,6 +407,35 @@ def _stamp_output_block(
     ev["response_decision"] = _decision_block(decision)
 
 
+def _resolve_and_scope_identity(payload: Any) -> Any:
+    """Resolve the agent identity and (if non-stack) push it.
+
+    Returns a context manager that pops the identity on exit. When
+    the resolver already found a pre-pushed identity (parent framework
+    patch is in scope), or the resolved tier doesn't push (stack /
+    class / hash / app — those are per-call only), we return a
+    no-op context.
+
+    Called BEFORE the policy phase so:
+      * ``_active_agent_id`` reads the right identity inside scoped
+        rules (closes the policy-attribution gap that existed pre-0.17).
+      * Inner nested ``gate_call``s in the same task see the same
+        identity instead of re-deriving from their own (often empty)
+        payload.
+    """
+    from contextlib import nullcontext
+
+    from egisai._auto_agent import identity_scope as _scope
+    from egisai._config import get_config_optional
+
+    cfg = get_config_optional()
+    hints = getattr(cfg, "auto_stack_hints", "loose") if cfg else "loose"
+    record = resolve_identity(payload, auto_stack_hints=hints)
+    if record is None or not record.push_to_stack:
+        return nullcontext(record)
+    return _scope(record)
+
+
 def gate_call(
     *,
     source: str,
@@ -414,6 +460,10 @@ def gate_call(
     ``deny_output_regex``, output-side ``semantic_guard``) run
     against the response when ``extract_output_signals`` is
     provided.
+
+    Identity resolution runs FIRST (before policy) so scoped policy
+    rules can match on the auto-detected agent — pre-0.17 only
+    ``set_context(agent=…)`` callers benefited from scoped rules.
     """
     prev_source = get_source()
     prev_checked = get_policy_checked()
@@ -426,76 +476,112 @@ def gate_call(
         if prev_checked:
             return forward()
 
-        ev = _build_input_event(
-            source=source,
-            target=target,
-            model=model,
-            prompt_text=prompt_text,
-            stream=stream,
-            payload=payload,
-        )
-
-        set_policy_checked(True)
-        reset_policy_usage()
-        try:
-            decision = _run_input_phase(
+        with _resolve_and_scope_identity(payload):
+            return _gate_call_inner(
                 source=source,
                 target=target,
                 model=model,
                 prompt_text=prompt_text,
                 stream=stream,
-                ev=ev,
-            )
-
-            if decision.verdict == "block":
-                ev["latency_ms"] = 0
-                return _block_response(
-                    decision=decision,
-                    ev=ev,
-                    model=model,
-                    stub_factory=stub_factory,
-                )
-
-            if decision.verdict == "sanitize":
-                _apply_sanitization(decision=decision, payload=payload, ev=ev)
-
-            model_started = time.monotonic()
-            try:
-                response = forward()
-            except BaseException:
-                ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
-                ev["error"] = "call failed"
-                enqueue(ev)
-                raise
-            ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
-            _stamp_usage(ev, response, extract_usage)
-
-            output_decision = _run_output_phase(
-                response=response,
                 payload=payload,
-                source=source,
-                target=target,
-                model=model,
-                stream=stream,
+                stub_factory=stub_factory,
+                extract_usage=extract_usage,
                 extract_output_signals=extract_output_signals,
+                forward=forward,
             )
-            if output_decision is not None and output_decision.verdict == "block":
-                _stamp_output_block(ev, output_decision)
-                return _block_response(
-                    decision=output_decision,
-                    ev=ev,
-                    model=model,
-                    stub_factory=stub_factory,
-                )
-            if output_decision is not None:
-                ev["response_decision"] = _decision_block(output_decision)
-
-            enqueue(ev)
-            return response
-        finally:
-            set_policy_checked(prev_checked)
     finally:
         set_source(prev_source)
+
+
+def _gate_call_inner(
+    *,
+    source: str,
+    target: str,
+    model: str,
+    prompt_text: str,
+    stream: bool,
+    payload: Any,
+    stub_factory: Callable[[PolicyDecision, str, str], Any] | None,
+    extract_usage: ExtractUsage | None,
+    extract_output_signals: ExtractOutputSignals | None,
+    forward: Callable[[], Any],
+) -> Any:
+    """Body of ``gate_call`` after identity has been resolved + pushed.
+
+    We only reach this helper when ``prev_checked`` was False on the
+    outer ``gate_call``; the outer's `prev_source` is reset by *its*
+    try/finally so we don't manage it here.
+    """
+    ev = _build_input_event(
+        source=source,
+        target=target,
+        model=model,
+        prompt_text=prompt_text,
+        stream=stream,
+        payload=payload,
+    )
+
+    set_policy_checked(True)
+    reset_policy_usage()
+    try:
+        decision = _run_input_phase(
+            source=source,
+            target=target,
+            model=model,
+            prompt_text=prompt_text,
+            stream=stream,
+            ev=ev,
+        )
+
+        if decision.verdict == "block":
+            ev["latency_ms"] = 0
+            return _block_response(
+                decision=decision,
+                ev=ev,
+                model=model,
+                stub_factory=stub_factory,
+            )
+
+        if decision.verdict == "sanitize":
+            _apply_sanitization(decision=decision, payload=payload, ev=ev)
+
+        model_started = time.monotonic()
+        try:
+            response = forward()
+        except BaseException:
+            ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
+            ev["error"] = "call failed"
+            enqueue(ev)
+            raise
+        ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
+        _stamp_usage(ev, response, extract_usage)
+
+        output_decision = _run_output_phase(
+            response=response,
+            payload=payload,
+            source=source,
+            target=target,
+            model=model,
+            stream=stream,
+            extract_output_signals=extract_output_signals,
+        )
+        if output_decision is not None and output_decision.verdict == "block":
+            _stamp_output_block(ev, output_decision)
+            return _block_response(
+                decision=output_decision,
+                ev=ev,
+                model=model,
+                stub_factory=stub_factory,
+            )
+        if output_decision is not None:
+            ev["response_decision"] = _decision_block(output_decision)
+
+        enqueue(ev)
+        return response
+    finally:
+        # Outer `gate_call` guaranteed prev_checked was False
+        # (we returned early otherwise), so reset to False here.
+        set_policy_checked(False)
 
 
 async def async_gate_call(
@@ -523,73 +609,104 @@ async def async_gate_call(
         if prev_checked:
             return await forward()
 
-        ev = _build_input_event(
-            source=source,
-            target=target,
-            model=model,
-            prompt_text=prompt_text,
-            stream=stream,
-            payload=payload,
-        )
-
-        set_policy_checked(True)
-        reset_policy_usage()
-        try:
-            decision = _run_input_phase(
+        with _resolve_and_scope_identity(payload):
+            return await _async_gate_call_inner(
                 source=source,
                 target=target,
                 model=model,
                 prompt_text=prompt_text,
                 stream=stream,
-                ev=ev,
-            )
-
-            if decision.verdict == "block":
-                ev["latency_ms"] = 0
-                return _block_response(
-                    decision=decision,
-                    ev=ev,
-                    model=model,
-                    stub_factory=stub_factory,
-                )
-
-            if decision.verdict == "sanitize":
-                _apply_sanitization(decision=decision, payload=payload, ev=ev)
-
-            model_started = time.monotonic()
-            try:
-                response = await forward()
-            except BaseException:
-                ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
-                ev["error"] = "call failed"
-                enqueue(ev)
-                raise
-            ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
-            _stamp_usage(ev, response, extract_usage)
-
-            output_decision = _run_output_phase(
-                response=response,
                 payload=payload,
-                source=source,
-                target=target,
-                model=model,
-                stream=stream,
+                stub_factory=stub_factory,
+                extract_usage=extract_usage,
                 extract_output_signals=extract_output_signals,
+                forward=forward,
             )
-            if output_decision is not None and output_decision.verdict == "block":
-                _stamp_output_block(ev, output_decision)
-                return _block_response(
-                    decision=output_decision,
-                    ev=ev,
-                    model=model,
-                    stub_factory=stub_factory,
-                )
-            if output_decision is not None:
-                ev["response_decision"] = _decision_block(output_decision)
-
-            enqueue(ev)
-            return response
-        finally:
-            set_policy_checked(prev_checked)
     finally:
         set_source(prev_source)
+
+
+async def _async_gate_call_inner(
+    *,
+    source: str,
+    target: str,
+    model: str,
+    prompt_text: str,
+    stream: bool,
+    payload: Any,
+    stub_factory: Callable[[PolicyDecision, str, str], Any] | None,
+    extract_usage: ExtractUsage | None,
+    extract_output_signals: ExtractOutputSignals | None,
+    forward: Callable[[], Any],
+) -> Any:
+    """Body of ``async_gate_call`` after identity has been resolved + pushed."""
+    ev = _build_input_event(
+        source=source,
+        target=target,
+        model=model,
+        prompt_text=prompt_text,
+        stream=stream,
+        payload=payload,
+    )
+
+    set_policy_checked(True)
+    reset_policy_usage()
+    try:
+        decision = _run_input_phase(
+            source=source,
+            target=target,
+            model=model,
+            prompt_text=prompt_text,
+            stream=stream,
+            ev=ev,
+        )
+
+        if decision.verdict == "block":
+            ev["latency_ms"] = 0
+            return _block_response(
+                decision=decision,
+                ev=ev,
+                model=model,
+                stub_factory=stub_factory,
+            )
+
+        if decision.verdict == "sanitize":
+            _apply_sanitization(decision=decision, payload=payload, ev=ev)
+
+        model_started = time.monotonic()
+        try:
+            response = await forward()
+        except BaseException:
+            ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
+            ev["error"] = "call failed"
+            enqueue(ev)
+            raise
+        ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
+        _stamp_usage(ev, response, extract_usage)
+
+        output_decision = _run_output_phase(
+            response=response,
+            payload=payload,
+            source=source,
+            target=target,
+            model=model,
+            stream=stream,
+            extract_output_signals=extract_output_signals,
+        )
+        if output_decision is not None and output_decision.verdict == "block":
+            _stamp_output_block(ev, output_decision)
+            return _block_response(
+                decision=output_decision,
+                ev=ev,
+                model=model,
+                stub_factory=stub_factory,
+            )
+        if output_decision is not None:
+            ev["response_decision"] = _decision_block(output_decision)
+
+        enqueue(ev)
+        return response
+    finally:
+        # Outer `async_gate_call` guaranteed prev_checked was
+        # False (it returned early otherwise), so reset to False.
+        set_policy_checked(False)

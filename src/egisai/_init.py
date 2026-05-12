@@ -16,11 +16,25 @@ from egisai._backend import close_client, handshake
 from egisai._config import EgisaiConfig, get_config_optional, set_config, update_config
 from egisai._logger import start_worker as start_logger
 from egisai._logger import stop_worker as stop_logger
+from egisai._patches import agno as patch_agno
 from egisai._patches import anthropic as patch_anthropic
+from egisai._patches import autogen as patch_autogen
+from egisai._patches import bedrock_agent as patch_bedrock_agent
+from egisai._patches import bedrock_runtime as patch_bedrock_runtime
+from egisai._patches import claude_agent_sdk as patch_claude_agent_sdk
+from egisai._patches import crewai as patch_crewai
 from egisai._patches import genai as patch_genai
 from egisai._patches import google as patch_google
+from egisai._patches import google_adk as patch_google_adk
 from egisai._patches import http as patch_http
+from egisai._patches import langchain as patch_langchain
+from egisai._patches import langgraph as patch_langgraph
+from egisai._patches import llamaindex as patch_llamaindex
 from egisai._patches import openai as patch_openai
+from egisai._patches import openai_agents as patch_openai_agents
+from egisai._patches import pydantic_ai as patch_pydantic_ai
+from egisai._patches import smolagents as patch_smolagents
+from egisai._patches import strands as patch_strands
 from egisai._policy_cache import refresh_now
 from egisai._redact import redact_api_key
 from egisai._refresher import start_worker as start_refresher
@@ -43,6 +57,7 @@ def init(
     refresh_interval_seconds: float = 10.0,
     enable_sse: bool = True,
     enable_http_fallback: bool = True,
+    auto_stack_hints: str = "loose",
     quiet: bool = False,
 ) -> None:
     """Activate egisai for the current process.
@@ -86,6 +101,22 @@ def init(
         polling on connection failure.
     enable_http_fallback
         Patch ``httpx`` / ``requests`` for HTTP-level audit visibility.
+    auto_stack_hints
+        Controls the Agent Identity v1 Tier 3 stack-frame inspector
+        (see ``_auto_agent._try_stack_identity``).
+
+        * ``"loose"`` (default) — when the resolver can't find an
+          identity any other way, it walks up to 12 stack frames
+          looking for ``__egisai_agent__`` / ``agent_name`` /
+          ``egisai_agent`` / string-typed ``agent`` locals.
+        * ``"strict"`` — only the explicit ``__egisai_agent__``
+          marker is recognised. Quieter — won't accidentally pick
+          up an enclosing test's ``agent_name`` variable.
+        * ``"off"`` — Tier 3 is disabled entirely; the resolver
+          skips to Tier 4 (class-name introspection).
+
+        Has no effect on explicit ``egisai.set_context`` /
+        ``with egisai.agent(...)`` calls (Tier 0) which always win.
     quiet
         Suppress the one-line "egisai active" startup log.
     """
@@ -107,6 +138,11 @@ def init(
                 f"semantic_on_outage must be 'allow' or 'block', "
                 f"got {semantic_on_outage!r}"
             )
+        if auto_stack_hints not in ("strict", "loose", "off"):
+            raise ValueError(
+                f"auto_stack_hints must be 'strict', 'loose', or 'off', "
+                f"got {auto_stack_hints!r}"
+            )
 
         cfg = EgisaiConfig(
             api_key=api_key,
@@ -121,6 +157,7 @@ def init(
             enable_sse=enable_sse,
             enable_http_fallback=enable_http_fallback,
             sdk_version=__version__,
+            auto_stack_hints=auto_stack_hints,  # type: ignore[arg-type]
         )
         set_config(cfg)
 
@@ -173,6 +210,40 @@ def init(
             enabled.append("google.genai")
         if patch_google.apply():
             enabled.append("google.generativeai")
+        # ── Framework identity patches (Agent Identity v1, 0.17.0) ──
+        # All import-guarded — silently no-op when the framework
+        # isn't installed. Patches run AFTER the raw-provider patches
+        # so an inner LLM call (governed by, e.g., the openai patch)
+        # sees the framework's pushed identity via ContextVar instead
+        # of re-deriving from the (often empty) inner system prompt.
+        if patch_openai_agents.apply():
+            enabled.append("openai-agents")
+        if patch_claude_agent_sdk.apply():
+            enabled.append("claude-agent-sdk")
+        if patch_langgraph.apply():
+            enabled.append("langgraph")
+        if patch_bedrock_runtime.apply():
+            enabled.append("bedrock-runtime")
+        if patch_bedrock_agent.apply():
+            enabled.append("bedrock-agent")
+        if patch_google_adk.apply():
+            enabled.append("google-adk")
+        if patch_autogen.apply():
+            enabled.append("autogen")
+        if patch_crewai.apply():
+            enabled.append("crewai")
+        if patch_agno.apply():
+            enabled.append("agno")
+        if patch_strands.apply():
+            enabled.append("strands")
+        if patch_smolagents.apply():
+            enabled.append("smolagents")
+        if patch_langchain.apply():
+            enabled.append("langchain")
+        if patch_llamaindex.apply():
+            enabled.append("llamaindex")
+        if patch_pydantic_ai.apply():
+            enabled.append("pydantic-ai")
         if enable_http_fallback and patch_http.apply():
             enabled.append("httpx/requests")
 

@@ -149,6 +149,8 @@ def ensure_agent(
     name: str,
     description: str | None = None,
     runtime: dict[str, Any] | None = None,
+    identity_hash: str | None = None,
+    identity_source: str | None = None,
 ) -> dict[str, Any]:
     """Find-or-create an agent in the caller's org by name. Idempotent.
 
@@ -157,12 +159,23 @@ def ensure_agent(
     The backend stamps it onto the agent's Provenance card and uses
     deltas to spot ``runtime_change`` anomalies. Sending it is
     optional; older backends ignore unknown keys.
+
+    ``identity_hash`` + ``identity_source`` (added in 0.17.0) are the
+    SDK-computed composite-fingerprint hash + provenance tag from
+    :mod:`egisai._auto_agent`. The backend dedups by
+    ``(org_id, identity_hash)`` first, then falls back to
+    ``(org_id, name_normalized)`` for legacy SDKs. Backends < 0.36
+    ignore both fields silently.
     """
     payload: dict[str, Any] = {"name": name}
     if description:
         payload["description"] = description
     if runtime:
         payload["runtime"] = runtime
+    if identity_hash:
+        payload["identity_hash"] = identity_hash
+    if identity_source:
+        payload["identity_source"] = identity_source
     # DEBUG breadcrumb so a developer staring at an empty Provenance
     # card on the dashboard can confirm "yes, the SDK actually shipped
     # the fingerprint" without reaching for tcpdump. Off by default;

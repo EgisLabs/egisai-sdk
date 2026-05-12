@@ -15,6 +15,7 @@ from egisai._context import get_policy_checked
 from egisai._events import build_event
 from egisai._logger import enqueue
 from egisai._patches import has_module
+from egisai._patches._common import _attribute_event
 
 LOGGER = logging.getLogger("egisai.patches.http")
 
@@ -52,11 +53,13 @@ def _patch_requests() -> bool:
             if get_policy_checked():
                 return orig(self, method, url, **kwargs)
             if _looks_like_model_call(str(url)):
+                payload = {"method": method, "json": kwargs.get("json")}
                 ev = build_event(
                     source="requests",
                     target=str(url),
-                    payload={"method": method, "json": kwargs.get("json")},
+                    payload=payload,
                 )
+                _attribute_event(ev, payload.get("json"))
                 ev["verdict"] = "allow"
                 ev["reason"] = "Network-layer event"
                 enqueue(ev)
@@ -87,11 +90,13 @@ def _patch_httpx() -> bool:
                 return orig(self, method, url, **kwargs)
             url_s = str(url)
             if _looks_like_model_call(url_s):
+                payload = {"method": method, "json": kwargs.get("json")}
                 ev = build_event(
                     source="httpx",
                     target=url_s,
-                    payload={"method": method, "json": kwargs.get("json")},
+                    payload=payload,
                 )
+                _attribute_event(ev, payload.get("json"))
                 ev["verdict"] = "allow"
                 ev["reason"] = "Network-layer event"
                 enqueue(ev)

@@ -33,6 +33,11 @@ def reset_sdk() -> Iterator[None]:
     _context._agent_id_cache.clear()
     _context._ctx.set(_context.EgisaiContext())
     _auto_agent._id_cache.clear()
+    # Identity v1: clear unified cache + identity stack so a test
+    # that pushed a framework identity doesn't leak it into the next
+    # test's resolver.
+    _auto_agent._identity_cache.clear()
+    _auto_agent._identity_stack.set(())
 
     # The init module also caches whether it's been called via _CONFIG; the
     # logger module's queue persists between tests, so we drain it.
