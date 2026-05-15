@@ -76,11 +76,19 @@ def test_openai_responses_stub_matches_openai_agents_unpack() -> None:
     assert response.usage.output_tokens_details.reasoning_tokens == 0
 
     # Real upstream Pydantic types must be used so downstream
-    # ``isinstance``-style Pydantic validation succeeds.
-    from openai.types.responses.response_usage import (
-        InputTokensDetails,
-        OutputTokensDetails,
-    )
+    # ``isinstance``-style Pydantic validation succeeds. Only
+    # enforce the isinstance contract when ``openai`` is
+    # importable — it's an optional extra in the SDK
+    # (``pip install egisai[openai]``) and the basic stub shape
+    # above (the duck-typed access path) is what matters in
+    # ``openai``-less environments.
+    try:
+        from openai.types.responses.response_usage import (
+            InputTokensDetails,
+            OutputTokensDetails,
+        )
+    except ImportError:
+        return
 
     assert isinstance(response.usage.input_tokens_details, InputTokensDetails)
     assert isinstance(response.usage.output_tokens_details, OutputTokensDetails)
@@ -148,8 +156,15 @@ def test_openai_responses_stub_walks_output_list_shape() -> None:
     assert content.type == "output_text"
     assert isinstance(content.text, str) and content.text
 
-    from openai.types.responses.response_output_message import ResponseOutputMessage
-    from openai.types.responses.response_output_text import ResponseOutputText
+    # Same rationale as the usage-unpack test above: only enforce
+    # the isinstance contract when ``openai`` is importable. The
+    # duck-typed access path above already covers the
+    # ``openai``-less environment.
+    try:
+        from openai.types.responses.response_output_message import ResponseOutputMessage
+        from openai.types.responses.response_output_text import ResponseOutputText
+    except ImportError:
+        return
 
     assert isinstance(item, ResponseOutputMessage)
     assert isinstance(content, ResponseOutputText)
@@ -280,7 +295,20 @@ def test_openai_chat_completion_stub_is_model_dump_capable() -> None:
     real upstream ``ChatCompletion`` Pydantic instance. This test
     pins the contract so any future refactor of the stub keeps
     autogen working.
+
+    The contract only applies in environments where the optional
+    ``openai`` extra is installed — in ``openai``-less envs the
+    stub gracefully falls back to a ``SimpleNamespace`` (no
+    autogen / langchain-openai patches are active anyway because
+    they all depend on ``openai`` themselves).
     """
+    import pytest
+
+    pytest.importorskip(
+        "openai",
+        reason=".model_dump() contract requires the optional ``openai`` extra",
+    )
+
     response = _stub_chat_completion(_decision(), trace_id="t" * 16, model="gpt-5")
 
     assert hasattr(response, "model_dump"), (
@@ -324,7 +352,20 @@ def test_openai_chat_completion_stub_matches_autogen_unpack() -> None:
     OpenAI client and converting it into its internal
     ``CreateResult``. Any future stub regression that breaks one
     of these accessors fails this single test instead of
-    surfacing in a customer's autogen agent loop."""
+    surfacing in a customer's autogen agent loop.
+
+    Requires the optional ``openai`` extra — without it the stub
+    falls back to a ``SimpleNamespace`` that has no
+    ``model_dump()``. autogen itself depends on ``openai`` so
+    skipping here is correct: autogen is not in the install set
+    when ``openai`` is absent."""
+    import pytest
+
+    pytest.importorskip(
+        "openai",
+        reason="autogen-style unpack requires the optional ``openai`` extra",
+    )
+
     response = _stub_chat_completion(_decision(), trace_id="t" * 16, model="gpt-5")
 
     prompt_tokens = (
