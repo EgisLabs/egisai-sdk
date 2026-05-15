@@ -150,18 +150,21 @@ def _wrap_converse_stream(orig: Any) -> Any:
     return wrapped
 
 
-_PATCHED_CLIENT_IDS: set[int] = set()
-
-
 def patch_client_instance(client: Any) -> None:
     """Patch a single boto3 ``bedrock-runtime`` client in-place.
 
-    Called by the ``boto3.client`` factory wrapper below. Idempotent
-    per-instance — we track patched object ids so the same client
-    isn't double-wrapped on accidental re-patches.
+    Called by the ``boto3.client`` factory wrapper below. Idempotency
+    is provided by the ``__egisai_wrapped__`` sentinel set on the
+    wrapper function: if a client's ``converse`` already carries that
+    attribute we skip re-wrapping it. A previous version of this
+    helper also tracked patched objects in a module-level
+    ``set[int]`` keyed by ``id(client)``, but CPython recycles
+    object ids the moment an instance is GC'd; under pytest, the
+    next test's freshly-allocated client could land on a recycled
+    id, the set would think it was already patched, and the gate
+    would be silently bypassed. The sentinel-attribute path is
+    sufficient AND immune to id reuse, so the set is gone.
     """
-    if id(client) in _PATCHED_CLIENT_IDS:
-        return
     if hasattr(client, "converse") and not getattr(
         client.converse, "__egisai_wrapped__", False
     ):
@@ -170,7 +173,6 @@ def patch_client_instance(client: Any) -> None:
         client.converse_stream, "__egisai_wrapped__", False
     ):
         client.converse_stream = _wrap_converse_stream(client.converse_stream)
-    _PATCHED_CLIENT_IDS.add(id(client))
 
 
 def apply() -> bool:

@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.25.15] — 2026-05-15
+
+### Fixed
+
+- **Bedrock Converse + Bedrock Agent: drop the stale-id tracker
+  that caused a silent gate bypass on the second-and-later
+  client in a process.** Both
+  `egisai/_patches/bedrock_runtime.py` and
+  `egisai/_patches/bedrock_agent.py` kept a module-level
+  `_PATCHED_CLIENT_IDS: set[int]` and used `id(client) in
+  _PATCHED_CLIENT_IDS` as a fast-path "already patched" check
+  inside `patch_client_instance`. The intent was idempotency,
+  but `id()` in CPython is just the object's address — addresses
+  are aggressively recycled the moment the previous occupant is
+  garbage-collected. In long-lived processes that constructed
+  multiple `boto3.client("bedrock-runtime")` /
+  `("bedrock-agent-runtime")` instances over time (the public
+  mirror's CI pytest run is the canonical reproduction:
+  back-to-back `bedrock_smoke` and `bedrock_converse_with_tool`
+  fixtures freshly allocate a `_BedrockClient` whose `id()`
+  often lands on the slot the previous test's instance just
+  vacated), the second call would short-circuit the wrap. The
+  client's `converse` / `converse_stream` / `invoke_agent`
+  method would then resolve to the underlying raw method,
+  `gate_call` would never run, and policies wouldn't fire —
+  blocked tool calls silently succeeded, PII calls didn't
+  raise `PermissionError`, and no audit event with `verdict =
+  allow|block` was emitted. The fix is to delete the
+  `_PATCHED_CLIENT_IDS` set entirely and rely on the
+  `__egisai_wrapped__` sentinel attribute that the wrapper
+  functions already carry: it's an attribute on the bound
+  method, not on the client object, so it's immune to id reuse
+  and gives the same "don't double-wrap" guarantee that the
+  set was meant to provide. The five flaky tests in
+  `tests/test_smoke_provider_battery.py::test_bedrock_converse_*`
+  and `tests/test_before_after_each_llm_and_tool.py::test_bedrock_converse_deny_tool_call_refuses_BEFORE_tool_dispatch`
+  now pass reliably across every Python / OS matrix cell, not
+  just the one that happened to allocate fresh memory for the
+  first client in each fixture.
+
+---
+
 ## [0.25.14] — 2026-05-15
 
 ### Fixed

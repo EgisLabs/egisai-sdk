@@ -220,17 +220,21 @@ def _wrap_invoke_agent(orig: Any) -> Any:
     return wrapped
 
 
-_PATCHED_CLIENT_IDS: set[int] = set()
-
-
 def patch_client_instance(client: Any) -> None:
-    if id(client) in _PATCHED_CLIENT_IDS:
-        return
+    """Patch a single boto3 ``bedrock-agent-runtime`` client in-place.
+
+    Idempotency is keyed off the ``__egisai_wrapped__`` sentinel set
+    on the wrapped ``invoke_agent`` function. We deliberately do
+    NOT track ``id(client)`` in a module-level set — CPython
+    recycles object ids the moment a previous client is GC'd, and
+    a fresh client landing on a recycled id would be skipped by
+    such a tracker, silently bypassing the gate. The sentinel-attr
+    path is correct AND immune to id reuse.
+    """
     if hasattr(client, "invoke_agent") and not getattr(
         client.invoke_agent, "__egisai_wrapped__", False
     ):
         client.invoke_agent = _wrap_invoke_agent(client.invoke_agent)
-    _PATCHED_CLIENT_IDS.add(id(client))
 
 
 def apply() -> bool:

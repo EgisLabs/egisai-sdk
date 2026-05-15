@@ -148,9 +148,13 @@ def bedrock_agent_smoke(
     assert patch.apply() is True
     yield fake_backend, Client, captured
     sys.modules.pop("boto3", None)
-    # bedrock_agent caches patched client ids for idempotency; clear
-    # the set so the next test's fresh boto3 patches afresh.
-    patch._PATCHED_CLIENT_IDS.clear()
+    # The patch keeps an internal name-cache; reset so the next test
+    # gets a clean slate. Note: 0.25.15 removed the
+    # ``_PATCHED_CLIENT_IDS`` set that this teardown used to clear —
+    # CPython's id() reuse made it a stale-state bug rather than an
+    # idempotency aid. The ``__egisai_wrapped__`` sentinel attribute
+    # on the wrapped method covers the same intent without
+    # process-wide bookkeeping.
     patch._NAME_CACHE.clear()
 
 
