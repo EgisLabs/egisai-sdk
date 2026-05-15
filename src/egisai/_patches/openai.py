@@ -550,8 +550,8 @@ def _build_chat_chunk(
     ``openai`` pin.
     """
     try:  # pragma: no cover - exercised in real-SDK env
-        from openai.types.chat import ChatCompletionChunk
-        from openai.types.chat.chat_completion_chunk import (
+        from openai.types.chat import ChatCompletionChunk  # type: ignore[import-not-found]
+        from openai.types.chat.chat_completion_chunk import (  # type: ignore[import-not-found]
             Choice,
             ChoiceDelta,
         )
@@ -651,7 +651,7 @@ def _build_zero_chat_usage() -> Any:
     on unusual ``openai`` pins.
     """
     try:  # pragma: no cover - exercised in real-SDK env
-        from openai.types.completion_usage import CompletionUsage
+        from openai.types.completion_usage import CompletionUsage  # type: ignore[import-not-found]
 
         return CompletionUsage(
             prompt_tokens=0,
@@ -766,9 +766,12 @@ def _stub_chat_completion(decision: PolicyDecision, trace_id: str, model: str):
     }
 
     try:  # pragma: no cover - exercised in real-SDK env
-        from openai.types.chat import ChatCompletion, ChatCompletionMessage
-        from openai.types.chat.chat_completion import Choice
-        from openai.types.completion_usage import CompletionUsage
+        from openai.types.chat import (  # type: ignore[import-not-found]
+            ChatCompletion,
+            ChatCompletionMessage,
+        )
+        from openai.types.chat.chat_completion import Choice  # type: ignore[import-not-found]
+        from openai.types.completion_usage import CompletionUsage  # type: ignore[import-not-found]
 
         msg = ChatCompletionMessage(
             role="assistant",
@@ -844,7 +847,9 @@ def _build_prompt_tokens_details() -> Any:
     full rationale on why ``SimpleNamespace`` alone is not
     enough."""
     try:  # pragma: no cover - exercised in real-SDK env
-        from openai.types.completion_usage import PromptTokensDetails
+        from openai.types.completion_usage import (
+            PromptTokensDetails,  # type: ignore[import-not-found]
+        )
 
         return PromptTokensDetails(audio_tokens=0, cached_tokens=0)
     except Exception:
@@ -857,7 +862,9 @@ def _build_completion_tokens_details() -> Any:
     """Counterpart of :func:`_build_prompt_tokens_details` for the
     output side of Chat Completions."""
     try:  # pragma: no cover - exercised in real-SDK env
-        from openai.types.completion_usage import CompletionTokensDetails
+        from openai.types.completion_usage import (
+            CompletionTokensDetails,  # type: ignore[import-not-found]
+        )
 
         return CompletionTokensDetails(
             accepted_prediction_tokens=0,
@@ -899,8 +906,12 @@ def _build_response_output_message(blurb: str, trace_id: str) -> Any:
     block-with-stub) is preserved.
     """
     try:  # pragma: no cover - exercised in real-SDK env
-        from openai.types.responses.response_output_message import ResponseOutputMessage
-        from openai.types.responses.response_output_text import ResponseOutputText
+        from openai.types.responses.response_output_message import (  # type: ignore[import-not-found]
+            ResponseOutputMessage,
+        )
+        from openai.types.responses.response_output_text import (  # type: ignore[import-not-found]
+            ResponseOutputText,
+        )
 
         text = ResponseOutputText(annotations=[], text=blurb, type="output_text")
         return ResponseOutputMessage(
@@ -947,7 +958,9 @@ def _build_input_tokens_details() -> Any:
     surrounding fail-open contract is preserved).
     """
     try:  # pragma: no cover - exercised in real-SDK env, skipped in unit tests with no openai installed
-        from openai.types.responses.response_usage import InputTokensDetails
+        from openai.types.responses.response_usage import (
+            InputTokensDetails,  # type: ignore[import-not-found]
+        )
 
         return InputTokensDetails(cached_tokens=0)
     except Exception:
@@ -960,7 +973,9 @@ def _build_output_tokens_details() -> Any:
     """Counterpart of :func:`_build_input_tokens_details` for the
     output side."""
     try:  # pragma: no cover - exercised in real-SDK env
-        from openai.types.responses.response_usage import OutputTokensDetails
+        from openai.types.responses.response_usage import (
+            OutputTokensDetails,  # type: ignore[import-not-found]
+        )
 
         return OutputTokensDetails(reasoning_tokens=0)
     except Exception:

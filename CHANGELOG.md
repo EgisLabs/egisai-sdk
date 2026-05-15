@@ -7,7 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.25.13] — 2026-05-15
+
+### Fixed
+
+- **CI gate parity for the public mirror's no-`openai`
+  environment** — both the `pytest` and `mypy` gates. The
+  mirror's CI bootstraps with `pip install -e ".[dev]"`; the
+  `dev` extra intentionally does **not** pull the optional
+  `openai` / `anthropic` / `google-genai` packages so the
+  release build proves the SDK still works when a customer
+  installs the bare `egisai` distribution. Two separate gates
+  were red on 0.25.12's release pipeline:
+
+  1. **`pytest`** — four contract tests in
+     `tests/test_block_stub_provider_sdk_shape.py` (the OpenAI
+     Responses `usage` / output-list shape pins, and the Chat
+     Completions `.model_dump()` / autogen-unpack pins)
+     imported `openai.types.…` at top-level inside the test
+     body and called `.model_dump()` on the stub. Both
+     contracts only apply when the optional `openai` extra is
+     installed. The four tests now use
+     `pytest.importorskip("openai")` / `try / except
+     ImportError: return` to skip cleanly when the extra is
+     absent, matching the pattern already in place on the
+     LangChain-OpenAI and openai-agents sibling tests in the
+     same file.
+
+  2. **`mypy`** — twelve guarded imports of `openai.types.…`
+     inside `try / except` blocks in
+     `src/egisai/_patches/openai.py` (the Pydantic-typed stub
+     factories for `ChatCompletion`, `ChatCompletionChunk`,
+     `CompletionUsage`, `ResponseOutputMessage`,
+     `ResponseOutputText`, and the `*TokensDetails`
+     sub-objects) didn't carry the
+     `# type: ignore[import-not-found]` directive the rest of
+     the optional-extra imports in the SDK already use
+     (`_patches/genai.py`, `_patches/agno.py`,
+     `_patches/google.py`). mypy doesn't honour
+     `try: import x; except ImportError: …` for missing
+     modules, so the in-`try`-body imports tripped seven
+     `Cannot find implementation or library stub`
+     errors. Each import now carries the project-standard
+     ignore directive.
+
+  No runtime behaviour change — the installed bytes are
+  identical to what 0.25.12 would have shipped. This release
+  exists because 0.25.12's PyPI publish was blocked by the
+  `pytest` gate inside `release.yml`'s `test` job (the
+  `build` job has `needs: test`), so the Agent-Identity
+  audit-provenance fix from 0.25.12 reaches customers as the
+  first installable 0.25.x in this series after 0.25.11. The
+  parallel `mypy` failure in `ci.yml`'s `type-check` job —
+  same root cause, separate workflow, not on the publish-
+  critical path — is fixed here too so the main-branch CI
+  badge stays green.
+
+---
+
 ## [0.25.12] — 2026-05-14
+
+> **Note**: 0.25.12 was never published to PyPI — its release
+> pipeline was blocked at the `pytest -q` gate by the test-only
+> regression fixed in 0.25.13. The Fixed entry below describes
+> the actual code change that 0.25.13 carries forward.
 
 ### Fixed
 
