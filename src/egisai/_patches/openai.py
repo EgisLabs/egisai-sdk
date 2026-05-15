@@ -847,8 +847,8 @@ def _build_prompt_tokens_details() -> Any:
     full rationale on why ``SimpleNamespace`` alone is not
     enough."""
     try:  # pragma: no cover - exercised in real-SDK env
-        from openai.types.completion_usage import (
-            PromptTokensDetails,  # type: ignore[import-not-found]
+        from openai.types.completion_usage import (  # type: ignore[import-not-found]
+            PromptTokensDetails,
         )
 
         return PromptTokensDetails(audio_tokens=0, cached_tokens=0)
@@ -862,8 +862,8 @@ def _build_completion_tokens_details() -> Any:
     """Counterpart of :func:`_build_prompt_tokens_details` for the
     output side of Chat Completions."""
     try:  # pragma: no cover - exercised in real-SDK env
-        from openai.types.completion_usage import (
-            CompletionTokensDetails,  # type: ignore[import-not-found]
+        from openai.types.completion_usage import (  # type: ignore[import-not-found]
+            CompletionTokensDetails,
         )
 
         return CompletionTokensDetails(
@@ -958,8 +958,8 @@ def _build_input_tokens_details() -> Any:
     surrounding fail-open contract is preserved).
     """
     try:  # pragma: no cover - exercised in real-SDK env, skipped in unit tests with no openai installed
-        from openai.types.responses.response_usage import (
-            InputTokensDetails,  # type: ignore[import-not-found]
+        from openai.types.responses.response_usage import (  # type: ignore[import-not-found]
+            InputTokensDetails,
         )
 
         return InputTokensDetails(cached_tokens=0)
@@ -973,8 +973,8 @@ def _build_output_tokens_details() -> Any:
     """Counterpart of :func:`_build_input_tokens_details` for the
     output side."""
     try:  # pragma: no cover - exercised in real-SDK env
-        from openai.types.responses.response_usage import (
-            OutputTokensDetails,  # type: ignore[import-not-found]
+        from openai.types.responses.response_usage import (  # type: ignore[import-not-found]
+            OutputTokensDetails,
         )
 
         return OutputTokensDetails(reasoning_tokens=0)

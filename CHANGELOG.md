@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.25.14] — 2026-05-15
+
+### Fixed
+
+- **Close the `ci.yml` mypy gate that 0.25.13 left half-fixed.**
+  0.25.13 added `# type: ignore[import-not-found]` to twelve
+  guarded imports of `openai.types.…` inside
+  `src/egisai/_patches/openai.py` so mypy would tolerate the
+  missing optional `openai` extra on the public mirror's CI.
+  After landing those edits, `ruff --fix` re-formatted four of
+  the imports (`PromptTokensDetails`, `CompletionTokensDetails`,
+  `InputTokensDetails`, `OutputTokensDetails`) from single-line
+  to parenthesised multi-line form because the single-line
+  version exceeded the project's 100-char limit. The reformat
+  parked the `# type: ignore[import-not-found]` directive on
+  the *symbol-name* line, but mypy emits the
+  `Cannot find implementation or library stub` error on the
+  `from … import (` line — so on those four sites the ignore
+  was a no-op. Only one of the four bubbled up as a CI error
+  (the others were silently masked by mypy's per-module
+  "module-missing" caching: once `openai.types.completion_usage`
+  was flagged on its first guarded import, subsequent imports
+  of the same module didn't re-flag). 0.25.13 still shipped
+  successfully because `release.yml`'s gate matrix is
+  `ruff + pytest`, not mypy — `mypy` lives only in `ci.yml`'s
+  `type-check` job, which is non-blocking for PyPI publish but
+  red on the repository badge.
+
+  0.25.14 moves the directive to the `from … import (` line on
+  all four sites, matching the pattern already in use on the
+  `response_output_message` / `response_output_text` siblings
+  (those weren't affected because their imports had multiple
+  symbols and ruff's reformat naturally put the ignore on the
+  outer line). No runtime behaviour change. Wheel + sdist for
+  0.25.14 are byte-equivalent-modulo-comments to 0.25.13's
+  artefacts.
+
+---
+
 ## [0.25.13] — 2026-05-15
 
 ### Fixed
