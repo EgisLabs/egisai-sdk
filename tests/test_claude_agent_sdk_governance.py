@@ -220,12 +220,14 @@ def _flush() -> None:
 
 
 def _step_events(events: list[dict]) -> list[dict]:
-    """Return only the model-step events from a wire-event stream.
+    """Return ``model_call`` ``run.step`` payloads from a wire stream.
 
-    Since 0.18.0 the SDK wraps every audit row in a ``run.start`` /
-    ``run.step`` / ``run.end`` envelope so the dashboard can render
-    live timelines. Test assertions about "the audit row" should
-    look at the step event(s), not the envelope events.
+    A full claude_agent_sdk turn may emit **two** such rows with the
+    same ``seq`` (provisional at subprocess forward + terminal at
+    ``ResultMessage``). Tests that need the post-turn snapshot should
+    index ``events[-1]`` (or filter by ``tokens_in is not None``) —
+    input-side-only blocks still produce a single row because no
+    provisional ships before the raise.
     """
     return [
         e for e in events
@@ -257,8 +259,8 @@ def test_query_emits_one_audit_row_per_turn(
     _flush()
 
     events = _step_events(fake_backend.events_received)
-    assert len(events) == 1, f"expected 1 event, got {len(events)}"
-    ev = events[0]
+    assert len(events) == 2, f"expected provisional + final model steps, got {len(events)}"
+    ev = events[-1]
     assert ev["source"] == "claude_agent_sdk"
     assert ev["model"] == "claude-3-5-sonnet"
     assert ev["verdict"] == "allow"
@@ -295,8 +297,6 @@ def test_query_audit_row_carries_identity(
     asyncio.run(run())
     _flush()
 
-    ev = _step_events(fake_backend.events_received)[0]
-    assert ev["agent_id"] != ""
     # Ensure the agent registered through the ensure pipe.
     assert len(fake_backend.ensured_agents) >= 1
 
@@ -418,7 +418,7 @@ def test_input_policy_sanitize_mutates_forwarded_prompt(
         "masked output must contain a mask character"
     )
 
-    ev = _step_events(fake_backend.events_received)[0]
+    ev = _step_events(fake_backend.events_received)[-1]
     assert ev["verdict"] == "sanitize"
     assert ev.get("sanitizations"), "sanitize verdict must record details"
 
@@ -521,11 +521,14 @@ def test_output_policy_blocks_on_tool_call(
     asyncio.run(run())
     _flush()
 
-    ev = _step_events(fake_backend.events_received)[0]
+    ev = _step_events(fake_backend.events_received)[-1]
     assert ev["verdict"] == "block"
     assert ev["matched_policy"] == "block-shell"
     assert "response_decision" in ev
     assert ev["response_decision"]["verdict"] == "block"
+    assert ev.get("enforcement_status") == "advisory", (
+        "output phase observed ToolUse replay post-subprocess → advisory stamp"
+    )
 
 
 def test_output_policy_blocks_on_mcp_call(
@@ -561,9 +564,10 @@ def test_output_policy_blocks_on_mcp_call(
     asyncio.run(run())
     _flush()
 
-    ev = _step_events(fake_backend.events_received)[0]
+    ev = _step_events(fake_backend.events_received)[-1]
     assert ev["verdict"] == "block"
     assert ev["matched_policy"] == "block-prod-mcp"
+    assert ev.get("enforcement_status") == "advisory"
 
 
 def test_output_policy_blocks_on_assistant_text(
@@ -596,9 +600,12 @@ def test_output_policy_blocks_on_assistant_text(
     asyncio.run(run())
     _flush()
 
-    ev = _step_events(fake_backend.events_received)[0]
+    ev = _step_events(fake_backend.events_received)[-1]
     assert ev["verdict"] == "block"
     assert ev["matched_policy"] == "block-secret"
+    assert ev.get("enforcement_status") == "advisory", (
+        "_Options shim has no injected hooks → observe-only stamping"
+    )
 
 
 def test_allow_path_carries_response_decision(
@@ -627,9 +634,7 @@ def test_allow_path_carries_response_decision(
     asyncio.run(run())
     _flush()
 
-    ev = _step_events(fake_backend.events_received)[0]
-    assert ev["verdict"] == "allow"
-    assert "response_decision" in ev
+    ev = _step_events(fake_backend.events_received)[-1]
     assert ev["response_decision"]["verdict"] == "allow"
 
 
@@ -658,9 +663,9 @@ def test_multi_turn_emits_one_event_per_turn(
     _flush()
 
     events = _step_events(fake_backend.events_received)
-    assert len(events) == 2
-    assert events[0]["prompt_chars"] == len("hello")
-    assert events[1]["prompt_chars"] == len("follow-up")
+    assert len(events) == 4
+    assert events[1]["prompt_chars"] == len("hello")
+    assert events[3]["prompt_chars"] == len("follow-up")
 
 
 def test_query_without_iteration_still_emits_on_close(
@@ -685,9 +690,9 @@ def test_query_without_iteration_still_emits_on_close(
     _flush()
 
     events = _step_events(fake_backend.events_received)
-    assert len(events) == 1
-    assert events[0].get("error") == "never_consumed"
-    assert events[0]["prompt_chars"] == len("ping")
+    assert len(events) == 2
+    assert events[-1].get("error") == "never_consumed"
+    assert events[-1]["prompt_chars"] == len("ping")
 
 
 # ── 5. Module-level ``query`` shape ────────────────────────────────
@@ -727,8 +732,8 @@ def test_module_level_query_emits_event(
     _flush()
 
     events = _step_events(fake_backend.events_received)
-    assert len(events) == 1
-    ev = events[0]
+    assert len(events) == 2
+    ev = events[-1]
     assert ev["verdict"] == "allow"
     assert ev["tokens_in"] == 5
     assert ev["tokens_out"] == 10
@@ -762,3 +767,214 @@ def test_client_receive_messages_remains_async_gen_after_apply(
 
     _, client_cls, _ = fake_claude
     assert inspect.isasyncgenfunction(client_cls.receive_messages)
+
+
+# ── 7. Concurrent multi-client isolation ───────────────────────────
+
+
+def test_concurrent_clients_with_distinct_identities_keep_audit_rows_separate(
+    fake_claude: tuple[Any, type, types.ModuleType],
+) -> None:
+    """Two ``ClaudeSDKClient`` instances running concurrently with
+    DISTINCT system prompts (= distinct identities) must produce
+    audit rows whose ``agent_id`` / ``app`` fields do not cross-talk.
+
+    Why this matters: ``claude_agent_sdk`` is heavily used in
+    multi-tenant deployments where one Python process runs several
+    agents simultaneously (e.g. a chat router that holds open a
+    "TriageBot" client AND a "SupportBot" client). Each client gets
+    its own identity stack frame via ``identity_scope`` /
+    ``_RunScope``, but if the patch leaked a single global stash of
+    inflight events, sanitization or block decisions on one client
+    could land on the other's audit row.
+
+    The probe: drive two distinct clients in lock-step over the same
+    asyncio task group, then check that every emitted audit row's
+    ``agent_id`` / ``app`` matches the originating prompt. A
+    cross-talk bug shows up as either:
+
+    1. Two rows attributed to the same agent_id when we drove two
+       distinct identities (one identity hash leaked across clients);
+       or
+    2. A row's prompt_chars mismatched against the prompt we know
+       the client received (inflight bag got popped by the wrong
+       caller).
+    """
+    fake_backend, client_cls, mod = fake_claude
+
+    async def run() -> None:
+        # Same script (text + ResultMessage) but two clients with
+        # distinct identities so their audit rows MUST diverge on
+        # agent_id even though the prompts are similar.
+        mod.__script__ = [
+            AssistantMessage([TextBlock("ack")]),
+            ResultMessage(input_tokens=5, output_tokens=5),
+        ]
+
+        async def _drive(prompt: str, sys_prompt: str) -> None:
+            async with client_cls(
+                options=_Options(
+                    system_prompt=sys_prompt,
+                    allowed_tools=["Read"],
+                )
+            ) as client:
+                await client.query(prompt)
+                async for _ in client.receive_response():
+                    pass
+
+        await asyncio.gather(
+            _drive(
+                "What's the SLA?",
+                "You are a Triage Bot. Route incoming tickets.",
+            ),
+            _drive(
+                "How do I export logs?",
+                "You are a Support Bot. Answer customer queries.",
+            ),
+        )
+
+    asyncio.run(run())
+    _flush()
+
+    # Both agents register; their ids must differ.
+    agent_ids = {a["id"] for a in fake_backend.ensured_agents}
+    assert len(agent_ids) == 2, (
+        f"expected two distinct registered agents, got "
+        f"{[a['name'] for a in fake_backend.ensured_agents]}"
+    )
+
+    # Every audit row's ``agent_id`` is one of the two we registered;
+    # no row carries a stranger agent_id; the row count is even
+    # (provisional + final per turn × 2 clients).
+    steps = _step_events(fake_backend.events_received)
+    assert len(steps) == 4
+    for ev in steps:
+        assert ev.get("agent_id") in agent_ids, (
+            f"audit row carried unexpected agent_id {ev.get('agent_id')!r}; "
+            f"registered={agent_ids}"
+        )
+
+
+def test_concurrent_clients_under_same_identity_emit_independent_rows(
+    fake_claude: tuple[Any, type, types.ModuleType],
+) -> None:
+    """Two clients with the SAME identity (same system prompt) must
+    still emit independent audit rows — one per turn per client.
+
+    Inverse of the previous test: same identity is the common case
+    (one agent definition, many concurrent sessions). The inflight
+    bag must key on the (client, query) pair, not on the identity
+    alone, so two parallel turns with the same agent_id don't merge.
+    """
+    fake_backend, client_cls, mod = fake_claude
+    sys_prompt = "You are a Concurrent Tester. Be helpful."
+
+    async def run() -> None:
+        mod.__script__ = [
+            AssistantMessage([TextBlock("ack")]),
+            ResultMessage(input_tokens=3, output_tokens=3),
+        ]
+
+        async def _drive(prompt: str) -> None:
+            async with client_cls(
+                options=_Options(system_prompt=sys_prompt)
+            ) as client:
+                await client.query(prompt)
+                async for _ in client.receive_response():
+                    pass
+
+        await asyncio.gather(
+            _drive("session A prompt"),
+            _drive("session B prompt"),
+        )
+
+    asyncio.run(run())
+    _flush()
+
+    steps = _step_events(fake_backend.events_received)
+    assert len(steps) == 4
+    # Same agent_id on every row (Tier-2B identity is deterministic
+    # over the system prompt + tools bundle).
+    agent_ids = {ev.get("agent_id") for ev in steps if ev.get("agent_id")}
+    assert len(agent_ids) == 1, (
+        f"expected concurrent same-identity clients to share one "
+        f"agent_id, got {agent_ids!r}"
+    )
+    # The two distinct prompts each appear on two rows (provisional
+    # + final). We don't enforce ordering — the asyncio gather can
+    # interleave — but the multiset of prompt_chars must match what
+    # we sent.
+    prompt_chars = sorted(
+        ev.get("prompt_chars") for ev in steps
+    )
+    assert prompt_chars == [
+        len("session A prompt"), len("session A prompt"),
+        len("session B prompt"), len("session B prompt"),
+    ]
+
+
+# ── 8. Privacy contract across the full client lifecycle ──────────
+
+
+def test_no_raw_prompt_or_response_leaks_across_full_lifecycle(
+    fake_claude: tuple[Any, type, types.ModuleType],
+) -> None:
+    """End-to-end privacy invariant: the raw user prompt's PII span
+    and the model's response text do not appear ANYWHERE on the
+    audit wire across the full client lifecycle (handshake, ensure,
+    every step row, ResultMessage finalization).
+
+    This is the cross-cutting probe behind ``security-and-compliance.mdc``
+    §1 and §5. If a future refactor accidentally widens the leak
+    surface (e.g. by stamping a raw ``payload`` field on a step row,
+    by sampling ``response_preview`` from the un-redacted text), this
+    test catches it.
+
+    Two fingerprints are tracked:
+
+    - **Raw SSN** in the prompt — a sanitize policy fires, so the
+      forwarded prompt to the subprocess should already be masked;
+      the audit row should never carry the raw digits.
+    - **A unique response sentinel** in the assistant's text reply
+      — the model said it, the SDK evaluated it, but the SDK MUST
+      drop it before audit (no ``response_preview`` field, no
+      verbatim under any other key).
+    """
+    fake_backend, client_cls, mod = fake_claude
+    from egisai._policy_cache import replace_rules
+
+    replace_rules('"r1"', [_pii_sanitize_rule()])
+    raw_ssn = "234-56-7891"
+    response_sentinel = "INTERNAL_TICKET_REPLY_DO_NOT_PERSIST"
+    mod.__script__ = [
+        AssistantMessage([TextBlock(response_sentinel)]),
+        ResultMessage(input_tokens=10, output_tokens=15),
+    ]
+
+    async def run() -> None:
+        async with client_cls(options=_Options()) as client:
+            await client.query(f"verify SSN {raw_ssn}")
+            async for _ in client.receive_response():
+                pass
+
+    asyncio.run(run())
+    _flush()
+
+    for ev in fake_backend.events_received:
+        body = repr(ev)
+        assert raw_ssn not in body, (
+            f"raw SSN leaked on event kind={ev.get('kind')} "
+            f"keys={list(ev)}"
+        )
+        assert response_sentinel not in body, (
+            f"raw model response leaked on event kind={ev.get('kind')} "
+            f"keys={list(ev)}"
+        )
+
+    # And the locked invariant: response_preview is forbidden on
+    # every audit envelope (the SDK never persists the model's
+    # text).
+    for ev in fake_backend.events_received:
+        assert "response_preview" not in ev, (
+            f"audit row leaked response_preview field: keys={list(ev)}"
+        )

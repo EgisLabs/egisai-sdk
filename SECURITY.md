@@ -95,3 +95,71 @@ data-clean text only.
 If you find a way to exfiltrate raw PII, OR to bypass a policy
 that should have blocked or sanitised, that's a Critical-severity
 issue and we want to know within hours.
+
+## Tool / MCP enforcement guarantees
+
+`egisai` distinguishes two states on every audit row:
+
+- **`enforcement_status="enforced"`** — A policy verdict on a
+  tool call PHYSICALLY PREVENTED the tool from running, OR a
+  policy verdict on a tool *result* prevented the model from
+  ever seeing the unredacted bytes. The action did not happen /
+  the leak did not reach the model.
+- **`enforcement_status="advisory"`** — A policy decided block,
+  but the underlying framework's architecture meant the SDK could
+  only observe after the fact. The audit row is honest about the
+  gap so SOC 2 / GDPR auditors can find these via
+  `WHERE verdict='block' AND enforcement_status='advisory'`.
+
+There are THREE enforcement surfaces the SDK documents for auditors:
+
+1. **Tool / MCP dispatch** — `deny_tool_call`, `deny_mcp_call`,
+   `semantic_guard` on the call itself. Blocks dangerous
+   actions (drop tables, send funds, exec arbitrary shell)
+   before they run.
+2. **Tool result content** — `pii_scan`, `deny_output_regex`,
+   `semantic_guard` on the data the tool returned. Blocks
+   leaks of PII / secrets / proprietary identifiers that
+   would otherwise enter the model's context.
+3. **Aggregated assistant OUTPUT (`claude_agent_sdk` only)** —
+   A second evaluator runs on the concatenated assistant stream at
+   ``ResultMessage``. When that evaluation replays structured
+   ``tool_calls`` emitted by the CLI subprocess, a ``verdict=block``
+   stamps ``enforcement_status="advisory"`` on the enclosing
+   ``model_call`` row — MCP/tool bytes were already replayed before
+   Python aggregated them. **Pure text-only** violations still stamp
+   ``enforced`` when hooks are wired. Applications that use
+   ``on_block="raise"`` continue to see ``PermissionError``; the audit
+   flag distinguishes *subprocess timing truth* from *caller withhold*.
+
+**Every framework `egisai` patches enforces surfaces **(1)** and **(2)**
+EXCEPT one**: `bedrock_agent` (AWS Bedrock Agents). AWS Bedrock Agents
+execute Action Groups on AWS-managed infrastructure outside the
+SDK process, so we cannot intercept tool dispatch before AWS
+runs it AND we cannot substitute the result before AWS feeds it
+back to the model. The patch records what happened via the
+trace events in the response stream and stamps audit rows as
+**advisory** to honestly reflect the limit. If your application
+requires hard pre-execution gating OR tool-result PII masking
+for Bedrock workloads, use one of:
+
+- The standalone `bedrock-runtime` Converse API (drive the
+  agentic loop yourself in Python — tool results round-trip
+  Python and the next call's input phase scans them).
+- The `claude_agent_sdk` (the only subprocess-loop framework
+  we patch where the SDK exposes both PreToolUse AND
+  PostToolUse hooks for true enforcement).
+
+For the full per-framework enforcement matrix, see the
+"Enforcement matrix" section of [README.md](README.md).
+
+**Claude Agent SDK:** `PreToolUse` / `PostToolUse` still satisfy rows
+(1) and (2) above; item (3) is the separate aggregated OUTPUT pass
+documented in the previous list.
+
+If you find a tool call that ran despite a matching
+`deny_tool_call` policy on any framework EXCEPT `bedrock_agent`,
+OR a tool result that reached the model despite a matching
+`pii_scan` / `deny_output_regex` policy on any framework
+EXCEPT `bedrock_agent`, that's a Critical-severity bypass and
+we want to know within hours.

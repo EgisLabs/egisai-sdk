@@ -41,7 +41,24 @@ def _extract_message_usage(response: Any) -> dict[str, Any]:
 
 
 def _stub_message(decision: PolicyDecision, trace_id: str, model: str):
-    """Build a stub Anthropic ``Message``-shaped object."""
+    """Build a stub Anthropic ``Message``-shaped object.
+
+    The upstream ``anthropic.types.Usage`` exposes
+    ``cache_creation_input_tokens``, ``cache_read_input_tokens``,
+    ``server_tool_use`` and ``service_tier`` alongside the basic
+    ``input_tokens``/``output_tokens`` pair. Frameworks that wrap
+    Anthropic (LangChain, LangGraph, CrewAI, …) frequently read
+    those extras directly off the response — a stub that omits
+    them crashes those frameworks with ``AttributeError`` the
+    moment a policy fires with ``on_block="stub"``. We populate
+    every documented field at a sensible "zero/no-cache" value
+    so the stub is structurally indistinguishable from a real
+    "blocked, no token usage" turn.
+
+    Similarly, the top-level ``Message`` exposes ``stop_sequence``
+    and ``container`` (both Optional on the upstream model); we
+    spell them as ``None`` so attribute access never raises.
+    """
     from types import SimpleNamespace
 
     blurb = (
@@ -55,7 +72,16 @@ def _stub_message(decision: PolicyDecision, trace_id: str, model: str):
         model=model,
         content=[SimpleNamespace(type="text", text=blurb)],
         stop_reason="end_turn",
-        usage=SimpleNamespace(input_tokens=0, output_tokens=0),
+        stop_sequence=None,
+        container=None,
+        usage=SimpleNamespace(
+            input_tokens=0,
+            output_tokens=0,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+            server_tool_use=None,
+            service_tier=None,
+        ),
         egis={"blocked": True, "reason": decision.message, "matched_policy": decision.matched_policy},
     )
 
@@ -79,6 +105,18 @@ def _wrap_messages_create(orig: Callable[..., Any], is_async: bool) -> Callable[
                 stub_factory=_stub_message,
                 extract_usage=_extract_message_usage,
                 extract_output_signals=extract_anthropic,
+                # Multi-step waterfall: when the assistant turn carries
+                # ``tool_use`` blocks, append one ``tool_call`` step per
+                # tool so the dashboard timeline reads
+                # ``model -> tool -> model -> tool -> ...`` instead of
+                # collapsing the whole turn into a single ``model_call``
+                # row. Same posture as the openai patch; the parent
+                # model_call's output policy already had a chance to
+                # gate each tool request before this step lands so the
+                # per-tool steps are stamped ``enforced`` (distinct
+                # from the agentic-subprocess case where execution
+                # happened ahead of observation).
+                emit_tool_call_steps=True,
                 forward=lambda: orig(self, *args, **kwargs),
             )
 
@@ -100,6 +138,7 @@ def _wrap_messages_create(orig: Callable[..., Any], is_async: bool) -> Callable[
             stub_factory=_stub_message,
             extract_usage=_extract_message_usage,
             extract_output_signals=extract_anthropic,
+            emit_tool_call_steps=True,
             forward=lambda: orig(self, *args, **kwargs),
         )
 

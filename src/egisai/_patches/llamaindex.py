@@ -51,14 +51,26 @@ def apply() -> bool:
     # All modern LlamaIndex agents (FunctionAgent, ReActAgent,
     # CodeActAgent, AgentWorkflow) expose ``run`` as a plain ``def``
     # that returns a ``WorkflowHandler`` — an awaitable handle whose
-    # ``.stream_events()`` is the streaming API. Wrapping these as
-    # ``async`` (pre-0.17.5) silently swallowed the handle inside our
-    # coroutine, breaking the supported
-    # ``async for ev in agent.run(...).stream_events()`` pattern.
-    # ``sync`` returns the handle as-is — ``await handle`` and
-    # ``handle.stream_events()`` both still work. (Identity falls back
-    # to Tier 5 / system-prompt hash during the streaming events; the
-    # next minor will add a handle-aware wrapper.)
+    # ``.stream_events()`` is the streaming API and whose internal
+    # ``_result_task`` is the asyncio Task on which the workflow's
+    # steps (including inner LLM + tool calls) actually run.
+    #
+    # ``handler`` kind is the only correct wrap here:
+    #
+    # * ``async`` swallowed the handle inside our coroutine and broke
+    #   the supported ``async for ev in agent.run(...).stream_events()``
+    #   pattern (0.17.0–0.17.4 regression).
+    # * ``sync`` (0.17.5–0.17.x) returned the handle as-is and so kept
+    #   that pattern working, BUT closed the Run scope before the
+    #   workflow's inner LLM calls executed — inner steps then fell
+    #   through to the legacy ephemeral-run path with no framework
+    #   attribution. The dashboard saw a phantom empty
+    #   ``framework=llamaindex`` run plus a real
+    #   ``framework=legacy`` run for the same task.
+    # * ``handler`` keeps the Run scope open from the moment ``run()``
+    #   returns the handle until the handle's ``_result_task``
+    #   completes, so every inner LLM call records under the correct
+    #   ``framework=llamaindex`` run with the right identity.
     for class_name in (
         "FunctionAgent",
         "ReActAgent",
@@ -67,12 +79,14 @@ def apply() -> bool:
     ):
         if patch_method(
             "llama_index.core.agent", class_name, "run",
-            derive=_derive, kind="sync",
+            derive=_derive, kind="handler",
         ):
             any_patched = True
     # ``AgentRunner`` was removed in modern LlamaIndex but we keep the
     # call for older installations — ``patch_method`` returns ``False``
-    # silently when the target is gone.
+    # silently when the target is gone. The legacy AgentRunner.run is
+    # a fully synchronous call (no handle) so ``sync`` is the right
+    # wrap for it.
     if patch_method(
         "llama_index.core.agent", "AgentRunner", "run",
         derive=_derive, kind="sync",

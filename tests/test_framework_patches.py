@@ -770,6 +770,103 @@ def test_agno_arun_polymorphic_coro_and_async_iter(
         assert rec.display_name == "Streamer"
 
 
+def test_agno_openai_chat_stub_compat_shim(
+    fake_backend: Any, cleanup_modules: list[str]
+) -> None:
+    """Block-stub from ``_patches/openai.py`` must survive Agno's
+    unguarded ``response_message.audio`` and ``response.model_extra``
+    reads. Real responses (no ``egis`` marker) are passed through
+    untouched.
+
+    Regression for the ``'types.SimpleNamespace' object has no
+    attribute 'audio'`` crash seen the moment a policy fires with
+    ``on_block="stub"`` on an Agno agent.
+    """
+    from types import SimpleNamespace
+
+    _init_sdk(fake_backend)
+
+    # Build a fake ``agno.models.openai.chat`` module with a
+    # ``_parse_provider_response`` that mirrors the unguarded reads
+    # in the real Agno code (line 844 for ``.audio``, line 884 for
+    # ``.model_extra``).
+    mod = _make_fake_module("agno")
+    sub_models = _make_fake_module("agno.models")
+    sub_openai = _make_fake_module("agno.models.openai")
+    sub_chat = _make_fake_module("agno.models.openai.chat")
+    # ``agno.agent`` is required for the identity patches in
+    # ``apply()`` to attempt their wrap (they no-op when the class
+    # isn't there, but ``has_module("agno")`` is the gate).
+    sub_agent = _make_fake_module("agno.agent")
+    cleanup_modules.extend([
+        "agno", "agno.models", "agno.models.openai",
+        "agno.models.openai.chat", "agno.agent",
+    ])
+
+    parsed: list[Any] = []
+
+    class OpenAIChat:
+        def _parse_provider_response(
+            self, response: Any, response_format: Any = None
+        ) -> dict[str, Any]:
+            # The two unguarded reads. Real Agno does more; these
+            # are the two that crash on a SimpleNamespace stub.
+            audio = response.choices[0].message.audio
+            extra = response.model_extra
+            parsed.append((audio, extra))
+            return {"content": response.choices[0].message.content}
+
+    sub_chat.OpenAIChat = OpenAIChat
+    sub_openai.chat = sub_chat
+    sub_models.openai = sub_openai
+    mod.models = sub_models
+    mod.agent = sub_agent
+
+    from egisai._patches import agno
+
+    assert agno.apply() is True
+    # Idempotent: a second apply() doesn't double-wrap.
+    agno.apply()
+    assert OpenAIChat._parse_provider_response.__egis_wrapped__ is True  # type: ignore[attr-defined]
+
+    # 1) Our block-stub shape — missing ``.audio`` and ``.model_extra``.
+    stub_msg = SimpleNamespace(role="assistant", content="[BLOCKED]", tool_calls=None)
+    stub_choice = SimpleNamespace(index=0, message=stub_msg, finish_reason="stop")
+    stub = SimpleNamespace(
+        id="egis-blocked-deadbeef",
+        choices=[stub_choice],
+        # The ``egis`` sentinel is what gates the normalization;
+        # without it the shim must pass through.
+        egis={"blocked": True, "reason": "test", "matched_policy": "p1"},
+    )
+    out = OpenAIChat()._parse_provider_response(stub)
+    assert out["content"] == "[BLOCKED]"
+    # The shim injected the missing fields as ``None``.
+    assert stub_msg.audio is None
+    assert stub.model_extra is None
+    assert parsed[-1] == (None, None)
+
+    # 2) Real response (no ``egis`` marker) — the shim is a no-op.
+    real_msg = SimpleNamespace(
+        role="assistant", content="hi", tool_calls=None,
+        # A real ``ChatCompletionMessage`` carries these fields;
+        # the shim must NOT overwrite them.
+        audio="real-audio-obj",
+    )
+    real_choice = SimpleNamespace(index=0, message=real_msg, finish_reason="stop")
+    real = SimpleNamespace(
+        id="cmpl-real",
+        choices=[real_choice],
+        model_extra={"something": 1},
+    )
+    out = OpenAIChat()._parse_provider_response(real)
+    assert out["content"] == "hi"
+    # Untouched — gating worked.
+    assert real_msg.audio == "real-audio-obj"
+    assert real.model_extra == {"something": 1}
+    assert parsed[-1] == ("real-audio-obj", {"something": 1})
+
+
 # ── strands ────────────────────────────────────────────────────────
 
 
@@ -1042,6 +1139,92 @@ async def _await_handle(handle: Any) -> Any:
     return await handle
 
 
+def test_llamaindex_handler_wrap_defers_run_finalization(
+    fake_backend: Any, cleanup_modules: list[str]
+) -> None:
+    """When the WorkflowHandler exposes ``_result_task`` (real
+    LlamaIndex shape since 0.10), our handler wrap MUST keep the
+    ``RunContext`` open until that task completes — every inner LLM
+    call started by the workflow attributes to the wrap's run
+    instead of falling out into a Tier-5 prompt-hash legacy run.
+
+    Pre-fix the wrap closed the run as soon as ``orig()`` returned
+    the handle, so inner ``client.chat.completions.create(...)``
+    calls inside the workflow saw ``current_run() is None`` and
+    each opened their own ephemeral legacy run. Verify here that:
+
+    * after ``orig()`` returns, the run is still open (caller's
+      contextvar is restored, but the underlying ctx is alive),
+    * after the handle's ``_result_task`` completes, the run is
+      closed exactly once,
+    * exceptions raised by the workflow are recorded on the run.
+    """
+    _init_sdk(fake_backend)
+    mod = _make_fake_module("llama_index")
+    pkg = _make_fake_module("llama_index.core")
+    sub = _make_fake_module("llama_index.core.agent")
+    cleanup_modules.extend([
+        "llama_index", "llama_index.core", "llama_index.core.agent",
+    ])
+    mod.core = pkg
+    pkg.agent = sub
+
+    class _Handle:
+        """Minimal WorkflowHandler stub: awaitable + has _result_task."""
+
+        def __init__(self, task: asyncio.Task[Any]) -> None:
+            self._result_task = task
+
+        def __await__(self) -> Any:
+            return self._result_task.__await__()
+
+    class FunctionAgent:
+        def __init__(self, name: str = "Bot") -> None:
+            self.name = name
+            self.tools: list[Any] = []
+            self.system_prompt = "fake"
+
+        def run(self, *args: Any, **kwargs: Any) -> _Handle:
+            async def _work() -> str:
+                await asyncio.sleep(0)
+                return "done"
+
+            task = asyncio.ensure_future(_work())
+            return _Handle(task)
+
+    sub.FunctionAgent = FunctionAgent
+    sub.ReActAgent = FunctionAgent
+    sub.CodeActAgent = FunctionAgent
+    sub.AgentWorkflow = FunctionAgent
+
+    from egisai._patches import llamaindex
+    from egisai._run import _current_run
+
+    assert llamaindex.apply() is True
+
+    a = FunctionAgent("Workflow Bot")
+
+    async def drive() -> tuple[bool, str]:
+        handle = a.run("hi")
+        # Right after ``run()`` returns, the wrap has restored the
+        # caller's contextvar pointer, but the underlying RunContext
+        # is still alive (will be finalized by the done-callback).
+        run_ptr_after_call = _current_run.get()
+        result = await handle
+        # Yield once so the done-callback (queued by add_done_callback)
+        # gets a chance to fire on the asyncio loop.
+        await asyncio.sleep(0)
+        return run_ptr_after_call is None, str(result)
+
+    parent_was_clean, value = asyncio.run(drive())
+    assert parent_was_clean, (
+        "after agent.run(...) returns, the parent task's contextvar must "
+        "be restored — otherwise nested calls in user code would see a "
+        "stale run pointer."
+    )
+    assert value == "done"
+
+
 # ── langchain ──────────────────────────────────────────────────────
 
 
@@ -1050,18 +1233,36 @@ def test_langchain_apply_noop_when_uninstalled(
 ) -> None:
     from egisai._patches import langchain
 
-    _force_missing(monkeypatch, "langchain", "langchain.agents")
+    _force_missing(
+        monkeypatch,
+        "langchain", "langchain.agents",
+        "langchain_classic", "langchain_classic.agents",
+    )
     sys.modules.pop("langchain", None)
     sys.modules.pop("langchain.agents", None)
+    sys.modules.pop("langchain_classic", None)
+    sys.modules.pop("langchain_classic.agents", None)
     assert langchain.apply() is False
 
 
 def test_langchain_apply_noop_on_modern_langchain(
+    monkeypatch: pytest.MonkeyPatch,
     cleanup_modules: list[str],
 ) -> None:
-    """LangChain 1.x removed ``AgentExecutor`` — our patch should
-    silently no-op and let the LangGraph patches handle the
-    ``CompiledStateGraph`` returned by ``create_agent``."""
+    """LangChain 1.x removed ``AgentExecutor`` from
+    ``langchain.agents`` — without ``langchain-classic`` installed
+    our patch should silently no-op and let the LangGraph patches
+    handle the ``CompiledStateGraph`` returned by ``create_agent``."""
+    # Force ``langchain_classic`` to look uninstalled both at the
+    # ``has_module`` gate AND at ``__import__`` time (the latter is
+    # what ``patch_method`` actually calls; ``has_module`` alone
+    # doesn't stop it). Setting a sys.modules entry to ``None`` is
+    # Python's documented way to make an import raise ImportError
+    # without uninstalling the package.
+    _force_missing(monkeypatch, "langchain_classic", "langchain_classic.agents")
+    monkeypatch.setitem(sys.modules, "langchain_classic", None)
+    monkeypatch.setitem(sys.modules, "langchain_classic.agents", None)
+
     mod = _make_fake_module("langchain")
     sub = _make_fake_module("langchain.agents")
     cleanup_modules.extend(["langchain", "langchain.agents"])
@@ -1072,6 +1273,119 @@ def test_langchain_apply_noop_on_modern_langchain(
     from egisai._patches import langchain
 
     assert langchain.apply() is False
+
+
+def test_langchain_patches_classic_module(
+    fake_backend: Any, cleanup_modules: list[str]
+) -> None:
+    """LangChain 1.x users who install ``langchain-classic`` keep
+    the classic ``AgentExecutor.invoke`` surface — our patch must
+    fire on it just like it fires on legacy ``langchain.agents``.
+
+    Regression for the LangChain 1.0 split: ``AgentExecutor`` was
+    removed from ``langchain.agents`` and shipped as a back-compat
+    package at ``langchain_classic.agents``.
+    """
+    _init_sdk(fake_backend)
+    mod = _make_fake_module("langchain_classic")
+    sub = _make_fake_module("langchain_classic.agents")
+    cleanup_modules.extend(["langchain_classic", "langchain_classic.agents"])
+
+    pushed: list[Any] = []
+
+    class _InnerAgent:
+        system_message = "You are a helpful refund agent."
+
+    class _Tool:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class AgentExecutor:
+        def __init__(self) -> None:
+            self.agent = _InnerAgent()
+            self.tools = [_Tool("lookup_customer"), _Tool("issue_refund")]
+            self.name = ""
+
+        def invoke(self, *args: Any, **kwargs: Any) -> str:
+            pushed.append(current_identity())
+            return "ok"
+
+        async def ainvoke(self, *args: Any, **kwargs: Any) -> str:
+            pushed.append(current_identity())
+            return "ok-async"
+
+        def stream(self, *args: Any, **kwargs: Any) -> Iterator[str]:
+            pushed.append(current_identity())
+            yield "chunk"
+
+    sub.AgentExecutor = AgentExecutor
+    mod.agents = sub
+
+    from egisai._patches import langchain
+
+    assert langchain.apply() is True
+    a = AgentExecutor()
+    a.invoke({"input": "hi"})
+    asyncio.run(a.ainvoke({"input": "hi"}))
+    list(a.stream({"input": "hi"}))
+    assert len(pushed) == 3
+    for rec in pushed:
+        assert rec is not None
+        assert rec.source == "framework:langchain"
+
+
+def test_langchain_patches_both_modules_simultaneously(
+    fake_backend: Any, cleanup_modules: list[str]
+) -> None:
+    """When BOTH ``langchain.agents`` and ``langchain_classic.agents``
+    expose ``AgentExecutor`` (e.g. transition periods where a user
+    pins legacy LangChain but has also installed langchain-classic
+    in the same env), the patch wires up both classes independently.
+    """
+    _init_sdk(fake_backend)
+    mod_legacy = _make_fake_module("langchain")
+    sub_legacy = _make_fake_module("langchain.agents")
+    mod_classic = _make_fake_module("langchain_classic")
+    sub_classic = _make_fake_module("langchain_classic.agents")
+    cleanup_modules.extend([
+        "langchain", "langchain.agents",
+        "langchain_classic", "langchain_classic.agents",
+    ])
+
+    pushed: list[tuple[str, Any]] = []
+
+    class _InnerAgent:
+        system_message = "Be helpful."
+
+    def _make_executor_cls(label: str) -> type:
+        class AgentExecutor:
+            def __init__(self) -> None:
+                self.agent = _InnerAgent()
+                self.tools: list[Any] = []
+                self.name = ""
+
+            def invoke(self, *args: Any, **kwargs: Any) -> str:
+                pushed.append((label, current_identity()))
+                return "ok"
+        AgentExecutor.__qualname__ = f"AgentExecutor_{label}"
+        return AgentExecutor
+
+    sub_legacy.AgentExecutor = _make_executor_cls("legacy")
+    sub_classic.AgentExecutor = _make_executor_cls("classic")
+    mod_legacy.agents = sub_legacy
+    mod_classic.agents = sub_classic
+
+    from egisai._patches import langchain
+
+    assert langchain.apply() is True
+    # Both classes must independently push identity — i.e. both
+    # were patched, not just the first one we found.
+    sub_legacy.AgentExecutor().invoke({"input": "hi"})
+    sub_classic.AgentExecutor().invoke({"input": "hi"})
+    assert {label for label, _ in pushed} == {"legacy", "classic"}
+    for _, rec in pushed:
+        assert rec is not None
+        assert rec.source == "framework:langchain"
 
 
 # ── bedrock_runtime ────────────────────────────────────────────────

@@ -7,6 +7,1376 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.25.12] — 2026-05-14
+
+### Fixed
+
+- **Legacy single-row audit events now stamp `identity_source` +
+  `identity_hash` on the audit event**, so the backend's synth-Run
+  ingest path (the `else` branch in `ingest_events` when
+  `ev.get("run_id") is None`) can carry the Agent Identity
+  provenance through onto the `runs` row it materialises. Before
+  this fix every Bedrock Converse / raw OpenAI Chat / raw
+  Anthropic call landed with NULL `identity_source` /
+  `identity_hash` on the synth Run — the Agent Identity card on
+  the dashboard rendered blank, and the agents-test validator's
+  `run.identity_source set` / `run.identity_hash set` checks
+  failed for every direct-LLM harness. Framework-wrapped Runs
+  were unaffected because they ship a `run.start` envelope that
+  carries the same two fields through `_upsert_run_from_start`.
+  The new helper `_stamp_identity_provenance` on
+  `egisai._patches._common` lives at a single seam
+  (`_attribute_event`) so the stamp lands on the event regardless
+  of whether the identity record came from the locked Run, the
+  pushed identity stack, or the fresh 7-tier resolver call.
+  `identity_source` is a controlled-vocabulary token and
+  `identity_hash` is a SHA-256 digest, so this is
+  compliance-safe — no raw prompt content leaks via either
+  field. Pairs with the matching backend change that copies
+  these onto `synth_run.identity_source` /
+  `synth_run.identity_hash` at ingest time. Regression coverage:
+  the agents-test validator (`agents-test/bedrock_converse_agentic.py`,
+  `agents-test/openai_direct_agentic.py`, `agents-test/anthropic_direct_agentic.py`)
+  now passes the two Agent Identity checks end-to-end.
+
+---
+
+## [0.25.11] — 2026-05-14
+
+### Fixed
+
+- **`_RunScope` now skips opening a duplicate Run when re-entered by
+  the *same* logical agent identity**, fixing a long-standing
+  double-row issue in LangGraph harnesses. `Pregel.invoke` calls
+  `self.stream` internally; both methods sit behind separate
+  `_RunScope` wraps, and before this fix each layer materialised
+  its own `runs` row. The outer (invoke) Run ended up empty
+  (`step_count=0`, `prompt_text=""`, `verdict="allow"` even when
+  the inner call blocked) while the inner (stream) Run held the
+  real step. The validator's "average step count" tile, billing
+  token roll-up, and SOC 2 "what actually happened" timeline all
+  double-counted the same trace as a result. The guard keys on
+  `identity_hash` so a *true* sub-agent / handoff (different
+  bundle → different hash) still opens a child Run with
+  `parent_run_id` wired up — the parent→child topology contract
+  is preserved end-to-end. Same code path also covers any future
+  framework whose user-facing entry point internally dispatches
+  through another wrapped entry point on the same `self`
+  (LlamaIndex's `AgentWorkflow.run` → `Workflow._astream`, etc.).
+  Regression test pinned in
+  `tests/test_run_per_framework.py::test_same_identity_nested_wraps_emit_one_run`.
+
+- **SDK-raised block `PermissionError` no longer pollutes `run.error`
+  with the full exception repr.** When `_block_response` (in
+  `_patches/_common.py`) refuses a call by raising
+  `PermissionError("[egisai] …")`, the step it already dispatched
+  carries the full verdict + matched-policy context on
+  `prompt_decision` / `response_decision`. `_RunScope.__exit__` used
+  to stamp the propagating PermissionError's `repr()` onto
+  `run.error`, which made every refused Bedrock-Agent / Bedrock-
+  Runtime turn look like an uncaught-exception crash in the
+  dashboard (and failed the agents-test validator's "`run.error`
+  is None on block" check). The exit path now recognises the SDK's
+  own block-raise (PermissionError whose message starts with the
+  `[egisai]` prefix) and stamps the short canonical reason
+  `"policy block"` instead — matching the allowed-list the
+  validator and `claude_agent_sdk`'s own `close_run` sites already
+  use (`"input policy block"`, `"output policy block"`). Real
+  unexpected exceptions (framework crashes, network errors,
+  programming bugs) still stamp their full `repr()` as before, so
+  the "what actually broke" diagnostic path is untouched. Regression
+  test pinned in
+  `tests/test_run_per_framework.py::test_sdk_block_permission_error_stamps_short_reason_not_full_repr`.
+
+---
+
+## [0.25.10] — 2026-05-14
+
+### Fixed
+
+- **Bedrock managed agents (`bedrock-agent-runtime`) now open a real
+  Run on every `InvokeAgent` call** so the audit row carries
+  `framework="bedrock_agent"`, `identity_source="framework:bedrock_agent"`,
+  and the bundled `identity_hash` — the same shape every other
+  framework wrap stamps. Before this release the patch only pushed
+  the identity onto the stack and called `gate_call` directly, so
+  no `RunContext` was open, `_dispatch_step` fell through to the
+  legacy single-row `enqueue` path, and the backend synthesised a
+  Run with `framework="legacy"` and `identity_source=NULL` /
+  `identity_hash=NULL`. The dashboard's Agent Identity card on a
+  Bedrock managed run was therefore missing the provenance row it
+  shows for every other framework. The fix wraps the gate call in
+  the shared `_RunScope("bedrock_agent", record)` (same primitive
+  used by the OpenAI Agents / LangGraph / Agno / Crew patches) so
+  the Run lifecycle, identity stamping, and re-entry guard all
+  match. No change to the advisory enforcement contract — input
+  policies still fire pre-`boto3`; output / tool-side enforcement
+  is still `advisory` because AWS executes the agent loop
+  server-side.
+
+---
+
+## [0.25.9] — 2026-05-14
+
+### Fixed
+
+- **LangGraph / LangChain `create_agent` / classic `AgentExecutor`
+  no longer crash with `AttributeError: 'ChatCompletion' object
+  has no attribute 'parse'` on blocked turns.**
+  `langchain-openai>=1.2`'s `ChatOpenAI._generate` (and its async
+  / streaming siblings) routes every non-streaming model call
+  through the raw-response code path —
+  `self.client.with_raw_response.create(**payload)` followed by
+  `response = raw_response.parse()`. The upstream
+  `to_raw_response_wrapper` injects the
+  `X-Stainless-Raw-Response: true` marker into `extra_headers` so
+  the OpenAI SDK returns a `LegacyAPIResponse` whose `.parse()`
+  yields the real `ChatCompletion`. Before this release the egisai
+  OpenAI patch returned the synthesised `ChatCompletion` block stub
+  directly back into that call site, which then crashed at the
+  `.parse()` step. Allow turns also silently dropped `tokens_in`,
+  `tokens_out`, and `cost_usd` on the audit row because our
+  usage extractor saw a `LegacyAPIResponse` instead of the parsed
+  body. We now sniff the marker header, wrap the block stub in a
+  `LegacyAPIResponse`-shaped object (`_RawResponseStub` — exposes
+  `.parse()`, `.headers`, `.http_response`, `.status_code`,
+  `.request_id`, `.content`, `.text`, `.elapsed`,
+  `.retries_taken`), and route the gate's usage / output-signal
+  extractors through `.parse()` so the audit row carries real
+  token counts on allow turns. Covers both Chat Completions and
+  Responses APIs, sync and async. The non-raw path is byte-for-byte
+  unchanged.
+
+---
+
+## [0.25.8] — 2026-05-14
+
+### Fixed
+
+- **Streamed OpenAI Chat Completions now record real `tokens_in`,
+  `tokens_out`, and `cost_usd` on the audit row instead of
+  zeros / `None`.** Upstream OpenAI only emits a final usage
+  chunk on streamed responses when the caller passes
+  `stream_options={"include_usage": True}` — but several agentic
+  frameworks (notably `llama-index-llms-openai`'s `_stream_chat`
+  / `_astream_chat`) never set this. Our streaming wrapper now
+  injects `include_usage=True` into `stream_options` when the
+  caller didn't already opt in (or out), so the materialised
+  replay's aggregated `response.usage` surface carries real
+  token counts. Existing keys in `stream_options` are merged
+  rather than overwritten, and an explicit
+  `include_usage=False` is honoured. Affects every streamed
+  call routed through `openai.chat.completions.create` (sync
+  and async), which is what every LlamaIndex agent run hits
+  through the OpenAI LLM adapter.
+
+---
+
+## [0.25.7] — 2026-05-14
+
+### Fixed
+
+- **LlamaIndex `FunctionAgent` / `ReActAgent` / `CodeActAgent` /
+  `AgentWorkflow` runs no longer crash on `TypeError: 'async for'
+  requires an object with __aiter__ method, got _StreamReplay`.**
+  `llama-index-llms-openai`'s `OpenAI._astream_chat` consumes the
+  return value of `await aclient.chat.completions.create(stream=True)`
+  via `async with stream as r: async for chunk in r: ...`. Our
+  `_StreamReplay` wrapper (used on both the block-stub and
+  allow-replay streaming paths) only implemented the **sync**
+  iteration / context-manager protocol, so any LlamaIndex agent
+  whose LLM hit the streaming code path crashed on the first
+  chunk. The replay now satisfies both halves of the async
+  protocol (`__aiter__`, `__anext__`, `__aenter__`, `__aexit__`,
+  `aclose`) via a new `_StreamReplayAsyncIter` helper that walks
+  the same materialised chunk list the sync path uses, so a
+  single replay can be consumed by either iteration flavour.
+
+- **LlamaIndex agent runs are now correctly grouped into a single
+  `RunContext` instead of fragmenting into a wrap-side empty run
+  plus N "legacy" inner runs.** `FunctionAgent.run()` returns
+  immediately with a `WorkflowHandler`, but the actual LLM calls
+  happen later on the handle's internal `_result_task`. The
+  previous `kind="sync"` patch closed the `RunContext` as soon as
+  `run()` returned the handle — every inner LLM call then saw
+  `current_run() is None`, opened its own ephemeral run with
+  `framework="legacy"`, and the dashboard's run waterfall lost
+  the workflow's structure entirely. A new `kind="handler"` wrap
+  in `egisai._patches._framework` opens the run + pushes
+  identity, calls `orig()` (which constructs the workflow's
+  internal asyncio tasks under our captured contextvars), then
+  hooks `add_done_callback` on `handle._result_task` to finalise
+  the run when the workflow actually completes. The parent task's
+  contextvars are restored before returning so user code after
+  `agent.run(...)` sees a clean stack. Falls back to sync close
+  when `_result_task` is absent (older LlamaIndex, fakes used in
+  unit tests). Inner LLM calls now correctly attribute to the
+  framework-stamped Run with the workflow's identity, matching
+  the per-Run waterfall every other framework wrap produces.
+
+## [0.25.6] — 2026-05-14
+
+### Fixed
+
+- **AutoGen ``AssistantAgent.run`` survives ``on_block="stub"``
+  without crashing on ``'types.SimpleNamespace' object has no
+  attribute 'model_dump'``.** ``autogen-ext.models.openai`` calls
+  ``response.model_dump()`` directly to populate its
+  ``LLMCallEvent`` log payload after every chat completion (see
+  ``_openai_client.py`` line 719) — a bare ``SimpleNamespace``
+  stub crashed with ``AttributeError`` between the gate returning
+  the verdict and the agent surfacing it to the operator. The
+  OpenAI patch's non-streaming block stub now builds a real
+  upstream Pydantic ``ChatCompletion`` (with
+  ``ChatCompletionMessage``, ``Choice``, ``CompletionUsage``
+  inside), so ``.model_dump()`` round-trips cleanly while every
+  existing attribute path the SDK contract tests pin
+  (``response.choices[0].message.content``,
+  ``response.usage.completion_tokens_details.reasoning_tokens``,
+  ``response.model``, ``response.system_fingerprint``,
+  ``response.service_tier``, …) keeps working. The streaming
+  block stub (added in v0.25.5 for the LangChain ``AgentExecutor``
+  path) already used real ``ChatCompletionChunk`` instances and
+  is unaffected. The ``SimpleNamespace`` fallback path remains
+  for the rare case where Pydantic construction fails (very old
+  ``openai`` pin or future shape change), matching the posture of
+  every other ``_build_*`` helper in this file.
+
+## [0.25.5] — 2026-05-14
+
+### Fixed
+
+- **LangChain ``AgentExecutor.invoke`` survives ``on_block="stub"``
+  without crashing on ``'types.SimpleNamespace' object does not
+  support the context manager protocol``.** The classic
+  ``AgentExecutor`` (both LangChain 0.x and ``langchain-classic``
+  on 1.x) defaults to ``stream_runnable=True``, which forces the
+  inner ``ChatOpenAI`` call down ``_stream`` →
+  ``self.client.create(stream=True)`` → ``with response as
+  response: for chunk in response: ...``. The OpenAI patch's
+  block-stub used to return a bare ``SimpleNamespace`` regardless
+  of ``stream=``, so the ``with`` step raised ``TypeError`` before
+  the policy verdict ever reached the operator. We now detect
+  ``stream=True`` and return a streaming-shaped replay that
+  satisfies both the context-manager and iteration protocols and
+  yields real upstream ``ChatCompletionChunk`` objects (with
+  ``.model_dump()``) so the framework's chunk-to-generation
+  converter keeps working unchanged.
+
+- **Streaming OpenAI calls now record real ``tokens_in`` /
+  ``tokens_out`` / ``cost_usd`` on the audit row.** When the
+  caller asked for ``stream=True`` (LangChain's default agentic
+  path, plus any direct streaming user code), the gate previously
+  ran ``_extract_chat_usage`` against the upstream ``Stream``
+  before iteration had drained it — ``.usage`` wasn't yet
+  populated, so every streamed turn shipped to the dashboard with
+  zero tokens and a NULL cost. The same blind spot affected
+  ``extract_openai_chat`` on the output policy phase, which only
+  saw an empty ``choices`` accessor and silently skipped
+  evaluation. The OpenAI patch now materialises the upstream
+  ``Stream`` into a re-iterable replay that exposes the
+  aggregated ``choices[0].message`` (content + reassembled
+  ``tool_calls`` across deltas) and the final-chunk ``usage`` on
+  its response surface — so per-tool waterfall emission, output
+  semantic_guard / deny_tool_call / deny_output_regex, and token
+  accounting all keep working on streaming turns. ``AsyncStream``
+  follows the same path via the async sibling.
+
+## [0.25.4] — 2026-05-14
+
+### Fixed
+
+- **LangChain patch covers both ``langchain.agents.AgentExecutor``
+  (LangChain 0.x) and ``langchain_classic.agents.AgentExecutor``
+  (LangChain 1.x).** LangChain 1.0 removed ``AgentExecutor`` from
+  ``langchain.agents`` and shipped the pre-1.0 agentic surface as
+  the dedicated back-compat package ``langchain-classic``. Users
+  on LangChain 1.x who install ``langchain-classic`` to keep the
+  classic ``AgentExecutor.invoke`` /  ``ainvoke`` / ``stream``
+  surface now get their executors patched and attributed with
+  ``identity_source="framework:langchain"`` exactly as on 0.x.
+  The patch tries each home independently — neither installed →
+  silent no-op (legacy behaviour); only one installed → that one
+  gets patched; both installed (transition envs) → both get
+  patched. The modern ``langchain.agents.create_agent`` path is
+  unchanged and continues to be covered transparently by the
+  ``langgraph`` patches via MRO on its returned
+  ``CompiledStateGraph``.
+
+## [0.25.3] — 2026-05-13
+
+### Fixed
+
+- **Agno agents survive ``on_block="stub"`` without crashing on
+  ``'types.SimpleNamespace' object has no attribute 'audio'``.**
+  Agno's ``OpenAIChat._parse_provider_response`` reads
+  ``response_message.audio`` and ``response.model_extra``
+  *unguarded* (no ``hasattr`` check on either site), so any
+  block-stub returned to it raised ``AttributeError`` the moment
+  a policy fired. The fix lives entirely in
+  ``_patches/agno.py``: a tiny shim wraps
+  ``OpenAIChat._parse_provider_response`` and pre-populates the
+  unguarded fields with ``None`` *only* when the response carries
+  our ``egis`` block-stub sentinel — real ``ChatCompletion``
+  objects pass through untouched. No other framework's stub
+  contract changes. The wrap is idempotent and applied once per
+  ``init()``.
+
+## [0.25.2] — 2026-05-13
+
+### Fixed
+
+- **HTTP fallback no longer enqueues phantom audit rows for the
+  OpenAI Agents SDK's tracing uploads.** Every time
+  ``Runner.run`` returned, the ``openai-agents`` SDK's
+  ``BackendSpanExporter`` POSTed its trace payload to
+  ``https://api.openai.com/v1/traces/ingest`` via its own
+  ``httpx.Client``. Our ``_patches/http`` fallback's
+  ``_looks_like_model_call`` matched the URL on host alone
+  (``"api.openai.com" in url``), so each tracing upload became a
+  second audit event with ``model="unknown"``,
+  ``verdict="allow"``, no prompt preview, and the app name as the
+  agent — surfacing on the dashboard as a ghost run alongside
+  every legitimate ``Runner.run`` invocation. The fallback now
+  requires BOTH a known LLM-provider host AND a known model-call
+  path token (``/chat/completions``, ``/responses``,
+  ``/messages``, ``:generateContent``, ``/openai/deployments``,
+  …) before logging, which silently drops tracing, files, audio,
+  images, threads, moderations, and any other ancillary
+  endpoint that happens to share the host. Same posture applies
+  to the Anthropic, Google Gemini, Together, Groq, Cohere, and
+  Mistral hosts. Dedicated provider patches still cover the
+  in-band model call — the fallback only matters for transports
+  we don't have a first-class adapter for.
+
+---
+
+## [0.25.1] — 2026-05-13
+
+### Fixed
+
+- **Block-stub responses now mirror the upstream provider SDK's
+  attribute shape.** When a policy fires with `on_block="stub"`,
+  every patched provider returns a `types.SimpleNamespace` posing
+  as the real SDK response. Agentic frameworks
+  (`openai-agents`, `langchain-openai`, LangGraph, CrewAI, …)
+  consume that stub as if it were a real response — they walk
+  `response.usage.<field>`, `response.output[].content[].text`,
+  etc. directly. Several fields the upstream SDKs read
+  unconditionally were missing from our stubs, so any agentic
+  loop that hit a blocking policy crashed with
+  `AttributeError` on the *next* statement after `egisai`
+  returned. Concretely:
+  - **OpenAI Responses API** (`gpt-5`, `gpt-4o`, …):
+    `usage.input_tokens_details` and
+    `usage.output_tokens_details` are non-Optional on
+    `openai.types.responses.ResponseUsage`, and the
+    `openai-agents` Runner reads both at
+    `agents/models/openai_responses.py:495`. A stub without them
+    crashed the Runner with
+    `AttributeError: 'types.SimpleNamespace' object has no
+    attribute 'input_tokens_details'` the moment a blocking
+    policy fired. *Both* sub-objects are now constructed as
+    real upstream `InputTokensDetails` / `OutputTokensDetails`
+    Pydantic instances — a bare `SimpleNamespace` with the right
+    attribute names was still rejected by the agents-SDK's own
+    `Usage` Pydantic dataclass (which validates via
+    `isinstance`). Same treatment applied to the `output[]`
+    items: real `ResponseOutputMessage` / `ResponseOutputText`
+    instances so the subsequent
+    `ModelResponse(output=response.output, ...)` Pydantic
+    construction succeeds. The stub also now carries
+    `output_text` / `incomplete_details` / `error` for
+    frameworks that read those convenience fields.
+  - **OpenAI Chat Completions API**:
+    `usage.prompt_tokens_details` (`audio_tokens`,
+    `cached_tokens`) and `usage.completion_tokens_details`
+    (`accepted_prediction_tokens`, `audio_tokens`,
+    `reasoning_tokens`, `rejected_prediction_tokens`) sub-objects
+    — constructed as real upstream `PromptTokensDetails` /
+    `CompletionTokensDetails` Pydantic instances for the same
+    reason — plus `message.tool_calls`, `choice.logprobs`,
+    `system_fingerprint`, `service_tier`, `created`.
+  - **Anthropic Messages API**: `usage.cache_creation_input_tokens`,
+    `usage.cache_read_input_tokens`, `usage.server_tool_use`,
+    `usage.service_tier`, plus top-level `stop_sequence` and
+    `container`. Fixes LangChain `ChatAnthropic` and CrewAI's
+    Anthropic adapter.
+  - **Google `google-genai` and `google.generativeai`**:
+    `usage_metadata.cached_content_token_count`,
+    `thoughts_token_count`, `tool_use_prompt_token_count`, the
+    `*_tokens_details` sub-objects, plus `function_calls`
+    aggregator, `model_version`, `response_id`. Fixes
+    LangChain `ChatGoogleGenerativeAI` and Vertex Agent
+    Builder shims.
+  Behavior of the gate itself is unchanged — same verdicts, same
+  audit fields, same `egis.blocked` marker on every stub. Only
+  the shape of the synthetic response object grew.
+
+### Added
+
+- **Contract test `test_block_stub_provider_sdk_shape.py`.** Pins
+  the exact attribute access pattern every supported framework
+  performs against a blocked stub. When a future upstream SDK
+  adds another required field, the failing assertion points
+  straight at the stub factory to patch — no more debugging
+  through 5-frame stack traces in customer agent loops.
+
+---
+
+## [0.25.0] — 2026-05-13
+
+### Added
+
+- **First-call gate for the Presidio + spaCy PII analyzer.** Before
+  0.25, a model call that fired within ~1 s of `egisai.init()` raced
+  the background daemon thread that warms the NER analyzer — meaning
+  the **first call of a fresh process could silently drop name /
+  address / GDPR-special-category detection**, falling back to the
+  regex chain (which only catches SSN / credit card / IBAN / email /
+  phone / API key / IP / MAC). Long-running services were unaffected
+  (the analyzer is warm long before request #1), but test harnesses,
+  demo scripts, and AWS Lambda cold starts routinely hit this. Worse,
+  the regression was invisible — the call returned `allow`, the
+  audit row showed no PII findings, and the operator believed their
+  policy was on.
+
+  0.25 wires a one-shot gate inside `egisai._evaluator.evaluate()`
+  and `evaluate_output()` that, on the **first** policy phase of the
+  process, briefly blocks waiting for the analyzer to warm — but
+  **only when** the org has at least one active `pii_scan` rule
+  scoped to this call. After call #1 the gate is permanently off
+  (the analyzer is either warm or has hard-failed; waiting again
+  serves no one).
+
+  Conditions for the wait to actually fire:
+
+  1. No previous call in this process burned the one-shot.
+  2. A `pii_scan` rule is in scope after `_scope_filter` (semantic-
+     only orgs pay zero overhead).
+  3. The analyzer isn't already warm (steady-state services skip
+     the wait entirely on a single attribute read).
+  4. `EGISAI_PII_WARMUP_TIMEOUT_SECS` > 0 (operators on Lambda /
+     latency-sensitive paths can opt out by setting it to `0`).
+
+  Default cap: **2.0 seconds**. Tunable via the new env var
+  `EGISAI_PII_WARMUP_TIMEOUT_SECS` (read on every gate invocation,
+  so a runtime change takes effect without a restart). On timeout
+  OR load failure the SDK falls through to the regex chain — the
+  privacy contract for structured PII (SSN / CC / IBAN / email /
+  phone / API key) is unaffected, only the NER-derived entities
+  (names, addresses, GDPR special categories) are deferred.
+
+  Observability: routed through ``logging.getLogger("egisai.evaluator")``
+  rather than ``sys.stderr`` so the success path is silent by
+  default (the gate firing in the happy case is invisible — the
+  operator's terminal stays clean). Ops who want to track cold-
+  start cost in a structured log pipeline (Datadog, CloudWatch,
+  Loki) attach a handler at INFO level and they'll see one
+  ``waited N ms`` line per process. The **timeout** branch logs at
+  WARNING level so default logging configs DO catch it — a
+  timeout is an honest degradation (THIS call ran with regex-only
+  PII detection on call #1) and operators need to know.
+
+  Why we did NOT take the obvious alternatives:
+
+  * A blocking `init()` kwarg (`wait_for_pii_engine_secs=2.0`) was
+    rejected — it regresses `init()` from instant to ~2 s for every
+    Lambda cold start AND every CLI tool that imports egisai, even
+    when the first call wouldn't have needed the analyzer. The
+    in-evaluator gate fires only when a PII rule is actually about
+    to run, so semantic-only workloads stay fast.
+  * Always waiting on every call was rejected — call #2 in a
+    long-running service must never pay this cost.
+
+### Changed
+
+- `egisai.policy._pii_loader.wait_for_warm(timeout_secs)` is now
+  part of the public-internal surface. The function is `Event`-based
+  (no busy-polling), returns `True` if the analyzer settled warm,
+  `False` on timeout or hard failure. Available for callers that
+  want to drive their own cold-start coordination (custom test
+  harnesses, health endpoints).
+
+---
+
+## [0.24.0] — 2026-05-13
+
+### Added
+
+- **`semantic_guard` policies can now intent-classify tool calls,
+  not just text.** Operators can describe forbidden agent behavior
+  in plain English — `"delete all users"`, `"block any lookup
+  request"`, `"wipe the production database"` — and the SDK asks
+  the platform judge, **before** the tool dispatches, whether THIS
+  specific call matches THAT intent. The match returns `block` ⇒
+  the PreToolUse hook returns `permissionDecision: deny` ⇒ the
+  Node CLI never executes the tool ⇒ audit row stamps
+  `enforcement_status="enforced"`. This closes the gap that
+  `deny_tool_call` (pattern-only) and prose-side `semantic_guard`
+  (text-only) couldn't cover — a model that decides to call a
+  destructive tool the operator never enumerated by name still
+  gets caught by an intent rule. Opt-in via a new `targets` field
+  on the rule config:
+
+  ```json
+  {
+    "type": "semantic_guard",
+    "name": "Forbid destructive actions",
+    "config": {
+      "intents": ["wipe the production database", "delete all users"],
+      "targets": ["text", "tool_calls"],
+      "message": "Refused: agent attempted a destructive action."
+    }
+  }
+  ```
+
+  `targets` defaults to `["text"]`, which preserves byte-for-byte
+  behavior of every pre-0.24 `semantic_guard` rule (no silent
+  meaning change on upgrade). When `targets` includes
+  `"tool_calls"`, the matcher synthesizes one natural-language
+  sentence per pending tool call —
+
+      "The agent is requesting to invoke tool 'X' with arguments {...}"
+
+  — sends each to the existing `/v1/sdk/judge` endpoint, and
+  short-circuits on the first match for cost control. The blame
+  attribution in the audit row's `matched_policy` message names
+  the specific tool that tripped the rule.
+
+- **Privacy contract for the new path.** Tool arguments are
+  PII-label-redacted via `pii_scanner.label_redact` **before**
+  they reach the judge, per `security-and-compliance.mdc` §1
+  ("PII never leaves the SDK boundary in raw form, including our
+  own LLM-based policy judges"). Intent classification accuracy
+  is preserved because the judge cares about the verb/noun shape
+  ("the agent is deleting `<NAME>`"), not the exact identifier
+  values. The two-phase contract from §2 still holds:
+  deterministic Phase 1 rules (`deny_tool_call`, etc.) get the
+  first look at every tool call; the judge is only consulted
+  when Phase 1 didn't already block.
+
+- **No framework patch changes required.** The `claude_agent_sdk`
+  PreToolUse hook, every OpenAI / Anthropic / Google / Bedrock
+  end-of-turn output policy evaluation, and every other path
+  through `evaluate_output` already pass `tool_calls` into the
+  evaluator. The matcher change alone wires `targets:
+  ["tool_calls"]` into all of them.
+
+### Test coverage
+
+- New `tests/test_semantic_guard_tool_calls.py` (15 tests) —
+  matcher behavior on every targets shape, short-circuit on first
+  match, multi-tool blame attribution, backwards-compat for
+  pre-0.24 rules, PII redaction of tool args, malformed input
+  defense, output-side eval routing.
+- Extended `tests/test_claude_agent_sdk_pretooluse.py` (+ 3
+  tests) — the reported scenario in one test: a `semantic_guard`
+  rule with intent "block any lookup request" + `targets:
+  ["tool_calls"]` denies `mcp__support__lookup_customer` on its
+  first hop, with `enforcement_status="enforced"`. A conjugate
+  test pins that benign tools pass cleanly. A third test pins the
+  most dangerous regression — a legacy rule (no `targets` field)
+  MUST NOT round-trip the judge for tool calls.
+
+---
+
+## [0.23.0] — 2026-05-12
+
+### Added
+
+- **Per-tool waterfall on every direct LLM provider** — The
+  multi-step ``model_call`` → ``tool_call`` audit timeline
+  previously emitted only on the OpenAI Chat / Responses
+  patches is now consistent across every direct LLM provider:
+  Anthropic Messages, Google GenAI (``google.genai``), Google
+  legacy (``google.generativeai``), and AWS Bedrock Converse.
+  An operator reading a Run never sees "this provider collapses
+  tools, that one doesn't" — the timeline reads identically
+  end-to-end regardless of which model the agent's call
+  fanned out to.
+
+### Fixed — privacy contract
+
+- **``payload_preview`` is now label-redact aware** —
+  ``egisai._events.safe_preview`` shipped raw ``repr(payload)``
+  to the wire on the input-side block path (the path that
+  raises ``PermissionError``, where no later code re-set the
+  preview). A prompt with an unflagged SSN inside an
+  immutable payload could land on the audit envelope. The
+  preview now passes through ``label_redact`` before
+  truncation, so even an inadvertent leak surfaces as
+  ``<SSN>`` / ``<EMAIL>`` / ``<CREDIT_CARD>``. Same
+  treatment for sanitize / allow paths; the fix is centralized
+  so every framework patch benefits.
+- **Gemini ``contents="..."`` sanitize was a no-op on the
+  forward** — ``mutate_prompt_text`` updated
+  ``payload["contents"]`` in place, but Gemini's ergonomic
+  ``contents="..."`` shape passes the same string as a
+  kwarg; strings are immutable so the upstream SDK kept
+  shipping the raw bytes to Google. The genai + google
+  legacy patches now mirror the post-sanitization value
+  back into the forwarded kwargs. Same fix shape for
+  OpenAI Responses (``input="..."``) and AWS Bedrock
+  Agents (``inputText="..."``).
+- **``extract_payload_text`` / ``mutate_prompt_text`` handle
+  top-level string ``contents``** — Previously only the
+  list-of-dicts shape was scanned; the top-level string was
+  invisible to PII detectors. Fixed at the evaluator seam so
+  every patch that uses Gemini-style shapes picks up the
+  improvement transparently.
+
+### Added — battle-tested smoke battery
+
+Six new test files lock in the privacy + enforcement contracts
+across the full integration matrix. Run any of them in CI to
+verify the SDK still honors the runtime-governance posture:
+
+- ``tests/test_smoke_provider_battery.py`` (25 tests) —
+  per-provider battery: allow / sanitize / block / tool-block /
+  per-tool waterfall / privacy contract for OpenAI Chat,
+  Anthropic Messages, Google GenAI, and Bedrock Converse.
+- ``tests/test_smoke_framework_cascade.py`` (18 tests) —
+  end-to-end cascade for every Tier-2 framework
+  (``openai_agents`` / ``langgraph`` / ``langchain`` / ``crewai``
+  / ``autogen`` / ``agno`` / ``strands`` / ``pydantic_ai``)
+  composed with ``openai``: identity push + sanitize/block at
+  the downstream provider seam.
+- ``tests/test_smoke_privacy_contract.py`` (13 tests) —
+  cross-cutting "no raw bytes ever leave the SDK boundary"
+  invariants. Asserts the locked contract for both
+  ``payload_preview`` and the never-persisted model
+  response across all Tier-1 providers.
+- ``tests/test_smoke_bedrock_agent.py`` (7 tests) — pins the
+  advisory-but-honest contract for AWS Bedrock managed
+  agents. Includes the regression for the
+  ``inputText="..."`` sanitize bug fixed above.
+- Strengthened ``tests/test_claude_agent_sdk_governance.py``
+  with three new invariants: concurrent multi-client isolation
+  (no cross-talk between two ``ClaudeSDKClient`` instances),
+  same-identity concurrent independence (two parallel turns
+  with the same agent_id emit independent audit rows), and an
+  end-to-end zero-leak lifecycle probe (raw PII + model text
+  never appear on any audit envelope).
+- Strengthened ``tests/test_claude_agent_sdk_posttooluse.py``
+  with the multi-text MCP single-replace invariant: an MCP
+  tool returning multiple ``{type:text}`` parts that contain
+  PII collapses to a SINGLE post-sanitize text part (the
+  contract change of 0.22.x — never multiple post-sanitize
+  parts that could re-introduce the raw spans).
+
+## [0.22.3] — 2026-05-12
+
+### Changed
+
+- **`claude_agent_sdk` OUTPUT-phase audit stamping (SOC 2 / ISO honesty)** —
+  When aggregated output evaluation at ``ResultMessage`` replays structured
+  ``tool_calls`` from the subprocess, a blocking verdict now stamps
+  ``enforcement_status="advisory"`` on the parent ``model_call`` row instead
+  of claiming full pre-execution enforcement. Pure assistant-text violations
+  with PreTool hooks wired remain ``enforced``. Per-tool Hook blocks /
+  substitutions keep their existing ``tool_call`` / ``PostToolUse`` signals.
+  Documented in [README.md](./README.md) and [SECURITY.md](./SECURITY.md).
+
+## [0.22.2] — 2026-05-12
+
+### Fixed
+
+- **Claude Agent SDK run timeline** — Emit seq-0 ``model_call`` as soon as
+  input policy clears (before tool rows) and **finalize** that row when
+  ``ResultMessage`` arrives instead of appending the model step last, so the
+  dashboard reads Input policy → Model → tools → … in true chronological order.
+- **Duplicate “Allowed” tool steps** — Skip the stream-time
+  ``_dispatch_tool_call_step`` fallback when PreToolUse hooks are active; the
+  hook emits the authoritative row after ``AssistantMessage`` was processed but
+  before ``hook_decisions`` was populated, which doubled allow rows.
+- **Platform ingest** — Upsert ``request_logs`` rows when the same
+  ``(run_id, step_seq)`` arrives again (terminal merge) and recompute Run
+  aggregates from all steps so token/latency totals stay correct.
+
+## [0.22.1] — 2026-05-12
+
+### Fixed — `claude_agent_sdk` hook injection timing (SOC 2 / ISO 27001)
+
+Critical fix: 0.22.0 wired the `PreToolUse` + `PostToolUse`
+hook injection inside `_wrap_client_query`, which runs AFTER
+the user's `async with ClaudeSDKClient(...)` block has
+already triggered `__aenter__` → `connect()` → CLI
+subprocess init. Upstream `claude_agent_sdk.client.ClaudeSDKClient`
+reads `self.options.hooks` exactly ONCE inside `connect()`,
+ships the matcher table to the Node.js CLI as part of the
+`initialize` control message, and the CLI never re-reads it.
+Mutating `options.hooks` after `connect()` returned was a
+silent no-op — the CLI dispatched every tool with no
+governance round trip, and tool RESULTS were never
+policy-evaluated. The "Allowed" tool rows customers saw on
+the dashboard came from the legacy post-hoc
+`_dispatch_tool_call_step` fallback inside
+`receive_messages`, not from real hook decisions.
+
+Effect on customers: every tool call AND tool result on a
+`ClaudeSDKClient` path on 0.22.0 ran ungoverned. PII in CRM
+lookups, file reads, database rows, etc. round-tripped Claude
+unmasked. Module-level `claude_agent_sdk.query()` was
+unaffected because its wrapper injects hooks before calling
+the original (no `connect()` had run yet at that point).
+
+Fix: inject placeholder dispatchers into `options.hooks` at
+`connect()` time, BEFORE the upstream's matcher table is
+shipped. The placeholders are bound to the client instance
+and read the real per-turn callback off `self` at hook-fire
+time. The real callback is built inside `_wrap_client_query`
+(unchanged eager-binding logic) and stashed on
+`self.__egisai_pre_cb__` / `self.__egisai_post_cb__`. The CLI
+sees one stable placeholder ID per matcher; the callable it
+points to refreshes every turn. Both deny / sanitize paths
+are now genuinely enforced — verified by the regression test
+`test_hooks_injected_at_connect_time_not_query_time` which
+asserts hooks are present in `options.hooks` immediately
+after `__aenter__` returns and BEFORE the first `query()`.
+
+- **`_wrap_client_connect()`** — new wrapper for
+  `ClaudeSDKClient.connect`. Wraps connect (not `__aenter__`)
+  because users may call `await client.connect()` directly;
+  `__aenter__` internally calls `self.connect()` so wrapping
+  connect covers both code paths in one patch.
+- **`_make_pretooluse_dispatcher(client_self)`** +
+  **`_make_posttooluse_dispatcher(client_self)`** —
+  placeholder async callbacks bound to a client instance. At
+  fire time they look up `self.__egisai_pre_cb__` /
+  `__egisai_post_cb__` and delegate; if no turn is in flight,
+  they fail open with `{}` (no decision) per
+  `sdk-design-philosophy.mdc` §5.
+- **`INFLIGHT_PRE_CALLBACK_ATTR`** + **`INFLIGHT_POST_CALLBACK_ATTR`**
+  — new client-instance attributes the dispatchers read.
+  Cleared on every `_clear_inflight()` so callbacks from a
+  closed turn can't accidentally fire on a fresh turn.
+- **`tests/test_claude_agent_sdk_posttooluse.py::test_hooks_injected_at_connect_time_not_query_time`**
+  — regression test asserts that immediately after
+  `__aenter__` (i.e., after `connect()` completed but BEFORE
+  any `query()` call), both `PreToolUse` and `PostToolUse`
+  matchers are present in `options.hooks`. If a future
+  refactor moves injection back into `query()`, this test
+  fails loudly.
+- **`tests/test_enforcement_matrix.py::test_claude_agent_sdk_wraps_connect_for_hook_injection`**
+  — structural guarantee: the patch MUST expose
+  `_wrap_client_connect`, `_make_pretooluse_dispatcher`,
+  and `_make_posttooluse_dispatcher`. Locks the API surface
+  for the SOC 2 / ISO 27001 enforced claim on Tier 3a.
+- **Test fakes updated**:
+  `tests/test_claude_agent_sdk_pretooluse.py` and
+  `tests/test_claude_agent_sdk_posttooluse.py` now mirror the
+  real SDK pattern — `__aenter__` calls `connect()` — so the
+  new wrap actually fires in tests. Without this the tests
+  would only exercise the broken pre-0.22.1 code path.
+
+Customers on 0.22.0 should upgrade immediately. There is no
+migration step beyond `pip install --upgrade egisai`; the
+public API is unchanged.
+
+---
+
+## [0.22.0] — 2026-05-12
+
+### Added — `claude_agent_sdk` PostToolUse hook gates tool *results*
+
+The 0.21 release wired `PreToolUse` into the policy engine so
+tool / MCP **inputs** could be hard-gated before the Node.js
+subprocess dispatched them. 0.22 closes the symmetric SOC 2 /
+ISO 27001 / GDPR gap on the **output** side: the
+`claude_agent_sdk` patch now also injects a `PostToolUse` hook
+that fires AFTER the tool runs but BEFORE Claude is shown the
+result. Output-side `pii_scan` / `deny_output_regex` /
+`semantic_guard` policies evaluate the tool's response text and
+the SDK swaps the result in place via the CLI's
+`updatedToolOutput` / `updatedMCPToolOutput` substitution
+contract — so a CRM lookup that returns a customer's email or
+SSN gets masked (sanitize verdict) or replaced with a
+recoverable denial payload (block verdict) before the model
+ever sees the raw bytes.
+
+This was the only seam in the matrix where a tool result could
+round-trip the model unmasked. Bug originally reported by a
+customer running a multi-agent harness against the SDK: every
+tool step showed `verdict=allow` on the dashboard even when the
+tool returned validated PII, because policy evaluation happened
+only on the tool's **input args** (PreToolUse) and on the
+model's **assistant text** at end-of-turn. The tool's **result**
+itself was never policy-evaluated. After 0.22, the audit
+trail carries a dedicated `tool_result` step row per affected
+tool with `verdict=sanitize|block`, `matched_policy`,
+`sanitizations`, and a post-redaction `request_text` preview —
+so SOC 2 auditors querying "what tool results did we refuse?"
+get a faithful answer attributed to the offending tool, not to
+the end-of-turn `model_call`.
+
+- **`_build_posttooluse_callback()`** — builds a hook closure
+  bound to the turn's identity record + Run context. Extracts
+  the tool response text from MCP-shaped (`{"content": [{"type":
+  "text", "text": "..."}]}`), raw-string, or opaque-JSON
+  responses; runs `evaluate_output(OutputCall(text=...,
+  allow_sanitize=True))`; on sanitize masks via `pii.sanitize`,
+  on block builds a denial payload, on allow returns `{}` (the
+  cheap-path is the common path). Emits a `tool_call` step row
+  with `target=...tool_result` only when the verdict is not
+  allow, so the dashboard timeline stays clean.
+- **`_extract_tool_response_text()`** + **`_rewrite_tool_response()`**
+  — handle the three response shapes (`mcp`, `string`, `json`)
+  with shape-preserving substitution. Non-text MCP parts
+  (images, audio) pass through unmodified so we don't
+  accidentally strip a tool's legitimate non-text content.
+- **`_inject_posttooluse_hook()`** — mirrors the PreToolUse
+  injector: shallow-copies any existing `options.hooks` dict,
+  appends our matcher to the `PostToolUse` slot, writes back.
+  User-supplied PostToolUse hooks remain in place; the CLI
+  runs all of them.
+- **`OutputPolicyContext.allow_sanitize`** + **`OutputCall.allow_sanitize`**
+  (new field, default `False`) — flips `pii_scan` from "always
+  block on the output side" to "honour the operator's action
+  config". Only the PostToolUse path sets it to `True`; every
+  other output caller's behavior is byte-for-byte identical to
+  0.21. This is what makes `pii_scan` with `action="sanitize"`
+  actually mask the email in the tool result (vs. coerce to
+  block as on response-text paths that have no atomic
+  mutation surface).
+- **Privacy contract preserved** — the step row's
+  `request_text` is sampled from the POST-sanitize / POST-denial
+  text. Raw PII goes out of scope as soon as the policy
+  decision is computed (per `security-and-compliance.mdc` §1, §5).
+- **Fail-open** — any exception in the PostToolUse callback
+  returns `{}` so a buggy policy never bricks the customer's
+  agent (per `sdk-design-philosophy.mdc` §5).
+
+The patch covers both `ClaudeSDKClient.query` (streaming) and
+the module-level `claude_agent_sdk.query()` one-shot, mirroring
+the PreToolUse wiring exactly.
+
+### Changed — `bedrock_agent.py` docstring tightened to call out tool-result advisory gap
+
+AWS Bedrock Agents run Action Groups on AWS-managed
+infrastructure with no equivalent of `PostToolUse`. The
+docstring now explicitly tells SOC 2 / GDPR / HIPAA-bound
+customers that PII in Action Group results is leaked to the
+model and lists two escape hatches: `claude_agent_sdk` for
+agentic workloads (PostToolUse enforced), or the standalone
+`bedrock-runtime` Converse API with the agentic loop driven in
+Python (next-call input phase catches tool-result PII).
+
+### Added — `tests/test_claude_agent_sdk_posttooluse.py`
+
+15 tests covering the full PostToolUse contract:
+
+- Hook injected alongside PreToolUse on every `query()`.
+- User-supplied PostToolUse hooks compose without clobbering.
+- PII in MCP-shaped tool result → masked via
+  `updatedMCPToolOutput`, raw value gone.
+- PII in MCP-shaped tool result with `action="block"` →
+  denial payload via `updatedMCPToolOutput`, model can recover.
+- Raw-string tool result (Bash, Read, …) → replaced via
+  `updatedToolOutput` (NOT `updatedMCPToolOutput` — the field
+  the CLI looks at depends on the shape).
+- Opaque-dict tool result → JSON-serialized for scanning,
+  replaced via `updatedToolOutput`.
+- Allow path: no substitution, no extra step row (cheap path
+  stays cheap).
+- Empty / image-only / `None` responses skip evaluation
+  without crashing.
+- `deny_output_regex` fires on tool result text (catches
+  secrets / API keys / proprietary identifiers that aren't
+  standard PII).
+- Multi-tool turn: each tool's result independently gated;
+  only non-allow tools emit step rows.
+- `PreToolUse` deny → `PostToolUse` never fires for that
+  tool (subprocess never dispatched it).
+- Identity scope propagates into the hook closure (separate
+  asyncio task; contextvars don't carry).
+- Fail-open on policy crash.
+- Raw PII never lands on the audit row preview.
+
+### Added — `tests/test_tool_result_extraction_cross_framework.py`
+
+7 regression tests locking in the cross-framework guarantee:
+for every patched framework whose agentic loop runs in Python
+(OpenAI / Anthropic / Google GenAI direct + every framework
+that delegates to one of them — LangChain, LangGraph, CrewAI,
+Pydantic-AI, LlamaIndex, AutoGen, Agno, Smolagents, Google
+ADK, Strands, OpenAI Agents), tool results round-trip through
+the next call's input phase. The tests pin
+`extract_prompt_text` / `extract_anthropic_prompt` /
+`extract_gemini_prompt` / `extract_payload_text` so they don't
+silently stop walking tool-result blocks on a refactor.
+
+End-to-end glue test
+`test_pii_scan_fires_on_anthropic_next_call_with_tool_result`
+verifies a `pii_scan` rule on the input side actually blocks a
+follow-up call whose `messages` contain a `tool_result` block
+with an SSN — i.e. the SOC 2 contract holds for the direct-LLM
+case even without the new PostToolUse hook.
+
+---
+
+## [0.21.0] — 2026-05-12
+
+### Added — `claude_agent_sdk` PreToolUse hook hard-gates tool / MCP calls
+
+The `claude_agent_sdk` patch now injects a `PreToolUse` hook into
+`ClaudeAgentOptions.hooks` at every `query()` / `ClaudeSDKClient`
+boundary. The hook routes every tool / MCP dispatch through our
+policy engine **before** the Node.js subprocess runs the tool, so
+`deny_tool_call` / `deny_mcp_call` / `semantic_guard` on tool calls
+become real pre-execution enforcement rather than post-hoc audit.
+
+Previously, `claude_agent_sdk` was the only framework in the matrix
+that stamped tool-block audit rows as `enforcement_status="advisory"`
+because the CLI executed tools in a subprocess before Python ever
+saw the `ToolUseBlock`. With 0.21, the hook fires on the control
+channel before dispatch; we evaluate policies, return `permissionDecision`,
+and the CLI either runs the tool or synthesizes a denial result.
+Audit rows for these calls now stamp `enforcement_status="enforced"`,
+matching every other framework in the matrix.
+
+- **Pre-execution gate** — `_build_pretooluse_callback()` builds a
+  closure that runs `evaluate_output` on the tool dispatch, captures
+  the identity scope and run context (contextvars don't propagate
+  to the SDK's hook task), emits the per-tool step row, and returns
+  `{"hookSpecificOutput": {"permissionDecision": "allow" | "deny", ...}}`
+  to the CLI.
+- **User-hook composition** — If the user already passed their own
+  `PreToolUse` hooks in `options.hooks`, our matcher is **appended**
+  to the list rather than replacing it. The SDK runs all matchers;
+  any one returning `deny` denies the call.
+- **Feature-detected** — `_hooks_supported()` checks for the
+  `hooks` field on `ClaudeAgentOptions` and the `HookMatcher` class.
+  Older SDK versions without the hook API fall back to the legacy
+  post-hoc advisory mode; audit rows in fallback mode are honestly
+  labelled `enforcement_status="advisory"`.
+- **Fail-open on policy errors** — A buggy policy that raises in
+  the hook is caught and treated as `allow`; the user's agent never
+  gets bricked by our policy engine misbehaving (per
+  `sdk-design-philosophy.mdc`).
+- **No double-emission** — When the hook ships a `tool_call` step,
+  the receive-side fallback emitter sees the `tool_use_id` in the
+  in-flight decisions dict and skips its redundant row. Audit logs
+  show exactly one step per tool dispatch.
+
+The patch covers both `ClaudeSDKClient.query` (streaming) and the
+module-level `claude_agent_sdk.query()` one-shot.
+
+### Added — cross-framework enforcement matrix in README
+
+`README.md` now ships a locked enforcement matrix documenting which
+of the 19 supported frameworks gate tool / MCP calls
+pre-execution (`enforced`) versus post-hoc audit (`advisory`).
+After this release, **only** AWS Bedrock Agents stamps advisory —
+and `SECURITY.md` explicitly names that limitation so customers
+can risk-assess accordingly. A new test
+(`tests/test_enforcement_matrix.py`) asserts the matrix in code
+stays in sync with the README and SECURITY.md so doc drift fails CI.
+
+### Added — comprehensive `PreToolUse` hook test suite
+
+`tests/test_claude_agent_sdk_pretooluse.py` (17 tests) covers:
+
+- Hook injection composes with user-supplied `PreToolUse` matchers
+  without clobbering them.
+- Hook returns `allow` on no-policies / safe tools.
+- Hook returns `deny` on `deny_tool_call` matches with a descriptive
+  `[egisai] …` reason embedded for the model's next-turn context.
+- MCP namespaced tool names (`mcp__<server>__<tool>`) are parsed
+  and matched against `deny_mcp_call` rules.
+- Each `tool_use_id` is gated independently in a multi-tool turn.
+- Per-tool `tool_call` step rows stamp `enforcement_status="enforced"`
+  when the hook fires; no duplicate rows from the receive-side
+  fallback emitter.
+- End-of-turn `model_call` row stamps `enforced` (matching OpenAI /
+  Anthropic / Google direct patches) when hooks were active for
+  the turn.
+- Legacy `ClaudeAgentOptions` without the `hooks` field falls back
+  to the pre-0.21 advisory path; existing audit semantics preserved.
+- Identity propagates correctly into the hook closure (contextvars
+  don't cross the SDK's task boundary; we re-enter `identity_scope`
+  inside the callback).
+- **Demo scenario**: "agent decides to delete all users via MCP"
+  is hard-blocked at the hook before AWS receives the call.
+- Bash commands that match a `deny_tool_call` on `^Bash$` are
+  blocked pre-execution.
+- Chain-of-tools: read → process → write where `write_file` is
+  denied leaves the first two with `allow`/enforced and the third
+  with `block`/enforced — independently gated per tool.
+- Policy engine raising in the hook fails OPEN, the agent keeps
+  running.
+
+### Changed — `_run_output_phase` enforcement-status semantics
+
+End-of-turn `model_call` audit rows in `claude_agent_sdk` now stamp:
+
+- `enforced` on the allow path (no policy fired — there was nothing
+  to enforce against). Unchanged from 0.20.
+- `enforced` on the block path **when hooks were active for the
+  turn**. New in 0.21.
+- `advisory` on the block path **when hooks were NOT active**
+  (older SDK / custom transport bypass). Unchanged from 0.20.
+
+Sanitize paths and allow paths remain `enforced` in all cases.
+
+### Removed — nothing externally visible
+
+No public API removed. The pre-existing single-row advisory
+behavior is preserved as the fallback path for legacy SDK
+versions.
+
+---
+
+## [0.20.0] — 2026-05-12
+
+### Added — per-tool `tool_call` steps for OpenAI
+
+OpenAI integrations (Chat Completions and the Responses API,
+sync and async) now emit one `tool_call` step per tool the
+model invokes, in addition to the parent `model_call` step.
+The dashboard's run timeline now reads top-to-bottom as a clear
+multi-step waterfall:
+
+```
+Prompt received
+  → Input policy   (Allowed / Sanitized / Blocked)
+  → Model call
+  → Output policy  (Allowed / Sanitized / Blocked)
+  → Tool · lookup_customer
+  → Tool · send_email
+  → Input policy
+  → Model call
+  → Output policy
+  → … → Returned to your code
+```
+
+Each per-tool step carries the tool's name and a
+**label-redacted** preview of its arguments (`label_redact` + 2
+KB truncation, identical to the existing tool-input sanitizer
+used by `claude_agent_sdk`). The SDK never persists raw tool
+arguments — if the model emitted a free-text PII argument, the
+operator sees `<EMAIL>` / `<SSN>` / etc. on the timeline.
+
+`enforcement_status` on these per-tool steps is `"enforced"`:
+the parent `model_call`'s output policy had a chance to refuse
+the tool request before this response left the gate. (Contrast
+with `claude_agent_sdk`, whose per-tool steps are marked
+`"advisory"` because the Node.js subprocess executes tools
+before Python sees them.)
+
+The per-tool emission only fires when an agentic framework
+(`Runner.run`, the auto-detected agent loop, …) has opened a
+Run above the gate. Raw `client.chat.completions.create()`
+calls without an agent wrap continue to emit a single legacy
+event the backend synthesises into a one-step Run on ingest —
+that preserves wire compatibility for every pre-0.20 SDK
+running in production today.
+
+### Changed — every policy enforcement layer is visible on the dashboard
+
+The run timeline modal now **always** renders the Input policy
+box and Output policy box for every `model_call` step, even
+on a plain `allow` with no matched rule. Pre-0.20 the policy
+boxes were collapsed away on allow paths, which made it hard
+to confirm at a glance that a clean run had in fact been
+evaluated.
+
+The visual contract is now:
+
+- **Allowed** — small green shield box with "Prompt cleared
+  every input-side rule" / "Response cleared every output-side
+  rule". The matched-policy chip is omitted because nothing
+  fired; the box's presence alone communicates "policy ran,
+  result was clean".
+- **Sanitized** — yellow box with the matched rule + redaction
+  summary (`Redacted: 2 SSNs and 1 email`). On the input side
+  the box also carries the masked prompt body.
+- **Blocked (enforced)** — red box with the matched rule. When
+  the **input** phase enforces a block, the timeline terminates
+  immediately at the red box (no follow-up Model or Output
+  boxes) — "if it's red, that's the end of the flow".
+- **Blocked (advisory)** — yellow box with an `advisory` chip
+  and a one-paragraph explanation that the framework had
+  already executed in a subprocess by the time the policy could
+  fire.
+
+Each step on the timeline is also numbered (`Step 1 · Input
+policy · Allowed` / `Step 1 · Model · gpt-4o` / `Step 2 · Tool
+· lookup_customer` / …) so the operator can reason about the
+agent's loop position even on long runs.
+
+This change is dashboard-only — no SDK code or schema column
+moved.
+
+---
+
+## [0.19.0] — 2026-05-12
+
+### Privacy — model responses are NEVER persisted
+
+Egis now treats the **model's response text as ephemeral**.
+The SDK evaluates the response against output policies
+(`deny_output_regex`, `deny_tool_call`, `deny_mcp_call`,
+`semantic_guard`, …) — and then the text goes out of scope.
+No audit event carries a `response_preview`. No `run.end`
+envelope carries a `final_text`. No SSE step payload carries a
+`step_response_preview`. The dashboard's "Model response" panel
+has been removed from `RunTimelineModal`; what the model
+**said** is intentionally not part of the visible audit record.
+
+What we DO still record:
+
+- the verdict, matched policy, and reason of any output-side
+  decision (so operators can see that, e.g.,
+  `deny_output_regex='credit_card'` matched without ever
+  storing the matching string),
+- token usage and wall-clock cost of the response,
+- per-tool steps for agentic runs — including each tool's
+  name and label-redacted input arguments — so the run
+  timeline still shows what the agent **did**.
+
+Why: model outputs are far less constrained than their
+inputs (the model can emit anything from PHI to API keys to
+free-text PII the input sanitizer never had a chance to see).
+SOC 2 / GDPR / HIPAA / ISO 27001 auditors consistently prefer
+"we never had it" over "we redacted it well". Storing model
+responses is a perpetual leak surface; not storing them
+eliminates the surface entirely.
+
+The `response_preview` column on `RequestLog` and the
+`final_text` column on `Run` are retained on the schema for
+historic-row compatibility but are written as `NULL` on
+every new row. Defense in depth: the ingest endpoint coerces
+incoming `response_preview` / `final_text` fields to `NULL`,
+so even if a misbehaving SDK ships them they don't get
+persisted.
+
+### Added — `enforcement_status` on every audit event
+
+A new top-level field on every audit event the SDK emits records
+whether the policy decision was **actually enforced** or merely
+**advisory**. This is independent from `verdict` so the audit row
+can honestly answer two questions at once: "what did the policy
+decide?" and "did the SDK actually prevent the data flow?".
+
+- `"enforced"` (default for every event): the SDK actively
+  prevented the call from reaching its full destination. Every
+  input-side block is `enforced` (the prompt is never forwarded),
+  and every output-side block on the synchronous patches
+  (`openai`, `anthropic`, `google.genai`, `bedrock`, the
+  `httpx`/`requests` fallback) is `enforced` (the gate either
+  returns a synthesized stub or raises `PermissionError` before
+  user code sees the model's real output).
+- `"advisory"`: the policy decided block, but by the time the
+  SDK could observe the response, the agentic framework had
+  already executed the call end-to-end (tools fired, side
+  effects landed). `claude_agent_sdk` with `on_block="stub"` is
+  the canonical case: Anthropic's Node.js CLI runs the entire
+  agent loop in a subprocess we don't own, so an output-side
+  policy firing on `ResultMessage` is a post-hoc finding, not
+  an enforcement.
+
+The dashboard's RunTimelineModal renders advisory blocks in a
+distinct warning tone with the copy *"Policy fired — call not
+prevented"* and explains in the empty-state hint that "the agent
+framework runs its loop in a subprocess we cannot stop
+mid-flight". SOC 2 / GDPR / HIPAA / ISO 27001 all require the
+audit trail to distinguish "control evaluated" from "control
+enforced"; conflating them inside `verdict` was an audit-finding
+risk we now eliminate.
+
+### Added — output-side policy latency + tokens land on the audit row
+
+`policy_latency_ms`, `policy_tokens_in`, and `policy_tokens_out`
+are now **additive across both phases** of policy evaluation.
+Pre-0.19 only the input phase booked these fields, so the
+dashboard's "Policy (sum)" stat was 0 ms for any call where the
+only matching policy was an output-side `semantic_guard` —
+hiding the real cost (LLM judge wall-clock + token spend) of
+post-model governance.
+
+The output-phase contribution is summed on top of whatever the
+input phase booked, so a call that pays for both an input-side
+deterministic regex and an output-side LLM judge reports the
+correct combined total without overwriting either phase.
+
+### Added — agentic frameworks emit one step per tool use
+
+`claude_agent_sdk`'s streaming receive path now dispatches one
+`tool_call` step per `ToolUseBlock` it sees in an
+`AssistantMessage`, so the dashboard's RunTimelineModal renders
+the actual agentic loop (assistant turn → its tools → next turn
+→ its tools → …) instead of collapsing a 6-tool customer-support
+agent into a single `model_call` step.
+
+Each per-tool step carries its own:
+- per-tool output-policy verdict (so `deny_tool_call` /
+  `deny_mcp_call` pinpoint which tool tripped them),
+- label-redacted `request_text` of the tool's input (so PII a
+  model passed as a tool argument never reaches the audit row
+  raw),
+- `enforcement_status="advisory"` (the Node subprocess had
+  already executed the tool by the time the `ToolUseBlock`
+  reached Python).
+
+### Fixed — model_call step now renders as separate per-phase boxes
+
+Before: a `pii_scan` policy with `action="sanitize"` runs on
+**both** sides of the call. On the input side it sanitizes the
+prompt and forwards it; on the output side it gets coerced to
+`block` (the SDK can't safely rewrite a provider's response —
+see `policy/engine.py::_pii_scan_match`) which on
+`claude_agent_sdk` becomes `advisory` because the Node
+subprocess had already executed. The audit row is honest about
+all of this — `prompt_decision.verdict="sanitize"`,
+`response_decision.verdict="block"`,
+`enforcement_status="advisory"` — but the `RunTimelineModal`'s
+`StepBox` rolled the two phases into a single visual unit that
+mixed "redact" + "blocked" + "forwarded to model" into one box,
+which was visually contradictory ("blocked AND forwarded?") even
+after an earlier fix tried to split the verdicts into chips
+inside that same single box.
+
+The `RunTimelineModal` now expands each `model_call` step into
+up to **three sequential boxes** so the operator can read the
+flow top-to-bottom — input policy → model → output policy:
+
+    ┌── Input policy check ─── [sanitize] [Redact…] [Redacted: 2 PII] ──┐
+    │   Egis redacted regulated data before forwarding to the model    │
+    │   Sanitized prompt (forwarded to model): SECURITY REPORT…        │
+    └──────────────────────────────────────────────────────────────────┘
+    ┌── Model · claude-sonnet-4 ─── 47015 ms · 62 in / 2422 out ───────┐
+    │   Model called and returned — see output policy box below        │
+    └──────────────────────────────────────────────────────────────────┘
+    ┌── Output policy check ─── [block] [advisory] [Redact…] ──────────┐
+    │   Policy decided block — the framework had already executed in  │
+    │   a subprocess. The audit row records this as an advisory       │
+    │   finding — investigate whether an input-side guard …           │
+    └──────────────────────────────────────────────────────────────────┘
+
+Implementation:
+
+- `renderModelCallBoxes(step)` is the new dispatcher: it
+  inspects `prompt_decision` / `response_decision` /
+  `enforcement_status` on the step row and returns the right
+  set of `<FlowBox>` elements for this step's actual shape.
+- `PolicyPhaseBox` is the new shared component for either
+  pre- or post-model policy boxes. It renders the matched
+  policy name, the verdict badge, an "advisory" tag for the
+  output-side advisory case, the redaction-type chip, and —
+  for output-side advisory blocks — the long explanatory
+  paragraph that pre-0.19 lived on the run-level terminator.
+- `ModelCallBox` is the new dedicated middle box that just
+  describes the API call itself (model name, latency, tokens).
+  When input was enforced-blocked it switches to a danger
+  tone and reads "Call refused before reaching the model".
+  When the call ran but output policy fired advisory, it
+  reads "Model called and returned — see output policy box
+  below" so the operator's eye is pulled to the actual
+  finding.
+- The run-level terminator copy simplifies to "Run completed
+  with advisory finding" (one line) since the advisory
+  explanation is now anchored to the specific step that
+  produced it. Pre-0.19 the terminator carried that whole
+  paragraph at the bottom of the timeline, which made it
+  unclear *which* step had fired.
+- Tool calls in `claude_agent_sdk` have only one policy phase
+  (per-tool output evaluation) so they continue to render as
+  a single box — splitting them would be empty noise.
+
+For live-streaming steps the per-phase signal is now on
+the `run.step.added` SSE wire as `step_prompt_decision` and
+`step_response_decision`, mirroring the JSONB columns the
+backend already persists. Previously only the rolled-up
+`step_verdict` reached the SSE stream, so freshly-arriving
+rows could only render the legacy single-box view until a
+page reload.
+
+### Added — redaction-type chip on every step of the run timeline
+
+The `RunTimelineModal`'s per-step box now renders a `Redacted: 2
+SSNs and 1 email`-style chip whenever the SDK masked PII on that
+step. The chip shows only the **types and counts** of fields
+that were redacted — never the original values, never the
+positions, never anything that could be reverse-engineered into
+the source PII. This restores the visibility that the
+RequestDetailModal already had, but at the per-step granularity
+the run timeline needs (e.g. one tool call masked an email, the
+next masked an SSN).
+
+To make this work for live-streaming steps without a page
+reload, the backend's `run.step.added` SSE event now also
+carries the canonical `step_sanitizations`,
+`step_matched_policy`, and `step_policy_reason` fields. The
+shape mirrors the persisted `RequestLog.sanitizations` column
+(`[{type, count, pattern}]`) — counts and types only.
+
+### Changed — intent_summary headlines are now ≤ 70 chars
+
+The LLM-generated **Decision Analysis** headline on the
+Requests table and the `RunTimelineModal` H2 is now strictly
+short: 4–8 words, ≤ 70 characters. Pre-0.19 the cap was 220
+chars, which let the LLM produce paragraph-length intent
+descriptions that broke the table layout and buried the
+operator-facing signal under restated prompt content.
+
+Changes:
+- `_MAX_LEN` in `intent_summarizer.py` lowered from 220 → 70.
+- `_SYSTEM_PROMPT` rewritten to demand 4–8 words / ≤ 60 chars
+  with an explicit example list and an explicit ban on
+  prompt-specific identifiers (account numbers, customer
+  names, dollar amounts, dates).
+- `max_tokens` lowered from 64 → 24 as a hard ceiling.
+- `template_summary` fallback strings rewritten as short
+  imperative headlines (e.g. `Tried to send regulated PII`,
+  `Tried restricted MCP server`, `Allowed by policies`).
+- `_truncate` now strips trailing terminal punctuation and
+  prefers a word boundary when cutting (mid-word breaks were
+  invisible at 220 chars; they're glaring at 70).
+- The frontend's `RunTimelineModal` H2 also truncates the
+  prompt-text fallback to 80 chars one-liner so a still-
+  pending intent_summary doesn't briefly render a whole
+  paragraph as the title.
+
+### Fixed — `claude_agent_sdk` audit row no longer says "Blocked"
+###     when it was actually a post-hoc finding
+
+The combination of the changes above means a successful
+multi-tool `claude_agent_sdk` run with `on_block="stub"` no
+longer shows the dashboard a single "Blocked" step. Instead it
+shows: the model_call's `enforcement_status="advisory"` (with
+the original policy match preserved) and one `tool_call` step
+per real tool invocation. Operators auditing the run get an
+honest answer to "did this run succeed?": *the tools executed
+because the SDK couldn't stop the subprocess mid-flight; the
+policy that fired is recorded as advisory; investigate whether
+an input-side guard or a synchronous SDK path would close the
+gap*.
+
+### Compliance
+
+This release is a SOC 2 (CC7.2 / CC4.2), GDPR Art. 30 / 32,
+HIPAA §164.308, and ISO 27001 A.12.4 alignment update on three
+axes:
+
+1. **Data minimization** — model responses are no longer
+   retained in any data store the platform owns. The
+   auditable trail shows what the agent *did* (verdict, tool
+   calls, matched policies), not what it *said*.
+2. **Control evidence** — `enforcement_status` distinguishes
+   "control evaluated" from "control enforced" as a queryable
+   column rather than implicit text.
+3. **Operator UX** — short, deterministic intent headlines
+   make the Decision Analysis column a usable governance
+   signal at fleet scale rather than an essay-length echo of
+   the prompt.
+
+No behavioural change for callers; the audit shape is additive
+and older backends ingest 0.19 events cleanly (every field has
+a backend-side `server_default`).
+
+---
+
 ## [0.18.1] — 2026-05-12
 
 ### Fixed — Bedrock output-phase enforcement gap

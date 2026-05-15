@@ -19,21 +19,65 @@ from egisai._patches._common import _attribute_event
 
 LOGGER = logging.getLogger("egisai.patches.http")
 
-_MODEL_HOST_TOKENS = (
-    "api.openai.com",
-    "api.anthropic.com",
-    "generativelanguage.googleapis.com",
-    ".azure.com/openai",
-    "api.together.xyz",
-    "api.groq.com",
-    "api.cohere.com",
-    "api.mistral.ai",
+# (host_token, path_token) pairs — BOTH substrings must appear in
+# the URL for it to count as a model call. The earlier host-only
+# match was too permissive: every framework-side bookkeeping HTTP
+# request that *happens* to share a host with the LLM provider got
+# logged as a phantom audit event. The canonical offender is the
+# OpenAI Agents SDK's own tracing exporter, which POSTs to
+# ``https://api.openai.com/v1/traces/ingest`` after each
+# ``Runner.run`` returns. With the host-only match those uploads
+# surfaced on the dashboard as ghost ``model="unknown"`` /
+# ``verdict="allow"`` rows attributed to the app instead of the
+# agent, *in addition to* the real run that already had its own
+# verdict — cosmetically wrong and operationally misleading.
+#
+# We list every model-call path we know about per provider so a
+# new endpoint (e.g. OpenAI ships ``/v1/edit``) requires an
+# explicit add — false-negative-by-default is the right posture
+# for an audit fallback. Dedicated patches (``_patches.openai``,
+# ``_patches.anthropic``, …) cover the in-band path; this fallback
+# only matters when the customer used a transport we don't have an
+# adapter for.
+_MODEL_CALL_URL_TOKENS: tuple[tuple[str, str], ...] = (
+    # OpenAI Chat / Completions / Responses / Embeddings
+    ("api.openai.com", "/chat/completions"),
+    ("api.openai.com", "/completions"),
+    ("api.openai.com", "/responses"),
+    ("api.openai.com", "/embeddings"),
+    # Anthropic Messages / legacy Complete
+    ("api.anthropic.com", "/messages"),
+    ("api.anthropic.com", "/complete"),
+    # Google Generative Language (Gemini)
+    ("generativelanguage.googleapis.com", ":generatecontent"),
+    ("generativelanguage.googleapis.com", ":streamgeneratecontent"),
+    ("generativelanguage.googleapis.com", ":embedcontent"),
+    # Azure OpenAI
+    (".azure.com", "/openai/deployments"),
+    # Together AI
+    ("api.together.xyz", "/chat/completions"),
+    ("api.together.xyz", "/completions"),
+    # Groq (OpenAI-compatible)
+    ("api.groq.com", "/chat/completions"),
+    ("api.groq.com", "/completions"),
+    # Cohere
+    ("api.cohere.com", "/chat"),
+    ("api.cohere.com", "/generate"),
+    # Mistral
+    ("api.mistral.ai", "/chat/completions"),
+    ("api.mistral.ai", "/completions"),
 )
 
 
 def _looks_like_model_call(url: str) -> bool:
+    """Return True only when the URL targets a known model-call endpoint.
+
+    Hostname alone is not enough — see the docstring on
+    ``_MODEL_CALL_URL_TOKENS`` for the OpenAI Agents tracing
+    incident that motivated the host+path requirement.
+    """
     u = url.lower()
-    return any(host in u for host in _MODEL_HOST_TOKENS)
+    return any(host in u and path in u for host, path in _MODEL_CALL_URL_TOKENS)
 
 
 def _patch_requests() -> bool:

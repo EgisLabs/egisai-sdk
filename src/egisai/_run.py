@@ -112,9 +112,14 @@ class RunContext:
     closed: bool = False
     error: str | None = None
     # ``prompt_text``: the FIRST step's prompt preview, displayed as
-    # "what kicked this run off" on the dashboard. ``final_text``: the
-    # LAST model step's response preview, displayed as "what the agent
-    # ultimately answered". Both are post-redaction.
+    # "what kicked this run off" on the dashboard. Post-redaction.
+    #
+    # ``final_text`` is intentionally always ``None``: the privacy
+    # contract is that the SDK NEVER persists model responses (see
+    # ``_patches/_common._run_output_phase``). The field is retained
+    # on the dataclass so the wire shape of ``run.end`` stays
+    # backwards-compatible — the value just goes out as ``None`` and
+    # the backend / dashboard expect that.
     prompt_text: str | None = None
     final_text: str | None = None
     # Worst verdict across all steps — block > sanitize > allow.
@@ -223,6 +228,80 @@ def close_run(*, error: str | None = None) -> RunContext | None:
     return ctx
 
 
+def _stamp_step_event(
+    ctx: RunContext,
+    event: dict[str, Any],
+    *,
+    seq: int,
+    kind: StepKind,
+) -> dict[str, Any]:
+    ev_copy = dict(event)
+    ev_copy["run_id"] = ctx.run_id
+    ev_copy["seq"] = seq
+    ev_copy["kind"] = kind
+    ev_copy["trace_id"] = ctx.trace_id
+    if ctx.agent_id:
+        ev_copy.setdefault("agent_id", ctx.agent_id)
+    if ctx.agent_name:
+        ev_copy.setdefault("app", ctx.agent_name)
+    return ev_copy
+
+
+def _make_run_step(
+    ctx: RunContext,
+    *,
+    seq: int,
+    kind: StepKind,
+    event: dict[str, Any],
+    started_at: float,
+    ended_at: float,
+) -> RunStep:
+    step = RunStep(
+        seq=seq,
+        kind=kind,
+        started_at=started_at,
+        ended_at=ended_at,
+        tokens_in=int(event.get("tokens_in") or 0),
+        tokens_out=int(event.get("tokens_out") or 0),
+        policy_tokens_in=int(event.get("policy_tokens_in") or 0),
+        policy_tokens_out=int(event.get("policy_tokens_out") or 0),
+        cost_usd=float(event.get("cost_usd") or 0.0),
+        verdict=str(event.get("verdict") or "allow"),
+        model=event.get("model"),
+        target=event.get("target"),
+        tool_name=event.get("tool_name"),
+        event=_stamp_step_event(ctx, event, seq=seq, kind=kind),
+    )
+    return step
+
+
+def _run_worst_verdict_from_steps(ctx: RunContext) -> str:
+    worst = "allow"
+    for s in ctx.steps:
+        worst = _worse(worst, s.verdict)
+    return worst
+
+
+def _append_step_unlocked(
+    ctx: RunContext,
+    *,
+    event: dict[str, Any],
+    kind: StepKind,
+    started_at: float | None,
+    ended_at: float | None,
+) -> RunStep:
+    """Append a step while ``ctx._lock`` is already held."""
+    seq = len(ctx.steps)
+    sta = started_at if started_at is not None else time.monotonic()
+    end = ended_at if ended_at is not None else time.monotonic()
+    step = _make_run_step(ctx, seq=seq, kind=kind, event=event, started_at=sta, ended_at=end)
+    ctx.steps.append(step)
+    ctx.worst_verdict = _worse(ctx.worst_verdict, step.verdict)
+    if seq == 0 and ctx.prompt_text is None:
+        ctx.prompt_text = event.get("prompt_preview")
+    return step
+
+
 def append_step(
     *,
     event: dict[str, Any],
@@ -242,46 +321,89 @@ def append_step(
     if ctx is None or ctx.closed:
         return None
     with ctx._lock:
-        seq = len(ctx.steps)
-        step = RunStep(
-            seq=seq,
-            kind=kind,
-            started_at=started_at if started_at is not None else time.monotonic(),
-            ended_at=ended_at if ended_at is not None else time.monotonic(),
-            tokens_in=int(event.get("tokens_in") or 0),
-            tokens_out=int(event.get("tokens_out") or 0),
-            policy_tokens_in=int(event.get("policy_tokens_in") or 0),
-            policy_tokens_out=int(event.get("policy_tokens_out") or 0),
-            cost_usd=float(event.get("cost_usd") or 0.0),
-            verdict=str(event.get("verdict") or "allow"),
-            model=event.get("model"),
-            target=event.get("target"),
-            tool_name=event.get("tool_name"),
-            event=dict(event),
+        step = _append_step_unlocked(
+            ctx, event=event, kind=kind, started_at=started_at, ended_at=ended_at,
         )
-        step.event["run_id"] = ctx.run_id
-        step.event["seq"] = seq
-        step.event["kind"] = kind
-        step.event["trace_id"] = ctx.trace_id
-        # Stamp the locked identity so a step inserted from a code path
-        # that bypassed _attribute_event still attributes correctly.
-        if ctx.agent_id:
-            step.event.setdefault("agent_id", ctx.agent_id)
-        if ctx.agent_name:
-            step.event.setdefault("app", ctx.agent_name)
-        ctx.steps.append(step)
-        # Promote the worst verdict — block > sanitize > allow.
-        ctx.worst_verdict = _worse(ctx.worst_verdict, step.verdict)
-        # First step's prompt becomes the run's "what kicked it off".
-        if seq == 0 and ctx.prompt_text is None:
-            ctx.prompt_text = event.get("prompt_preview")
-        # Every model_call step's response text becomes the candidate
-        # final_text — the dashboard renders the LAST one.
-        if kind == "model_call":
-            rd = event.get("response_decision") or {}
-            text = rd.get("response_preview") or event.get("response_preview")
-            if text:
-                ctx.final_text = text
+    _safe_emit_run_step(ctx, step)
+    return step
+
+
+def append_initial_model_call_step(
+    *,
+    event: dict[str, Any],
+    started_at: float | None = None,
+) -> RunStep | None:
+    """Append seq 0 ``model_call`` when the run is still empty.
+
+    Used by ``claude_agent_sdk`` (and similar) so the dashboard timeline
+    lists input policy + model *before* tool rows while tool steps are
+    still being streamed. The row is later finalized in-place via
+    :func:`finalize_or_append_model_call_step`.
+    """
+    ctx = _current_run.get()
+    if ctx is None or ctx.closed:
+        return None
+    with ctx._lock:
+        if ctx.steps:
+            return None
+        sta = started_at if started_at is not None else time.monotonic()
+        step = _append_step_unlocked(
+            ctx,
+            event=event,
+            kind="model_call",
+            started_at=sta,
+            ended_at=sta,
+        )
+    _safe_emit_run_step(ctx, step)
+    return step
+
+
+def finalize_or_append_model_call_step(
+    *,
+    event: dict[str, Any],
+    started_at: float | None = None,
+    ended_at: float | None = None,
+) -> RunStep | None:
+    """Finalize placeholder seq 0 ``model_call`` or append a new one.
+
+    When :func:`append_initial_model_call_step` created the first step,
+    this merges the terminal audit fields (tokens, output policy,
+    latency, …) into that row and re-emits ``run.step`` with the same
+    ``seq``. Otherwise falls back to :func:`append_step`.
+    """
+    ctx = _current_run.get()
+    if ctx is None or ctx.closed:
+        return None
+    with ctx._lock:
+        if (
+            ctx.steps
+            and ctx.steps[0].kind == "model_call"
+            and ctx.steps[0].seq == 0
+        ):
+            step = ctx.steps[0]
+            sta = started_at if started_at is not None else step.started_at
+            end = ended_at if ended_at is not None else time.monotonic()
+            step.started_at = sta
+            step.ended_at = end
+            step.tokens_in = int(event.get("tokens_in") or 0)
+            step.tokens_out = int(event.get("tokens_out") or 0)
+            step.policy_tokens_in = int(event.get("policy_tokens_in") or 0)
+            step.policy_tokens_out = int(event.get("policy_tokens_out") or 0)
+            step.cost_usd = float(event.get("cost_usd") or 0.0)
+            step.verdict = str(event.get("verdict") or "allow")
+            step.model = event.get("model")
+            step.target = event.get("target")
+            step.tool_name = event.get("tool_name")
+            step.event = _stamp_step_event(ctx, event, seq=0, kind="model_call")
+            ctx.worst_verdict = _run_worst_verdict_from_steps(ctx)
+        else:
+            step = _append_step_unlocked(
+                ctx,
+                event=event,
+                kind="model_call",
+                started_at=started_at,
+                ended_at=ended_at,
+            )
     _safe_emit_run_step(ctx, step)
     return step
 
@@ -289,6 +411,34 @@ def append_step(
 def reset_for_tests() -> None:
     """Clear the run pointer — only used by the test reset fixture."""
     _current_run.set(None)
+
+
+def finalize_run_in_place(
+    ctx: RunContext, *, error: str | None = None
+) -> None:
+    """Mark ``ctx`` closed + emit ``run.end`` without touching the ContextVar.
+
+    Used by callbacks scheduled on framework-handle completion
+    (e.g. LlamaIndex ``WorkflowHandler._result_task.add_done_callback``)
+    where the handle's work runs on a different asyncio task than
+    the one that opened the run. The contextvar dance ``close_run``
+    performs is the wrong tool there — the parent task has long
+    since restored its own pointer, so we just need to flip
+    ``closed=True`` and enqueue the ``run.end`` event for ``ctx``
+    specifically.
+
+    Idempotent — repeated calls with the same ``ctx`` are no-ops.
+    """
+    if ctx.closed:
+        return
+    with ctx._lock:
+        if ctx.closed:
+            return
+        ctx.closed = True
+        ctx.ended_at = time.monotonic()
+        if error is not None:
+            ctx.error = error
+    _safe_emit_run_end(ctx)
 
 
 # ── Wire-format helpers ─────────────────────────────────────────────

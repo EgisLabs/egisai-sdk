@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -75,6 +75,12 @@ class _AnalyzerState:
     error: BaseException | None = None
     # ``True`` once we've kicked off a load (idempotency guard).
     primed: bool = False
+    # Signalled exactly once when ``_load_in_background`` returns
+    # (success OR failure). Lets callers ``wait_for_warm()`` without
+    # busy-polling. Defined here rather than as a module-level
+    # singleton so ``reset_for_tests()`` rebuilds it cleanly with
+    # the rest of the state.
+    settle_event: threading.Event = field(default_factory=threading.Event)
 
 
 _state = _AnalyzerState()
@@ -135,6 +141,39 @@ def last_error() -> BaseException | None:
     return _state.error
 
 
+def wait_for_warm(timeout_secs: float) -> bool:
+    """Block up to ``timeout_secs`` for the analyzer to settle.
+
+    Returns ``True`` if the analyzer is ready (and ``try_get_analyzer()``
+    will return a live instance), ``False`` on timeout OR if the load
+    thread settled with an error. The False case is "the regex fallback
+    will run" — callers should treat that as expected, not as a bug.
+
+    Cheap, event-based: the daemon thread sets a ``threading.Event``
+    in its ``finally`` block, so this call wakes up the instant the
+    load completes rather than busy-polling. ``timeout_secs <= 0``
+    is a non-blocking probe (returns immediately).
+
+    Designed to be called from the SDK's policy entry points exactly
+    once per process. Higher-level code (the input-phase gate in
+    ``egisai._evaluator``) is responsible for the one-shot policy:
+    waiting *here* is always safe, but waiting on every call defeats
+    the point of the daemon-loader pattern.
+    """
+    # Fast path — already warm or already failed. Avoids touching
+    # the Event at all on the steady-state hot path.
+    if _state.settled:
+        return _state.analyzer is not None
+    if timeout_secs <= 0:
+        return False
+    # ``wait()`` returns True if the flag is set within the timeout,
+    # False on timeout. Either way we re-read the analyzer slot to
+    # report the true outcome (load could have failed AFTER the
+    # event fired).
+    _state.settle_event.wait(timeout_secs)
+    return _state.analyzer is not None
+
+
 def reset_for_tests() -> None:
     """Wipe loader state so tests can drive a fresh load.
 
@@ -170,6 +209,12 @@ def _load_in_background(*, quiet: bool) -> None:
         with _lock:
             _state.loading = False
             _state.settled = True
+        # Signal AFTER the lock release so any thread parked in
+        # ``wait_for_warm`` wakes up to a fully-published state.
+        # ``set()`` is idempotent — even if the thread somehow ran
+        # twice (it can't; the ``primed`` guard prevents it), the
+        # extra signal is a no-op.
+        _state.settle_event.set()
 
 
 def _build_analyzer(*, quiet: bool) -> AnalyzerEngine:

@@ -9,7 +9,9 @@ cached rules. Output-side rules run on the response via
 from __future__ import annotations
 
 import logging
+import os
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -21,6 +23,7 @@ from egisai.policy import (
     OutputPolicyContext,
     PolicyContext,
     PolicyDecision,
+    _pii_loader,
     evaluate_output_policies,
     evaluate_policies,
 )
@@ -30,6 +33,150 @@ LOGGER = logging.getLogger("egisai.evaluator")
 
 _blocker_lock = threading.Lock()
 _blocker: SemanticBlocker | None = None
+
+# ── PII analyzer first-call gate ────────────────────────────────────
+#
+# The Presidio + spaCy analyzer is warmed in a daemon thread from
+# ``egisai.init()`` (see ``policy/_pii_loader.py``). It takes ~1–3 s
+# on a warm machine and up to ~90 s the first time the SDK is ever
+# installed (one-time ~750 MB model download). The hot path falls
+# back to regex+checksum detection while the analyzer is cold, which
+# means **names / addresses / GDPR special-category text are not
+# masked on call #1 of a fresh process**.
+#
+# For long-running services (FastAPI backends, agent harnesses) the
+# analyzer is warm by the time the first request lands and this is a
+# non-issue. For test harnesses, demo scripts, and serverless cold
+# starts that fire a model call within ~1 s of ``init()``, that first
+# call slips through with regex-only coverage — silently.
+#
+# The gate below closes that window WITHOUT regressing init() back to
+# blocking I/O. On the first ``evaluate()`` (or ``evaluate_output()``)
+# of the process, IF the current rule set has an active ``pii_scan``
+# rule scoped to this call AND the analyzer is still loading, we block
+# briefly (cap 2.0 s by default) waiting for warm-up. Subsequent calls
+# never wait — the one-shot flag is set regardless of outcome.
+#
+# Env knobs (no kwarg on init() — keeping that surface non-blocking
+# by contract):
+#   * ``EGISAI_PII_WARMUP_TIMEOUT_SECS`` — cap in seconds, default
+#     ``2.0``. Set to ``0`` (or negative) to opt out entirely; the
+#     SDK then behaves exactly as pre-0.25 (silent regex fallback on
+#     call #1 if you race the loader). Recommended for AWS Lambda
+#     and any environment where a 2 s cold-start blip in the first
+#     request's tail latency is unacceptable.
+_WARMUP_DEFAULT_SECS = 2.0
+_warmup_lock = threading.Lock()
+_warmup_done = False
+
+
+def _warmup_timeout_secs() -> float:
+    """Resolve the per-call-#1 cap from the env var, defaulting to 2 s.
+
+    Re-read on every gate invocation so operators can flip it without
+    restarting. The gate is one-shot per process so the cost of re-
+    reading is paid at most once.
+    """
+    raw = os.getenv("EGISAI_PII_WARMUP_TIMEOUT_SECS")
+    if not raw:
+        return _WARMUP_DEFAULT_SECS
+    try:
+        return float(raw)
+    except ValueError:
+        return _WARMUP_DEFAULT_SECS
+
+
+def _has_active_pii_rule(rules: list) -> bool:
+    """Does this call's scoped rule set actually need the NER analyzer?
+
+    If the org has only ``semantic_guard`` / ``deny_regex`` / etc.
+    rules active for this agent, blocking on the PII engine is just
+    wasted latency on call #1. Skip the gate in that case.
+    """
+    return any(getattr(r, "type", None) == "pii_scan" for r in rules)
+
+
+def _maybe_wait_for_pii_analyzer(rules: list) -> None:
+    """One-shot pre-evaluation gate. Idempotent across both phases.
+
+    Conditions for the wait to actually fire:
+      * we haven't waited yet in this process;
+      * the org has at least one active ``pii_scan`` rule scoped to
+        this call;
+      * the analyzer is still loading (settled implies either warm
+        or permanently failed — neither benefits from waiting).
+
+    Logs one stderr line when it fires so operators can see "egisai
+    paid X ms on the first call to warm the PII engine" — important
+    observability for tuning ``EGISAI_PII_WARMUP_TIMEOUT_SECS``.
+    """
+    global _warmup_done
+    if _warmup_done:
+        return
+    with _warmup_lock:
+        if _warmup_done:
+            return
+        timeout = _warmup_timeout_secs()
+        if timeout <= 0:
+            # Operator opt-out (Lambda etc). Don't wait, don't log —
+            # they chose this path explicitly.
+            _warmup_done = True
+            return
+        if _pii_loader.is_settled():
+            # Warm (or permanently failed). Either way, no wait helps.
+            _warmup_done = True
+            return
+        if not _has_active_pii_rule(rules):
+            # No PII rule in scope. NER warm-up wouldn't change the
+            # decision on this call — skip to keep call #1 fast.
+            # Don't flip the one-shot: a later call from a different
+            # agent (with different scoping) might need the analyzer.
+            return
+        started = time.monotonic()
+        warm = _pii_loader.wait_for_warm(timeout)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        _warmup_done = True
+        # Both branches go through the ``egisai.evaluator`` logger
+        # rather than ``sys.stderr`` directly. Default Python logging
+        # config is WARNING+, so SUCCESS (.info) is silent unless the
+        # operator opts in; TIMEOUT (.warning) is visible by default
+        # to surface the rare honest degradation (NER coverage missed
+        # call #1, regex fallback is in effect). Either way the line
+        # is observable at ``logging.getLogger("egisai.evaluator")``
+        # for ops who want to track cold-start cost in a structured
+        # log pipeline (Datadog, CloudWatch, Loki).
+        if warm:
+            LOGGER.info(
+                "[egisai] waited %d ms on first call to warm PII NER "
+                "analyzer (Presidio + spaCy). Subsequent calls add "
+                "zero overhead. Set EGISAI_PII_WARMUP_TIMEOUT_SECS=0 "
+                "to disable.",
+                elapsed_ms,
+            )
+        else:
+            LOGGER.warning(
+                "[egisai] PII NER analyzer not warm after %d ms — "
+                "proceeding with regex+checksum fallback for THIS "
+                "call. Names / addresses / GDPR special-category text "
+                "will not be flagged until the daemon thread finishes "
+                "loading (typical: 1–3 s warm machine, up to ~90 s on "
+                "first install with model download). Raise "
+                "EGISAI_PII_WARMUP_TIMEOUT_SECS if your environment "
+                "needs more headroom on call #1.",
+                elapsed_ms,
+            )
+
+
+def _reset_warmup_gate_for_tests() -> None:
+    """Wipe the one-shot flag so tests can drive multiple gate scenarios.
+
+    Production callers must not use this — the gate is intentionally
+    one-shot per process. Mirrors ``_pii_loader.reset_for_tests`` in
+    intent.
+    """
+    global _warmup_done
+    with _warmup_lock:
+        _warmup_done = False
 
 
 def _has_semantic_rule(rules: list) -> bool:
@@ -124,6 +271,16 @@ class OutputCall:
     mcp_targets: list[str]
     stream: bool = False
     tenant: str | None = None
+    # ``allow_sanitize`` flips ``pii_scan`` from "always block on the
+    # output side" to "honour the operator's action='sanitize'". Only
+    # set by output paths that have an atomic mutation point after
+    # the model produced bytes — today that's the ``claude_agent_sdk``
+    # PostToolUse hook, which can swap the tool result via
+    # ``updatedToolOutput`` / ``updatedMCPToolOutput`` before Claude
+    # is shown it. See ``OutputPolicyContext`` for the full
+    # rationale. Default ``False`` keeps every existing caller's
+    # behavior identical.
+    allow_sanitize: bool = False
 
 
 def evaluate(call: InputCall) -> PolicyDecision:
@@ -134,6 +291,11 @@ def evaluate(call: InputCall) -> PolicyDecision:
     rules = _scope_filter(rules, _active_agent_id())
     if not rules:
         return PolicyDecision.allow()
+    # First-call gate: if the analyzer is still warming and a
+    # ``pii_scan`` rule is scoped to this call, briefly wait. After
+    # this returns the analyzer is either warm OR we've decided to
+    # proceed with the regex fallback. Idempotent across phases.
+    _maybe_wait_for_pii_analyzer(rules)
     ctx = PolicyContext(
         tenant=call.tenant or "",
         model=call.model,
@@ -156,6 +318,10 @@ def evaluate_output(call: OutputCall) -> PolicyDecision:
     rules = _scope_filter(rules, _active_agent_id())
     if not rules:
         return PolicyDecision.allow()
+    # Same first-call gate as ``evaluate`` — covers frameworks (e.g.
+    # ``claude_agent_sdk``) where the first patched entry point is the
+    # output / tool-result hook rather than the model-call entrypoint.
+    _maybe_wait_for_pii_analyzer(rules)
     ctx = OutputPolicyContext(
         tenant=call.tenant or "",
         model=call.model,
@@ -164,6 +330,7 @@ def evaluate_output(call: OutputCall) -> PolicyDecision:
         tool_calls=list(call.tool_calls),
         mcp_targets=list(call.mcp_targets),
         stream=call.stream,
+        allow_sanitize=call.allow_sanitize,
     )
     blocker = _get_semantic_blocker() if _has_semantic_rule(rules) else None
     try:
@@ -256,7 +423,17 @@ def extract_payload_text(payload: Any) -> str:
         _walk_messages(inp)
 
     contents = payload.get("contents")
-    if isinstance(contents, list):
+    if isinstance(contents, str):
+        # Google Gemini's ergonomic shape — ``client.models.
+        # generate_content(model=..., contents="hi gemini")`` —
+        # passes the whole prompt as a top-level string. Without
+        # this branch the prompt is invisible to PII scanners and
+        # to label_redact, which means a raw SSN in that string
+        # would never trip pii_scan and never get masked. The
+        # smoke-battery test ``test_genai_async_path_sanitize``
+        # pinned this regression.
+        chunks.append(contents)
+    elif isinstance(contents, list):
         for item in contents:
             if isinstance(item, str):
                 chunks.append(item)
@@ -319,7 +496,14 @@ def mutate_prompt_text(payload: Any, transform: Callable[[str], str]) -> bool:
         _walk_messages(inp)
 
     contents = payload.get("contents")
-    if isinstance(contents, list):
+    if isinstance(contents, str):
+        # Mirror of ``extract_payload_text``: Gemini's
+        # ``contents="..."`` ergonomic shape passes the whole
+        # prompt as a top-level string. Mutating that key in
+        # place ensures the SDK's outbound kwargs carry the
+        # sanitized text rather than the original.
+        payload["contents"] = _apply_to_text(contents)
+    elif isinstance(contents, list):
         for i, item in enumerate(contents):
             if isinstance(item, str):
                 contents[i] = _apply_to_text(item)

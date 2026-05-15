@@ -16,11 +16,46 @@ def now_iso() -> str:
 
 
 def safe_preview(payload: object, max_len: int = 280) -> str:
-    """Bounded human-friendly preview for audit logs."""
+    """Bounded, label-redacted preview for audit logs.
+
+    Privacy contract (``security-and-compliance.mdc`` §1, §5):
+    this preview is shipped to the audit log on every framework
+    patch and on every code path — allow, sanitize, AND **block**
+    (the block path doesn't re-set ``payload_preview`` after build
+    time, so what we produce here is what auditors see).
+    Therefore we MUST push the rendered string through
+    ``label_redact`` BEFORE truncating, so a payload that carries
+    a raw SSN / credit card / IBAN never leaves the SDK boundary
+    even if a policy didn't flag it (e.g. an allow-path call with
+    incidentally PII-bearing text, or an input-side block whose
+    payload preview was set at build time).
+
+    ``label_redact`` is regex+checksum-only (no Presidio dependency
+    at this seam, so we can't accidentally trigger the analyzer's
+    cold-start) and replaces SSN / credit card / IBAN / email /
+    phone / API-key matches with the ``<TYPE>`` token. That is the
+    same redaction the dashboard renders next to verdict pills, so
+    a single preview field reads identically pre- and post-shipping.
+    """
     try:
         s = repr(payload)
     except Exception:
         s = "<unrepr-able>"
+    # Local import — ``egisai.policy`` is the heavier module that
+    # imports the rule engine + PII scanners. We deliberately do
+    # NOT pull that into this file's top-level import graph so
+    # circular-import risk stays zero (``_events.py`` is imported
+    # very early during ``init()``, before ``policy`` is wired).
+    try:
+        from egisai.policy import label_redact
+
+        s = label_redact(s)
+    except Exception:  # noqa: BLE001
+        # Fail-open: if redaction errored for any reason, fall
+        # back to the raw repr — but truncate to ``max_len`` so
+        # an inadvertent leak is still bounded in size. We don't
+        # WIDEN the leak surface by raising here.
+        pass
     if len(s) > max_len:
         return s[: max_len - 3] + "..."
     return s

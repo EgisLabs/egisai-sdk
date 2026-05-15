@@ -46,23 +46,49 @@ def _extract_gemini_usage(response: Any) -> dict[str, Any]:
 
 
 def _stub_response(decision: PolicyDecision, trace_id: str, model: str):
+    """Legacy ``google.generativeai`` ``GenerateContentResponse``-shaped stub.
+
+    Mirror of ``genai._stub_response``. The upstream
+    ``google.generativeai.types.GenerateContentResponse`` carries
+    a richer ``usage_metadata`` shape than the basic three-counter
+    triple — frameworks that wrap the legacy SDK read those
+    extras directly off the response. A stub that omits them
+    crashes those frameworks with ``AttributeError`` the moment
+    a policy fires with ``on_block="stub"``. We populate every
+    documented field at zero/None so the stub is structurally
+    indistinguishable from a real "blocked, no token usage" turn.
+    """
     from types import SimpleNamespace
 
     blurb = (
         f"[POLICY BLOCK] {decision.message or 'Blocked by policy.'} "
         f"(matched={decision.matched_policy or 'unknown'})"
     )
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(
+            parts=[SimpleNamespace(text=blurb, function_call=None)],
+            role="model",
+        ),
+        finish_reason="STOP",
+        finish_message=None,
+        safety_ratings=None,
+        citation_metadata=None,
+        token_count=0,
+        avg_logprobs=None,
+        grounding_metadata=None,
+        index=0,
+    )
     return SimpleNamespace(
         text=blurb,
-        candidates=[
-            SimpleNamespace(
-                content=SimpleNamespace(parts=[SimpleNamespace(text=blurb)], role="model"),
-                finish_reason="STOP",
-                index=0,
-            )
-        ],
+        candidates=[candidate],
         prompt_feedback=None,
-        usage_metadata=SimpleNamespace(prompt_token_count=0, candidates_token_count=0, total_token_count=0),
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=0,
+            candidates_token_count=0,
+            total_token_count=0,
+            cached_content_token_count=0,
+        ),
+        function_calls=[],
         egis={"blocked": True, "reason": decision.message, "matched_policy": decision.matched_policy},
         _trace_id=trace_id,
         _model=model,
@@ -76,17 +102,35 @@ def _wrap_generate(orig: Callable[..., Any], is_async: bool) -> Callable[..., An
         async def aw(self, contents, *args, **kwargs):  # type: ignore[no-untyped-def]
             model = getattr(self, "model_name", "unknown")
             stream = bool(kwargs.get("stream", False))
+            # ``payload`` is the mutable view the gate hands to
+            # ``mutate_prompt_text`` on a sanitize verdict.
+            # ``contents`` is a positional arg whose binding here is
+            # an immutable scalar (string) in the common case, so the
+            # forward must re-read the post-sanitization value from
+            # ``payload["contents"]`` and pass THAT to the SDK -
+            # otherwise the raw prompt would still leave the SDK
+            # boundary even though policy stamped sanitize. Same
+            # rationale as ``_patches.genai._wrap_sync``.
+            payload: dict[str, Any] = {
+                "contents": contents,
+                "tools": kwargs.get("tools"),
+            }
             return await async_gate_call(
                 source="genai",
                 target=target,
                 model=model,
                 prompt_text=extract_gemini_prompt(contents),
                 stream=stream,
-                payload={"contents": contents, "tools": kwargs.get("tools")},
+                payload=payload,
                 stub_factory=_stub_response,
                 extract_usage=_extract_gemini_usage,
                 extract_output_signals=extract_google,
-                forward=lambda: orig(self, contents, *args, **kwargs),
+                # Multi-step waterfall: see ``_patches.openai._wrap_create_chat``
+                # for the dashboard timeline rationale. Each
+                # ``function_call`` part the model emitted becomes one
+                # ``tool_call`` step on the Run.
+                emit_tool_call_steps=True,
+                forward=lambda: orig(self, payload["contents"], *args, **kwargs),
             )
 
         aw.__egisai_wrapped__ = True  # type: ignore[attr-defined]
@@ -95,17 +139,24 @@ def _wrap_generate(orig: Callable[..., Any], is_async: bool) -> Callable[..., An
     def w(self, contents, *args, **kwargs):  # type: ignore[no-untyped-def]
         model = getattr(self, "model_name", "unknown")
         stream = bool(kwargs.get("stream", False))
+        # See the async branch above for the immutable-scalar
+        # ``contents`` rationale.
+        payload: dict[str, Any] = {
+            "contents": contents,
+            "tools": kwargs.get("tools"),
+        }
         return gate_call(
             source="genai",
             target=target,
             model=model,
             prompt_text=extract_gemini_prompt(contents),
             stream=stream,
-            payload={"contents": contents, "tools": kwargs.get("tools")},
+            payload=payload,
             stub_factory=_stub_response,
             extract_usage=_extract_gemini_usage,
             extract_output_signals=extract_google,
-            forward=lambda: orig(self, contents, *args, **kwargs),
+            emit_tool_call_steps=True,
+            forward=lambda: orig(self, payload["contents"], *args, **kwargs),
         )
 
     w.__egisai_wrapped__ = True  # type: ignore[attr-defined]

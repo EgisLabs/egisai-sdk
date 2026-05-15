@@ -119,6 +119,11 @@ def _make_call(orig: Any, model_id: str, kwargs: dict) -> Any:
         # output phase short-circuits (extractor=None) and policies
         # silently skip post-model.
         extract_output_signals=extract_bedrock_converse,
+        # Multi-step waterfall: one ``tool_call`` step per ``toolUse``
+        # block in the Bedrock Converse response. Mirrors the OpenAI /
+        # Anthropic / Gemini patches so the dashboard timeline reads
+        # consistently across all direct LLM providers.
+        emit_tool_call_steps=True,
         forward=lambda: orig(**kwargs),
     )
 
@@ -172,7 +177,7 @@ def apply() -> bool:
     if not has_module("boto3"):
         return False
     try:
-        import boto3  # type: ignore[import-not-found]
+        import boto3  # type: ignore[import-not-found,import-untyped]
     except Exception:  # noqa: BLE001
         return False
     if getattr(boto3.client, "__egisai_wrapped__", False):

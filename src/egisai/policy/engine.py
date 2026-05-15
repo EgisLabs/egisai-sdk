@@ -56,7 +56,23 @@ class PolicyContext:
 
 @dataclass(frozen=True)
 class OutputPolicyContext:
-    """Inputs for evaluating *output-side* policies (after the LLM responds)."""
+    """Inputs for evaluating *output-side* policies (after the LLM responds).
+
+    ``allow_sanitize`` controls whether ``pii_scan`` rules with
+    ``action="sanitize"`` are honored on this side. Default ``False``
+    because the typical output surface (a streamed assistant text
+    response) can't be safely rewritten in flight — once the bytes
+    have left the provider we have no atomic mutation point. The
+    ``claude_agent_sdk`` ``PostToolUse`` hook is the exception:
+    the SDK exposes ``updatedToolOutput`` / ``updatedMCPToolOutput``
+    which let us swap the tool result before Claude is shown it, so
+    a sanitize verdict there is actually enforceable. Patches that
+    have such a mutation point flip ``allow_sanitize=True``; every
+    other output-side caller leaves it at the default so PII
+    detected in a model response still blocks (the conservative
+    SOC 2 / GDPR posture — better refuse than silently let it
+    through).
+    """
 
     tenant: str
     model: str
@@ -65,6 +81,7 @@ class OutputPolicyContext:
     tool_calls: list[dict[str, str]]
     mcp_targets: list[str]
     stream: bool
+    allow_sanitize: bool = False
 
 
 @dataclass(frozen=True)
@@ -530,27 +547,140 @@ def _semantic_guard_match(
     text: str,
     semantic_blocker: SemanticBlocker | None,
     side: str,
+    tool_calls: list[dict[str, Any]] | None = None,
 ) -> MatchedPolicyRecord | None:
-    """Returns a block record when the judge flags the text, else ``None``.
+    """Returns a block record when the judge flags the call, else ``None``.
+
+    Operates against any subset of the available signals selected by
+    ``policy.config["targets"]``:
+
+    - ``["text"]`` (the default — preserves pre-0.24 behavior) — the
+      judge receives ``text``: the user prompt on the input side or
+      the model's accumulated assistant text on the output side.
+    - ``["tool_calls"]`` — for each entry in ``tool_calls``, the
+      matcher synthesizes a one-sentence description ("The agent is
+      requesting to invoke tool 'X' with arguments {...}") and asks
+      the judge whether that matches any operator intent. This is
+      what closes the "agent makes a mistake" gap: a ``deny_tool_call``
+      rule needs to enumerate every dangerous tool name by hand,
+      whereas a ``semantic_guard`` rule with ``targets=["tool_calls"]``
+      lets the operator describe forbidden behavior in plain English
+      ("delete all users", "wipe the production database") and the
+      judge decides whether THIS call matches THAT intent.
+    - ``["text", "tool_calls"]`` — both, ``text`` first.
 
     With no live ``SemanticBlocker`` the rule is a no-op — there's
     no keyword fallback, so an unconfigured judge never produces
     false matches.
+
+    Privacy contract (security-and-compliance.mdc §1) — tool args
+    are PII-label-redacted via ``pii_scanner.label_redact`` BEFORE
+    they reach the judge. The judge is the platform's own endpoint,
+    but the rule that "PII never leaves the SDK boundary in raw
+    form, including our own LLM-based policy judges" still applies.
+    Intent classification accuracy is preserved because the judge
+    cares about the verb/noun shape ("the agent is deleting users"),
+    not the exact identifier values.
+
+    Each tool call counts as one judge round-trip. The matcher
+    short-circuits on the first match for cost control. Operators
+    who want to scan many tools per turn can mitigate cost by
+    setting tighter ``deny_tool_call`` rules in Phase 1 — those
+    fire deterministically and prevent the judge call entirely on
+    the obviously-blocked tools.
     """
-    if not text or semantic_blocker is None:
+    if semantic_blocker is None:
         return None
-    match = semantic_blocker.check(text, policy.config)
-    if match is None:
-        return None
-    return MatchedPolicyRecord(
-        name=policy.name,
-        type=policy.type,
-        verdict="block",
-        reason_code="semantic_blocked",
-        message=policy.config.get(
-            "message",
-            f"{side.capitalize()} matches blocked intent: '{match.intent}'",
-        ),
+
+    targets_raw = policy.config.get("targets")
+    if isinstance(targets_raw, list) and targets_raw:
+        targets = [str(t) for t in targets_raw if isinstance(t, str)]
+    else:
+        # Backwards compat: a ``semantic_guard`` rule without an
+        # explicit ``targets`` field behaves exactly the same as
+        # every released version of this SDK — judge the text.
+        targets = ["text"]
+
+    # Phase A — text target. Kept verbatim from the pre-0.24 path
+    # so existing rules (no ``targets`` field) cannot regress.
+    if "text" in targets and text:
+        match = semantic_blocker.check(text, policy.config)
+        if match is not None:
+            return MatchedPolicyRecord(
+                name=policy.name,
+                type=policy.type,
+                verdict="block",
+                reason_code="semantic_blocked",
+                message=policy.config.get(
+                    "message",
+                    f"{side.capitalize()} matches blocked intent: '{match.intent}'",
+                ),
+            )
+
+    # Phase B — tool_calls target. Each tool gets its own judge call
+    # so the audit row's ``matched_policy`` message can name the
+    # specific tool that tripped the rule. First match wins.
+    if "tool_calls" in targets and tool_calls:
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            name = tc.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            args = tc.get("input")
+            if args is None:
+                args = tc.get("arguments")
+            synthesized = _synthesize_tool_call_text(name, args)
+            if not synthesized:
+                continue
+            match = semantic_blocker.check(synthesized, policy.config)
+            if match is None:
+                continue
+            return MatchedPolicyRecord(
+                name=policy.name,
+                type=policy.type,
+                verdict="block",
+                reason_code="semantic_blocked_tool",
+                message=policy.config.get(
+                    "message",
+                    (
+                        f"Tool call '{name}' matches blocked intent: "
+                        f"'{match.intent}'"
+                    ),
+                ),
+            )
+
+    return None
+
+
+def _synthesize_tool_call_text(name: str, args: Any) -> str:
+    """Render a tool call as a sentence the judge can intent-classify.
+
+    Shape: ``"The agent is requesting to invoke tool 'X' with
+    arguments: {...}"``. Natural-language form is deliberate — the
+    judge prompt on the platform side is tuned for intent
+    classification of free-text agent behavior descriptions, not
+    for arbitrary code-shaped strings.
+
+    PII in the arguments is replaced with typed labels (``<EMAIL>``,
+    ``<SSN>``, ``<CREDIT_CARD>``, …) via ``pii_scanner.label_redact``.
+    This satisfies security-and-compliance.mdc §1 — raw PII never
+    leaves the SDK boundary, including on its way to our own
+    LLM-based judges. The judge keeps enough structural context to
+    decide intent ("the agent is deleting <NAME>" still classifies
+    as a destructive user operation) without ever holding the real
+    value.
+    """
+    import json
+
+    try:
+        rendered_args = json.dumps(args, default=str, ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        rendered_args = repr(args)
+    safe_args = pii_scanner.label_redact(rendered_args)
+    return (
+        f"The agent is requesting to invoke tool '{name}' "
+        f"with arguments: {safe_args}"
     )
 
 
@@ -847,13 +977,22 @@ def _evaluate_one_output_policy(
         )
 
     if policy.type == "pii_scan":
-        # Output-side sanitization isn't wired through provider
-        # patches yet; coerce to block so PII detected in the
-        # response stops the call instead of slipping past.
+        # Output-side sanitization is wired only through patches
+        # that have an atomic mutation point AFTER the model
+        # produced the bytes (today: ``claude_agent_sdk``'s
+        # PostToolUse hook, which can swap the tool result via
+        # ``updatedToolOutput`` / ``updatedMCPToolOutput`` before
+        # the model is shown it). On every other output surface
+        # (streamed assistant text, finalized model_call responses)
+        # we coerce to block: there is no safe in-place rewrite of
+        # a response that's already on the wire to the user, and
+        # the SOC 2 / GDPR conservative posture is "refuse rather
+        # than silently let through". The patch tells us which side
+        # of that line we're on via ``context.allow_sanitize``.
         return _pii_scan_match(
             policy,
             text=context.text,
-            allow_sanitize=False,
+            allow_sanitize=context.allow_sanitize,
             block_reason_code="pii_in_output",
         )
 
@@ -876,6 +1015,7 @@ def _evaluate_one_output_policy(
         return _semantic_guard_match(
             policy=policy,
             text=context.text,
+            tool_calls=context.tool_calls,
             semantic_blocker=semantic_blocker,
             side="output",
         )
