@@ -127,8 +127,29 @@ def handshake(
     return r.json()
 
 
-def fetch_policies(etag: str | None = None) -> tuple[str | None, list[dict] | None]:
-    """Returns ``(new_etag, rules)``. ``rules`` is ``None`` on 304."""
+def fetch_policies(
+    etag: str | None = None,
+) -> tuple[str | None, list[dict] | None, list[str] | None]:
+    """Pull the per-org policy + paused-agent snapshot.
+
+    Returns ``(new_etag, rules, paused_agent_ids)``.
+
+    * ``rules`` is ``None`` on a 304 (cache still fresh — the
+      caller leaves its current rule list AND its current
+      ``paused_agent_ids`` cache untouched).
+    * On 200 ``rules`` is the freshly-fetched rule list and
+      ``paused_agent_ids`` is the freshly-fetched set of paused
+      agent UUIDs (lower-case canonical 8-4-4-4-12 form).
+      Older backends that don't ship the field return an empty
+      list — the SDK then treats the org as having no paused
+      agents, which matches their pre-rollout behaviour.
+
+    The triple-return wire shape is intentional: callers (the
+    in-process ``_policy_cache``) want both pieces of state to
+    update atomically, in lockstep with the same ETag, so a
+    well-timed pause never lands inconsistently against a
+    just-fetched rule set.
+    """
     headers: dict[str, str] = {}
     if etag:
         headers["If-None-Match"] = etag
@@ -137,11 +158,15 @@ def fetch_policies(etag: str | None = None) -> tuple[str | None, list[dict] | No
         lambda: get_client().get("/v1/sdk/policies", headers=headers),
     )
     if r.status_code == 304:
-        return etag, None
+        return etag, None, None
     if r.status_code != 200:
         raise _http_error(op="fetch_policies", status=r.status_code)
     body = r.json()
-    return body.get("etag"), body.get("rules", [])
+    raw_paused = body.get("paused_agent_ids") or []
+    paused: list[str] = [
+        str(a).strip().lower() for a in raw_paused if a
+    ]
+    return body.get("etag"), body.get("rules", []), paused
 
 
 def ensure_agent(

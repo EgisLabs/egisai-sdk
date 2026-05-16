@@ -18,7 +18,7 @@ from typing import Any
 
 from egisai._config import get_config_optional
 from egisai._context import get_context
-from egisai._policy_cache import get_rules
+from egisai._policy_cache import get_paused_agent_ids, get_rules
 from egisai.policy import (
     OutputPolicyContext,
     PolicyContext,
@@ -283,12 +283,87 @@ class OutputCall:
     allow_sanitize: bool = False
 
 
+# ── Phase 0: operator pause / resume gate ───────────────────────────
+#
+# A paused agent never reaches the policy phases. The kill switch is
+# enforced HERE, before Phase 1's deterministic checks fire, before
+# any LLM token is spent on a semantic-guard judge, and before any
+# raw prompt is even reasoned about. The check is a single O(1) set
+# membership lookup against the in-process snapshot the refresher
+# keeps in lockstep with the platform — flipping pause on the
+# dashboard takes effect SDK-side within ~50 ms via the SSE
+# ``agent.changed`` event (or one ``refresh_interval_seconds``
+# poll cycle as a fallback).
+#
+# Returns a ``PolicyDecision`` carrying a synthetic ``MatchedPolicyRecord``
+# so the audit row carries the same shape every other block carries:
+# the dashboard renders it under the agent's normal block-history
+# panel with ``matched_policy = "Agent paused"``, ``reason_code =
+# "agent_paused"``. No real policy fired — but the audit pipeline
+# stays uniform.
+#
+# Fail-open: an empty agent_id (no identity could be resolved for
+# this call) means we cannot match against the paused set, so the
+# call is allowed through to the policy phases. This is the
+# correct posture — pausing is a per-agent verb; if we don't know
+# which agent we'd be enforcing on, we have to fall through and
+# let policies do their normal allow/block work. The platform
+# audit will still show the call against whatever agent the
+# backend's ingest pipeline ends up attributing it to.
+
+
+def _agent_paused_decision() -> PolicyDecision:
+    """Build the synthetic ``block`` decision for a paused agent."""
+    from egisai.policy.engine import MatchedPolicyRecord
+
+    record = MatchedPolicyRecord(
+        name="Agent paused",
+        type="agent_paused",
+        verdict="block",
+        reason_code="agent_paused",
+        message=(
+            "Agent is paused by an operator. Resume it from the "
+            "dashboard's Agents page to re-enable governed traffic."
+        ),
+    )
+    return PolicyDecision.deny(
+        reason_code="agent_paused",
+        message=(
+            "Agent is paused by an operator. Resume it from the "
+            "dashboard's Agents page to re-enable governed traffic."
+        ),
+        matched_policy="Agent paused",
+        matched_policies=(record,),
+    )
+
+
+def _is_agent_paused(agent_id: str) -> bool:
+    """Quick lookup against the cached paused-agent set.
+
+    Returns ``False`` whenever ``agent_id`` is empty (we can't
+    enforce a per-agent pause without an identity) so callers
+    fall through to the regular policy phases unchanged.
+    """
+    if not agent_id:
+        return False
+    return agent_id in get_paused_agent_ids()
+
+
 def evaluate(call: InputCall) -> PolicyDecision:
-    """Run the cached input rules against an in-flight call."""
+    """Run the cached input rules against an in-flight call.
+
+    Phase 0 first: if the active agent is paused, refuse the call
+    immediately — Phase 1 / Phase 2 never see the prompt and the
+    LLM judge never gets called. Then fall through to the normal
+    policy phases.
+    """
+    agent_id = _active_agent_id()
+    if _is_agent_paused(agent_id):
+        return _agent_paused_decision()
     rules = get_rules()
     if not rules:
         return PolicyDecision.allow()
-    rules = _scope_filter(rules, _active_agent_id())
+    rules = _scope_filter(rules, agent_id)
     if not rules:
         return PolicyDecision.allow()
     # First-call gate: if the analyzer is still warming and a
@@ -312,10 +387,20 @@ def evaluate(call: InputCall) -> PolicyDecision:
 
 
 def evaluate_output(call: OutputCall) -> PolicyDecision:
+    """Run the cached output rules against a model response.
+
+    Phase 0 mirrors ``evaluate``: a paused agent's response is
+    refused before any post-model policy fires. This also covers
+    framework patches whose first wrapped entry point is the
+    output / tool-result hook (``claude_agent_sdk``).
+    """
+    agent_id = _active_agent_id()
+    if _is_agent_paused(agent_id):
+        return _agent_paused_decision()
     rules = get_rules()
     if not rules:
         return PolicyDecision.allow()
-    rules = _scope_filter(rules, _active_agent_id())
+    rules = _scope_filter(rules, agent_id)
     if not rules:
         return PolicyDecision.allow()
     # Same first-call gate as ``evaluate`` — covers frameworks (e.g.

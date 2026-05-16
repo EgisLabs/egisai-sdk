@@ -74,15 +74,28 @@ def _sse_listen_loop() -> None:
             return
 
 
+# Event-name prefixes the SDK reacts to. Both ``policy.*`` (rule
+# create / update / delete / toggle) and ``agent.*`` (operator
+# pause / resume) bump the same shared cache via the ETag-aware
+# ``/v1/sdk/policies`` round-trip — so one event filter covers
+# both kinds of state mutation. Adding a new prefix here is the
+# extension point for future "things the SDK should re-fetch on"
+# (e.g. an org-wide ``settings.*`` topic).
+_REFRESH_EVENT_PREFIXES: tuple[str, ...] = ("policy.", "agent.")
+
+
 def _handle_sse(event_name: str, data: str) -> None:
     """React to one server-sent event.
 
-    Only ``policy.*`` events trigger a refresh. The data payload is
-    treated as an opaque trigger — the actual policy snapshot is
-    pulled by ``refresh_now()`` so we always hit the cache-aware
-    ETag path on the server.
+    Both ``policy.*`` and ``agent.*`` events trigger a refresh;
+    the data payload is treated as an opaque trigger so a forged
+    event body cannot poison the SDK's cache. The actual
+    snapshot — rules + paused-agent set — is pulled by
+    ``refresh_now()`` so we always go through the cache-aware
+    ETag path on the server (one no-op 304 round-trip on a
+    duplicate event, no payload validation here).
     """
-    if not event_name.startswith("policy."):
+    if not any(event_name.startswith(p) for p in _REFRESH_EVENT_PREFIXES):
         return
     _ = data  # opaque trigger; refresh_now() handles cache validation
     try:

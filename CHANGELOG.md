@@ -7,7 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.25.15] — 2026-05-15
+## [0.26.0] — 2026-05-15
+
+### Added
+
+- **Operator pause / resume — runtime kill switch for an agent.**
+  When an operator clicks *Pause* on the dashboard's Agents page,
+  the platform marks the agent paused (`agents.paused_at` set;
+  `paused_by` records the operator), bumps the org-scoped policy
+  ETag, and emits an `agent.changed` SSE event. The SDK reacts in
+  three ways:
+  1. `_policy_cache` now stores a `paused_agent_ids: frozenset`
+     in lockstep with the rule list. A 200 response from
+     `/v1/sdk/policies` carries the new field; a 304 leaves
+     both pieces of state untouched.
+  2. `_refresher` subscribes to the new `agent.*` SSE prefix in
+     addition to `policy.*`, so a pause takes effect SDK-side
+     within ≈ 50 ms (or one `refresh_interval_seconds` tick on
+     the polling fallback).
+  3. `_evaluator.evaluate` and `evaluate_output` gain a **Phase 0**
+     gate that runs **before** Phase 1's deterministic checks —
+     a paused agent's call short-circuits with a synthetic
+     `PolicyDecision.deny` (`reason_code = "agent_paused"`,
+     `matched_policy = "Agent paused"`) so no LLM token is spent
+     on a `semantic_guard` judge, no raw prompt is even hashed,
+     and the audit pipeline records the block in the same shape
+     every other policy block already uses.
+
+  Backwards-compatible: older backends that don't ship
+  `paused_agent_ids` are treated as "no agents are paused", which
+  matches their pre-rollout behaviour. The `replace_rules()`
+  helper takes the field as an optional keyword argument so
+  third-party callers (and the existing test suite) keep
+  compiling unchanged.
+
+
 
 ### Fixed
 
