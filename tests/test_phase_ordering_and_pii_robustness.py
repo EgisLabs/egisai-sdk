@@ -57,7 +57,6 @@ def _semantic_rule() -> dict:
         "tenant": None,
         "config": {
             "intents": ["delete database tables"],
-            "judge_model": "gpt-4o",
             "message": "Destructive intent.",
         },
     }

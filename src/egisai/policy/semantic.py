@@ -169,8 +169,17 @@ class SemanticBlocker:
         }
         if config.get("threshold") is not None:
             body["threshold"] = config["threshold"]
+        # ``judge_model`` used to be forwarded here so an operator
+        # could swap the underlying judge model per policy. That
+        # escape hatch has been removed: the platform's judge
+        # SYSTEM_PROMPT is calibrated against a single model and a
+        # silent swap would break the calibrated ``threshold``
+        # semantics every other knob assumes. Existing policies
+        # that still carry the field stay valid (no schema error);
+        # we just stop forwarding it and emit a one-time warning so
+        # the operator knows to clean it up.
         if config.get("judge_model"):
-            body["judge_model"] = config["judge_model"]
+            _warn_judge_model_ignored_once()
         return body
 
     def _interpret(
@@ -285,6 +294,7 @@ class SemanticBlocker:
 
 
 _legacy_warning_emitted = False
+_judge_model_warning_emitted = False
 
 
 def _warn_legacy_embedding_engine_once() -> None:
@@ -296,4 +306,27 @@ def _warn_legacy_embedding_engine_once() -> None:
         "semantic_guard policy uses ``engine: \"embedding\"`` — that path is "
         "no longer supported. Remove the ``engine`` field from the policy "
         "config to use the LLM judge (the default).",
+    )
+
+
+def _warn_judge_model_ignored_once() -> None:
+    """Loud-but-non-fatal warning the first time a semantic_guard
+    rule's ``judge_model`` field is seen at evaluation time.
+
+    The platform's judge SYSTEM_PROMPT is calibrated against a
+    single model, so an operator-supplied override would silently
+    skew the ``threshold`` semantics every other rule assumes. The
+    SDK stops forwarding the field as of 0.27.0; this warning
+    nudges operators to remove the dead key from their policy
+    config so audits don't show a knob that does nothing.
+    """
+    global _judge_model_warning_emitted
+    if _judge_model_warning_emitted:
+        return
+    _judge_model_warning_emitted = True
+    LOGGER.warning(
+        "semantic_guard policy has a ``judge_model`` field; that knob is "
+        "ignored — the platform always uses its calibrated judge model so "
+        "the ``threshold`` field behaves as documented. Remove "
+        "``judge_model`` from the policy config to clean this up.",
     )

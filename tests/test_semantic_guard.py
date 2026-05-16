@@ -272,13 +272,20 @@ def test_legacy_embedding_engine_is_no_op_with_warning() -> None:
     assert calls == [], "legacy embedding engine must not call the platform"
 
 
-# ── Threshold + judge_model are forwarded as request body fields ──────
+# ── Threshold is forwarded; judge_model is dropped ────────────────────
 
 
-def test_threshold_and_judge_model_are_forwarded_when_set() -> None:
-    """When the operator hand-edited a policy to include
-    ``threshold`` or ``judge_model``, the SDK passes them through to
-    the platform so the platform-side gate uses the override."""
+def test_threshold_is_forwarded_and_judge_model_is_not() -> None:
+    """``threshold`` is the operator-tunable knob — it must reach
+    the platform's judge endpoint so the per-policy override
+    actually takes effect.
+
+    ``judge_model`` used to ride alongside it. As of SDK 0.27.0 it
+    is removed end-to-end: the platform's judge SYSTEM_PROMPT is
+    calibrated against a single model, and an operator-supplied
+    override would silently skew the threshold semantics every
+    other rule assumes. The SDK now drops the field before the
+    POST; this test pins that contract."""
     import json
 
     from egisai.policy.semantic import SemanticBlocker
@@ -300,10 +307,14 @@ def test_threshold_and_judge_model_are_forwarded_when_set() -> None:
         {
             "intents": ["delete rows from a database table"],
             "threshold": 0.85,
+            # Legacy field; must be silently stripped by the SDK.
             "judge_model": "gpt-4o",
         },
     )
     assert captured["body"]["threshold"] == 0.85
-    assert captured["body"]["judge_model"] == "gpt-4o"
+    assert "judge_model" not in captured["body"], (
+        "SDK 0.27.0+ must NOT forward judge_model — the platform "
+        "controls the judge model exclusively."
+    )
     assert captured["body"]["prompt_text"] == "Delete all users"
     assert captured["body"]["intents"] == ["delete rows from a database table"]

@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.27.0] — 2026-05-16
+
+### Changed
+
+- **`semantic_guard` policies no longer support a per-policy
+  `judge_model` override.** The platform's judge `SYSTEM_PROMPT`
+  is calibrated against a single OpenAI model and the per-rule
+  `threshold` knob (default 0.75) behaves as documented only
+  against that calibration. Allowing operators to swap the model
+  per policy silently skewed the threshold semantics every other
+  rule on the workspace assumed — a foot-gun masquerading as a
+  knob. Removed end-to-end:
+  1. `SemanticBlocker._prepare()` (`egisai/policy/semantic.py`)
+     stops appending `judge_model` to the `/v1/sdk/judge` request
+     body. Existing policies that still carry the field stay
+     valid (no schema error); the field is silently ignored.
+  2. The first time a `semantic_guard` rule with a `judge_model`
+     entry is evaluated, the SDK logs one `WARNING` per process
+     pointing the operator at the cleanup. After that the field
+     is silent.
+  3. Platform-side, `/v1/sdk/judge` still accepts `judge_model`
+     in the request body (for back-compat with SDK ≤ 0.26.x)
+     but drops the value before invoking the judge.
+
+  Migration: remove `judge_model` from any `semantic_guard`
+  policy config in your dashboard. No code change required;
+  behavior is unchanged unless you were intentionally pointing
+  a policy at a different model — in which case the warning
+  surfaces it.
+
+---
+
 ## [0.26.0] — 2026-05-15
 
 ### Added
