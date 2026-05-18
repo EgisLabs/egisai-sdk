@@ -697,6 +697,62 @@ def test_tool_call_step_stamped_enforced_when_hook_active(
     assert step["tool_name"] == "run_shell"
 
 
+def test_tool_call_step_carries_input_under_prompt_preview_key(
+    fake_claude_with_hooks: tuple[Any, type, types.ModuleType],
+) -> None:
+    """Regression for 0.27.1 — every tool_call event MUST ship the
+    tool input under the wire key ``prompt_preview``.
+
+    The backend reads the audit row's preview text from
+    ``ev.get("prompt_preview")`` (see ``app.routers.sdk
+    ._build_request_log_row``). Pre-0.27.1 the Claude Agent SDK
+    patch shipped tool_call inputs under ``request_text`` (the DB
+    column name), which the backend ingest reader ignored —
+    leaving every tool_call row's ``request_text`` NULL and
+    collapsing the intent-summary LLM onto generic "Open ended
+    assistant chat" / "General chat follow up question" labels.
+    """
+    fake_backend, client_cls, mod = fake_claude_with_hooks
+    _load_rules()  # allow-all so the hook emits with verdict=allow
+    mod.__script__ = [
+        AssistantMessage(
+            [
+                ToolUseBlock(
+                    "lookup_customer_account",
+                    {"customer_id": "ACME-001", "fields": ["status"]},
+                    id_="tu_preview_A",
+                ),
+            ]
+        ),
+        ResultMessage(),
+    ]
+
+    async def run() -> None:
+        opts = _ClaudeAgentOptions()
+        async with client_cls(options=opts) as client:
+            await client.query("Look up ACME-001.")
+            async for _ in client.receive_response():
+                pass
+
+    asyncio.run(run())
+    _flush()
+
+    tool_steps = _step_events(fake_backend.events_received, kind="tool_call")
+    assert len(tool_steps) == 1
+    step = tool_steps[0]
+    preview = step.get("prompt_preview")
+    assert isinstance(preview, str) and preview, (
+        "tool_call step must carry the tool input under "
+        f"``prompt_preview`` (got {preview!r}; full keys="
+        f"{sorted(step.keys())})"
+    )
+    assert "ACME-001" in preview
+    # Defense in depth: the legacy key MUST NOT be set, or the
+    # backend's compatibility fallback would still read it and
+    # this test would mask a future regression.
+    assert "request_text" not in step
+
+
 def test_no_duplicate_tool_step_emitted_by_receive_when_hook_fired(
     fake_claude_with_hooks: tuple[Any, type, types.ModuleType],
 ) -> None:

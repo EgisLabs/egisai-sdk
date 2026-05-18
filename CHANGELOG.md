@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.27.1] — 2026-05-17
+
+### Fixed
+
+- **`tool_call` step events now ship the tool input under the
+  correct wire key.** Pre-0.27.1, every per-tool step row built
+  by `_patches/_common.py:_dispatch_per_tool_steps` and by the
+  Claude Agent SDK's PreToolUse / PostToolUse / post-hoc
+  fallback paths stamped the tool input under the dict key
+  `"request_text"` (matching the DB column name). The backend
+  ingest reader at `app.routers.sdk._build_request_log_row`
+  reads the audit row's preview text from
+  `ev.get("prompt_preview")`, so every `tool_call` row landed
+  with `request_text = NULL`. The dashboard's intent-summary
+  LLM then ran against an empty prompt and collapsed those
+  rows onto the generic "Open ended assistant chat" /
+  "General chat follow up question" fallback shapes (or, when
+  the LLM was unavailable, onto the `"Governed agent run"`
+  seed). Affected every framework that emits per-tool steps —
+  OpenAI Agents (sync + responses), Anthropic, Google
+  Generative AI, LangChain / LangGraph / LlamaIndex / Bedrock
+  via the shared `_common.gate_call` waterfall, and every
+  flavor of the Claude Agent SDK path. The fix renames the
+  wire key in all four sites to `"prompt_preview"`; no DB
+  schema change. Backend hardening lands alongside: ingest
+  now falls back to `ev.get("request_text")` so dashboards on
+  a fresh backend heal immediately for customers still on
+  ≤ 0.27.0. Two regression tests pin the new contract — one
+  on the OpenAI per-tool waterfall, one on the Claude Agent
+  SDK PreToolUse hook — and both assert that the legacy
+  `"request_text"` key is no longer set on the event (so the
+  backend's compatibility fallback can't mask a future
+  regression).
+
+---
+
 ## [0.27.0] — 2026-05-16
 
 ### Changed
@@ -1748,7 +1784,7 @@ see a uniform shape regardless of SDK age.
 - **RunTimelineModal** (click any row) shows the prompt → policy
   → model → policy → tool → … → final waterfall as a vertical
   timeline, paint-as-you-go via SSE.
-- **Overview → Recent runs** widget mirrors the Requests page.
+- **Overview → Recent governed actions** widget mirrors the Requests page.
 - **/v1/runs** + **/v1/runs/{run_id}** endpoints land alongside
   the still-supported `/v1/requests` (back-compat shim for one
   release).

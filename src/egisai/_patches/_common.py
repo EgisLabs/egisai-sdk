@@ -308,7 +308,14 @@ def _dispatch_per_tool_steps(
             "model": model,
             "stream": stream,
             "tool_name": name,
-            "request_text": _label_redact_tool_input(tool_input),
+            # Wire key MUST be ``prompt_preview`` — the backend reads
+            # the audit row's preview text from this field
+            # (``app.routers.sdk._build_request_log_row`` → ``ev.get(
+            # "prompt_preview")``). Shipping under ``request_text``
+            # (the column name on the DB side) is silently dropped
+            # because the ingest reader doesn't look at that key.
+            # Bug fix in 0.27.1 — see CHANGELOG.
+            "prompt_preview": _label_redact_tool_input(tool_input),
             # The parent model_call's output policy already gated
             # this tool request. Each per-tool step records the
             # invocation as ``allow`` so the timeline reads green

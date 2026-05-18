@@ -504,7 +504,14 @@ def _build_pretooluse_callback(
                     "model": model,
                     "stream": True,
                     "tool_name": tool_name,
-                    "request_text": _safe_preview_tool_input(tool_input),
+                    # Wire key MUST be ``prompt_preview`` — the backend
+                    # reads the audit row's preview text from this key
+                    # (``app.routers.sdk._build_request_log_row`` →
+                    # ``ev.get("prompt_preview")``). Shipping under
+                    # ``request_text`` silently drops the value on the
+                    # floor (column name on the DB ≠ wire key). Bug
+                    # fix in 0.27.1 — see CHANGELOG.
+                    "prompt_preview": _safe_preview_tool_input(tool_input),
                     "verdict": "allow",
                     "enforcement_status": ENFORCEMENT_ENFORCED,
                     "policy_latency_ms": elapsed_policy_ms,
@@ -875,7 +882,9 @@ def _build_posttooluse_callback(
                     "model": model,
                     "stream": True,
                     "tool_name": tool_name,
-                    "request_text": _safe_text_preview(replacement_text),
+                    # ``prompt_preview`` is the wire key the backend
+                    # reads (see note on the PreToolUse path above).
+                    "prompt_preview": _safe_text_preview(replacement_text),
                     "verdict": decision.verdict,
                     "enforcement_status": ENFORCEMENT_ENFORCED,
                     "policy_latency_ms": elapsed_policy_ms,
@@ -1429,7 +1438,9 @@ def _dispatch_tool_call_step(
         "model": model,
         "stream": True,
         "tool_name": tool_name,
-        "request_text": _safe_preview_tool_input(tool_input),
+        # ``prompt_preview`` is the wire key the backend reads
+        # (see note on the hook-gated path above).
+        "prompt_preview": _safe_preview_tool_input(tool_input),
         "verdict": "allow",
         "enforcement_status": ENFORCEMENT_ADVISORY,
     }

@@ -179,6 +179,49 @@ def test_chat_completions_emits_one_tool_call_step_per_tool(
         assert ev.get("enforcement_status") == "enforced"
         assert ev.get("verdict") == "allow"
 
+    # Regression for 0.27.1 — every tool_call event MUST ship the
+    # tool input under the wire key ``prompt_preview``. The backend
+    # reads the audit row's preview text from ``ev.get(
+    # "prompt_preview")`` (see ``app.routers.sdk
+    # ._build_request_log_row``); shipping it under ``request_text``
+    # (the DB column name) silently dropped the value on the floor,
+    # which left every tool_call row's ``request_text`` NULL and
+    # collapsed the intent-summary LLM onto generic "Open ended
+    # assistant chat" / "General chat follow up question" labels.
+    #
+    # The preview is *post-redaction* by design
+    # (``security-and-compliance.mdc`` §1) — ``_label_redact_tool_input``
+    # routes the JSON-serialized input through ``label_redact``
+    # before stamping the event. So we check for the field name
+    # (which is never redacted) plus an unredacted sentinel from
+    # the input (``ACC-1`` survives because it doesn't match any
+    # PII pattern).
+    for ev in tool_evs:
+        preview = ev.get("prompt_preview")
+        assert isinstance(preview, str) and preview, (
+            "tool_call events must ship the tool input under "
+            f"``prompt_preview`` (got {preview!r}; full keys="
+            f"{sorted(ev.keys())})"
+        )
+        assert ev["tool_name"] in {"lookup_customer", "send_email"}
+        if ev["tool_name"] == "lookup_customer":
+            # Field names aren't redacted; ``ACC-1`` doesn't match
+            # any PII pattern so it survives end-to-end.
+            assert "account_id" in preview
+            assert "ACC-1" in preview
+        else:
+            # ``send_email`` carried ``"x@example.com"`` which the
+            # URL detector correctly redacts to ``x@<URL>``. The
+            # important invariant is that the field key reaches
+            # the backend so the intent-summary LLM can describe
+            # the call.
+            assert "to" in preview
+            assert "x@" in preview
+        # Defense in depth: the legacy key MUST NOT be set, or the
+        # backend's compatibility fallback would still read it and
+        # the test would mask a future regression.
+        assert "request_text" not in ev
+
 
 def test_chat_completions_no_tool_calls_emits_no_tool_steps(
     fake_backend: Any,
