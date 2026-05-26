@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.27.2] — 2026-05-26
+
+### Changed
+
+- **README points to the canonical legal documents.** The
+  "Privacy and security" section now explicitly links to the
+  authoritative [Privacy Policy](https://egisai.co/privacy) and
+  [Terms of Service](https://egisai.co/terms) at `egisai.co` —
+  the SDK is Apache 2.0 but use of the hosted control plane is
+  governed by those documents, and customers reading the PyPI
+  page should be able to find them in one click.
+
+- **README ships the same enterprise disclaimers as the website.**
+  Two paragraphs added next to the architecture-review summary:
+  a *certification-status* disclaimer (EgisAI is not currently
+  SOC 2, ISO 27001, HIPAA, FedRAMP, or PCI DSS certified unless
+  the website Security page says otherwise with current evidence)
+  and a *no professional advice* disclaimer (the Service provides
+  technical controls and audit-supporting evidence, not legal /
+  regulatory / compliance / security advice). Both paragraphs are
+  kept in sync with `homepage/terms.html`,
+  `homepage/privacy.html`, the homepage compliance section, and
+  `docs/security.mdx` from a single source of truth in
+  `legal/snippets.md` (propagated by `scripts/sync_legal.py`),
+  so future legal-review cycles update every surface in one
+  step.
+
+No code or runtime behavior changed in this release — README-only.
+
+---
+
 ## [0.27.1] — 2026-05-17
 
 ### Fixed
@@ -104,7 +135,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Backwards-compatible: older backends that don't ship
   `paused_agent_ids` are treated as "no agents are paused", which
-  matches their pre-rollout behaviour. The `replace_rules()`
+  matches their pre-rollout Behavior. The `replace_rules()`
   helper takes the field as an optional keyword argument so
   third-party callers (and the existing test suite) keep
   compiling unchanged.
@@ -184,7 +215,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `response_output_message` / `response_output_text` siblings
   (those weren't affected because their imports had multiple
   symbols and ruff's reformat naturally put the ignore on the
-  outer line). No runtime behaviour change. Wheel + sdist for
+  outer line). No runtime Behavior change. Wheel + sdist for
   0.25.14 are byte-equivalent-modulo-comments to 0.25.13's
   artefacts.
 
@@ -234,7 +265,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      errors. Each import now carries the project-standard
      ignore directive.
 
-  No runtime behaviour change — the installed bytes are
+  No runtime Behavior change — the installed bytes are
   identical to what 0.25.12 would have shipped. This release
   exists because 0.25.12's PyPI publish was blocked by the
   `pytest` gate inside `release.yml`'s `test` job (the
@@ -542,7 +573,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surface now get their executors patched and attributed with
   ``identity_source="framework:langchain"`` exactly as on 0.x.
   The patch tries each home independently — neither installed →
-  silent no-op (legacy behaviour); only one installed → that one
+  silent no-op (legacy Behavior); only one installed → that one
   gets patched; both installed (transition envs) → both get
   patched. The modern ``langchain.agents.create_agent`` path is
   unchanged and continues to be covered transparently by the
@@ -2104,7 +2135,7 @@ Stress / coverage:
   called `set_context(agent=…)`. The resolver now runs *before*
   policy evaluation inside `gate_call` / `async_gate_call`, so any
   auto-detected identity is visible to scoped rules without user
-  intervention. Existing `set_context` callers see no behaviour
+  intervention. Existing `set_context` callers see no Behavior
   change (Tier 0 still wins).
 - **HTTP fallback attribution.** The `httpx` / `requests` model-host
   fallback now also runs identity resolution against the request
@@ -2131,9 +2162,9 @@ Stress / coverage:
 
   Existing rules unaffected: every policy that has ``action`` set
   explicitly (the default for any rule created via the dashboard's
-  modal) keeps its current behaviour. Only policies that OMITTED
+  modal) keeps its current Behavior. Only policies that OMITTED
   ``action`` — typically API-created rules — see the new default,
-  and that change is desirable: the previous behaviour would refuse
+  and that change is desirable: the previous Behavior would refuse
   the call even when masking would have preserved the user's
   workflow without risking a leak.
 
@@ -2249,7 +2280,7 @@ Stress / coverage:
   showing a fabricated value.
 
   The new ``cloud`` key is purely additive to the runtime blob;
-  no public API change, no behaviour change for existing code.
+  no public API change, no Behavior change for existing code.
 
 ---
 
@@ -2503,7 +2534,7 @@ Stress / coverage:
   `"pre_model"` (the prompt, before the call), `"post_model"` (the
   response, after the call), or `"both"`. Operators can scope a
   single rule to either side or keep the legacy "wherever it
-  applies" behaviour. Older platform responses that don't carry the
+  applies" Behavior. Older platform responses that don't carry the
   field default to `"both"`, preserving every previous deployment's
   semantics.
 - **Per-phase decision blocks on the audit event.** The SDK now
@@ -2531,7 +2562,7 @@ Stress / coverage:
 ### Internal
 
 - New tests cover phase filtering across both evaluators, the wire
-  parser's default behaviour, and the dual-decision audit shape on
+  parser's default Behavior, and the dual-decision audit shape on
   allow / pre-model-block / post-model-block paths.
 
 ---

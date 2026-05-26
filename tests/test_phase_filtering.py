@@ -5,7 +5,7 @@ Three phase values:
 - ``"pre_model"``  — only ``evaluate_policies`` (prompt side)
 - ``"post_model"`` — only ``evaluate_output_policies`` (response side)
 - ``"both"``       — runs on whichever side the rule's type supports
-                     (the default; preserves pre-0.12.4 behaviour for
+                     (the default; preserves pre-0.12.4 Behavior for
                      older platform responses that don't carry the
                      field at all)
 """
@@ -138,7 +138,7 @@ def test_both_phase_rule_runs_on_response_side() -> None:
 def test_to_rule_defaults_to_both_when_phase_field_absent() -> None:
     """Older platform responses don't carry ``phase`` — the SDK
     must default to ``"both"`` so each rule fires on whichever side
-    its type supports (the pre-0.12.4 behaviour).
+    its type supports (the pre-0.12.4 Behavior).
     """
     from egisai._policy_cache import _to_rule
 

@@ -1,4 +1,4 @@
-"""``semantic_guard`` SDK-side behaviour.
+"""``semantic_guard`` SDK-side Behavior.
 
 The LLM-judge for ``semantic_guard`` runs on the EgisAI platform —
 the SDK is a thin HTTP client over ``POST /v1/sdk/judge``. These

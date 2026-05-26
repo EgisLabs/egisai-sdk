@@ -142,7 +142,7 @@ def fetch_policies(
       agent UUIDs (lower-case canonical 8-4-4-4-12 form).
       Older backends that don't ship the field return an empty
       list — the SDK then treats the org as having no paused
-      agents, which matches their pre-rollout behaviour.
+      agents, which matches their pre-rollout Behavior.
 
     The triple-return wire shape is intentional: callers (the
     in-process ``_policy_cache``) want both pieces of state to

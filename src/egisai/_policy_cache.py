@@ -41,7 +41,7 @@ def _to_rule(d: dict) -> PolicyRule:
 
     ``agent_ids`` defaults to an empty tuple ("applies to all").
     ``phase`` defaults to ``"both"`` so older platform responses
-    (which don't carry the field) keep their previous behaviour:
+    (which don't carry the field) keep their previous Behavior:
     each rule fires on whichever side its type supports.
     Both ``"type"`` and the legacy ``"kind"`` field are accepted.
     """

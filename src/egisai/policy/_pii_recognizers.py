@@ -1,7 +1,7 @@
 """Custom Presidio recognizers that fill gaps in Presidio's defaults.
 
 Presidio ships ~60 entity recognizers out of the box, but four pieces
-of behaviour from our pre-Presidio engine still belong here because no
+of Behavior from our pre-Presidio engine still belong here because no
 upstream recognizer covers them:
 
 * **``EGIS_API_KEY``** — entropy-validated API keys / bearer tokens /

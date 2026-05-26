@@ -457,7 +457,7 @@ def _hash_bundle(parts: Iterable[Any]) -> str:
     return hashlib.sha256("\x1e".join(pieces).encode("utf-8")).hexdigest()
 
 
-# Legacy name patterns (kept for parity with prior behaviour when NER
+# Legacy name patterns (kept for parity with prior Behavior when NER
 # isn't warm). The new tiers prefer NER for novel prompts.
 _NAME_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bYou are\b\s+(?:a\s+|an\s+)?specialist:\s*([^.\n,;:]+)"),

@@ -32,7 +32,7 @@ def is_reserved_email_domain(domain: str) -> bool:
     Case-insensitive. ``endswith`` covers any subdomain beneath a
     reserved TLD (``api.example.invalid`` etc.). Used as a post-
     filter on Presidio's ``EmailRecognizer`` results AND inside the
-    regex fallback's email matcher so behaviour matches in both modes.
+    regex fallback's email matcher so Behavior matches in both modes.
     """
     if not domain:
         return False

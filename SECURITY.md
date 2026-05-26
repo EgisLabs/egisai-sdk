@@ -9,7 +9,7 @@ systems, so the integrity of this SDK is our customers' integrity.
 **Please report security issues privately, not in public GitHub
 issues.**
 
-- Email: **security@egisai.co** (monitored; replies within 48h).
+- Email: **adriano@egisai.co** (monitored; replies within 48h).
 - Encrypted alternatives: please mention the preferred channel in
   your initial unencrypted message and we will move to it (PGP,
   age, Signal, etc.). We don't currently publish a PGP key — if
@@ -50,7 +50,7 @@ Out of scope:
   attacker-untrusted).
 - Denial of service via volumetric flooding of `/v1/sdk/*`
   endpoints — these are protected by platform-side rate
-  limiting; report directly to security@egisai.co if you find a
+  limiting; report directly to adriano@egisai.co if you find a
   bypass.
 
 ## Supply-chain integrity

@@ -192,7 +192,7 @@ def sanitize(
     if type_filter is not None:
         unknown = _pii_taxonomy.unknown_types(type_filter)
         if unknown:
-            # Mirror the behaviour the operator wants: a clear log
+            # Mirror the Behavior the operator wants: a clear log
             # at policy-evaluation time so misconfigurations surface
             # instead of silently no-opping.
             LOGGER.warning(
@@ -386,7 +386,7 @@ def _apply_results(
     When two recognizers overlap on the same span (e.g. an SSN that
     also looks like a sequence of digits), the higher-score entity
     wins; this matches Presidio's own "highest score wins" merge
-    behaviour and prevents double-masking.
+    Behavior and prevents double-masking.
     """
     selected: list[tuple[int, int, str, float]] = []
     for r in raw_results:

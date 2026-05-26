@@ -747,7 +747,7 @@ def test_client_query_remains_a_coroutine_after_apply(
 ) -> None:
     """``inspect.iscoroutinefunction(ClaudeSDKClient.query)`` must
     remain True so downstream introspection (e.g. anyio's
-    coroutine-check) doesn't flip behaviour. This is the exact
+    coroutine-check) doesn't flip Behavior. This is the exact
     regression that produced the 0.17.2–0.17.4 ``TypeError: object
     async_generator can't be used in 'await' expression``."""
     import inspect

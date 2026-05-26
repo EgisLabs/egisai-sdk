@@ -212,11 +212,20 @@ For multi-tenant or test scenarios, you may override auto-detected context (for 
 
 - Do **not** embed secrets in repository copies of this README.
 - For vulnerability reporting, see **[SECURITY.md](https://github.com/EgisLabs/egisai-sdk/blob/main/SECURITY.md)** — please use the disclosed channel rather than public issues for security-sensitive matters.
+- The authoritative privacy and legal documents for the hosted platform are the **[Privacy Policy](https://egisai.co/privacy)** and **[Terms of Service](https://egisai.co/terms)** at `egisai.co`. This SDK ships under [Apache 2.0](https://github.com/EgisLabs/egisai-sdk/blob/main/LICENSE); use of the hosted control plane is governed by those documents.
 
 A short summary suitable for architecture reviews:
 
 - Governance evaluates prompts with respect to your organization’s policies before upstream invocation where applicable.
 - Sensitive-content handling is architected so that raw regulated values are not sent to third-party LLMs as part of policy enforcement workflows described here.
+
+<!-- LEGAL:certification-status:BEGIN -->
+<p><strong>Certification status.</strong> The platform is being built with SOC&nbsp;2, ISO&nbsp;27001, GDPR, HIPAA, and enterprise security expectations in mind. EgisAI is <strong>not currently</strong> SOC&nbsp;2, ISO&nbsp;27001, HIPAA, FedRAMP, PCI&nbsp;DSS, or other formally certified or attested unless expressly stated on the <a class="inline" href="https://docs.egisai.co/security">Security page</a> with current supporting evidence. Customers must complete their own compliance assessment before relying on the Service for regulated workloads.</p>
+<!-- LEGAL:certification-status:END -->
+
+<!-- LEGAL:no-professional-advice:BEGIN -->
+<p><strong>No professional advice.</strong> The Service provides technical controls, operational telemetry, and audit-supporting evidence. EgisAI does not provide legal, regulatory, compliance, security, audit, insurance, or risk-management advice. Customer remains responsible for determining whether its AI systems, workflows, notices, policies, controls, and records satisfy applicable laws, regulations, standards, and contractual obligations.</p>
+<!-- LEGAL:no-professional-advice:END -->
 
 ---
 

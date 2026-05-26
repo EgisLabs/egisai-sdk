@@ -240,7 +240,7 @@ def test_system_prompt_call_does_not_lazy_register_app(
     _attribute_event({}, payload)
 
     # The sub-agent ("Python Developer") was registered, but NOT
-    # the ``app`` agent ("my-test-agents") — exactly the behaviour
+    # the ``app`` agent ("my-test-agents") — exactly the Behavior
     # the user reported they wanted.
     names = [a["name"] for a in unbound_backend.ensured_agents]
     assert "Python Developer" in names

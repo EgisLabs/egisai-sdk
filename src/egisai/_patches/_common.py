@@ -428,7 +428,7 @@ def _attribute_event(ev: dict, payload: Any) -> None:
 
     if ctx.agent_id:
         # set_context(agent_id=…) escape hatch — explicit UUID on the
-        # context with no display name. Keep the legacy behaviour.
+        # context with no display name. Keep the legacy Behavior.
         return
 
     cfg = get_config()

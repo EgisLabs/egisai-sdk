@@ -189,7 +189,7 @@ def test_loading_success_is_silent_on_stderr_by_default(capsys):
     The user explicitly asked for the success log to disappear from
     terminal output. Default Python logging routes WARNING+ to
     stderr; INFO is dropped unless the operator wires a handler.
-    This test pins the behaviour so a future refactor doesn't
+    This test pins the Behavior so a future refactor doesn't
     accidentally regress the print/log split.
     """
     with patch.object(_pii_loader, "is_settled", return_value=False), patch.object(
