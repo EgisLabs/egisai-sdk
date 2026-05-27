@@ -15,9 +15,11 @@ This document is the canonical SDK guide for **[PyPI](https://pypi.org/project/e
 | Capability | What it means for you |
 |------------|------------------------|
 | **Central policies** | Operators configure rules in the [EgisAI dashboard](https://app.egisai.co). The SDK loads them at runtime and refreshes them continuously—no redeploy to tighten controls. |
-| **Transparent integration** | No proxy layer and no wrapper objects you must remember to use. Supported libraries are patched in-process when your application imports them after `egisai.init()`. |
-| **Audit trail** | Governed calls emit structured events to your org so teams can review verdicts, latency, and usage in one place. |
+| **Transparent integration** | No proxy layer and no wrapper objects you must remember to use. `egisai.init()` patches every supported library that is importable in the current environment; calls through their normal API go through governance without further wiring. |
+| **Broad framework coverage** | Direct provider SDKs (OpenAI, Anthropic, Google Gemini, AWS Bedrock Converse) plus the major agent frameworks (LangChain, LangGraph, OpenAI Agents, CrewAI, AutoGen, Agno, Strands, smolagents, LlamaIndex, Pydantic AI, Google ADK, Claude Agent SDK) are governed transparently. |
+| **Audit trail** | Governed calls emit structured events to your org so teams can review verdicts, latency, tool calls, and usage in one place. |
 | **Local-first sensitive checks** | Pattern-based PII handling and other deterministic rules run entirely inside your process before traffic leaves your environment. |
+| **Automatic agent identity** | Each logical agent in your process is auto-detected and registered on the dashboard. Sub-agents fingerprinted by system prompt, framework hook, or explicit name show up as distinct rows for attribution. |
 
 ---
 
@@ -162,9 +164,11 @@ egisai.init(..., on_block="stub")
 | `env` | `"production"` | Environment label (for example `staging`, `prod`). Free-form string for your own segmentation. |
 | `base_url` | Hosted control plane | Override only when directed by EgisAI (for example dedicated regions or enterprise deployments). |
 | `on_block` | `"raise"` | `"raise"` or `"stub"` — see above. |
+| `semantic_on_outage` | `"allow"` | What `semantic_guard` rules do if the intent judge can't be reached. `"allow"` fails open (preserves availability); `"block"` fails closed (refuses the call when the judge is unreachable). |
 | `refresh_interval_seconds` | `10` | How often to poll for policy updates if live streaming is unavailable. |
 | `enable_sse` | `True` | Subscribe to live policy and configuration updates when supported. |
 | `enable_http_fallback` | `True` | Optional patching of `httpx` / `requests` for broader HTTP visibility where enabled. |
+| `auto_stack_hints` | `"loose"` | Controls the stack-frame inspector used by the agent identity resolver. `"loose"` (default) honors common conventions; `"strict"` requires an explicit `__egisai_agent__` marker; `"off"` disables stack inspection. |
 | `quiet` | `False` | Set `True` to suppress the one-line startup banner on stderr. |
 
 ### Environment variables
@@ -187,8 +191,8 @@ Organizations configure policies in the dashboard. Typical categories include:
 | **PII & secrets** | Detect and block or mask categories such as government identifiers, payment data, and credential-shaped strings before model calls. |
 | **Content patterns** | Allow or deny prompts or outputs matching operator-defined patterns. |
 | **Models & size** | Restrict which model names may be called or cap prompt size. |
-| **Intent** | Block requests that match dangerous or out-of-scope *intent* even when phrased obliquely or in another language. |
-| **Tools & connectors** | Restrict tool, shell, or integration use when the model returns structured tool or command requests. |
+| **Intent** | Block prompts, responses, *or* tool calls that match dangerous or out-of-scope *intent* even when phrased obliquely or in another language. |
+| **Tools, shell, MCP & connectors** | Restrict tool, shell, MCP, database, or financial actions when the model returns structured tool or command requests. |
 
 Exact rule JSON and ordering are managed in the product; the SDK consumes the published configuration and does not require you to embed policy documents in your repository.
 
@@ -196,7 +200,45 @@ Exact rule JSON and ordering are managed in the product; the SDK consumes the pu
 
 ## Advanced: explicit context (optional)
 
-For multi-tenant or test scenarios, you may override auto-detected context (for example agent identity) with `egisai.set_context(**kwargs)` as described in the package API. This is **optional**—the default path fingerprints agents from your application’s behavior.
+The SDK auto-detects an agent identity for each call (system-prompt fingerprint, framework signal, or explicit name) so you usually don't need to wire anything up. When you do want to override it explicitly, three primitives are public:
+
+```python
+import egisai
+
+# 1) Per-task metadata. Writes to a ContextVar — async/threads inherit.
+egisai.set_context(
+    agent="billing-agent",       # logical sub-agent name
+    user_id="u_123",
+    user_role="customer",
+    session_id="s_abc",
+    workflow_id="wf_42",
+    end_user_id="hash_of_customer_id",
+)
+
+# 2) Block-scoped agent identity. Wins outright over auto-detection
+# inside the block; the previous identity is restored on exit.
+with egisai.agent("Triage"):
+    client.chat.completions.create(...)
+
+# 3) Eager registration so the Agent row exists on the dashboard
+# before any traffic flows. Useful at process startup.
+egisai.register_agent("billing-agent")
+```
+
+The `set_context` and `agent()` paths use `ContextVar`, so asyncio tasks and child threads inherit the values cleanly without leaking across requests. Explicit overrides always win over auto-detection.
+
+### Health snapshot for `/healthz` endpoints
+
+```python
+import egisai
+
+snapshot = egisai.diagnostics()
+# {"initialized": True, "sdk_version": "0.28.0", "app": "...",
+#  "env": "...", "policy_etag": "...", "policy_rule_count": 12,
+#  "audit_queue_size": 0, "audit_dropped_total": 0, ...}
+```
+
+`diagnostics()` is a JSON-serializable dict suitable for exposing on your own health endpoint or dashboard so you can confirm the SDK is initialized, policies are loaded, and audit delivery is keeping up.
 
 ---
 
@@ -242,15 +284,28 @@ A short summary suitable for architecture reviews:
 
 ## Supported Python libraries
 
-| Library | Notes |
-|---------|--------|
-| `openai` ≥ 1.40 | Chat Completions, Responses API, streaming where supported by the adapter. |
-| `anthropic` ≥ 0.40 | Messages API, streaming. |
-| `google-genai` ≥ 1.0 | `client.models.generate_content`, async, streaming. |
-| `google-generativeai` ≥ 0.8 | `GenerativeModel.generate_content`, streaming. Install via `egisai[google-legacy]`. |
-| `httpx` / `requests` | Optional broad HTTP capture when the fallback is enabled. |
+| Category | Library | Notes |
+|----------|---------|-------|
+| **Direct provider SDK** | `openai` ≥ 1.40 | Chat Completions, Responses API, sync + async, streaming, tool calls. |
+| | `anthropic` ≥ 0.40 | Messages API, sync + async, streaming, tool use. |
+| | `google-genai` ≥ 1.0 | `client.models.generate_content`, async, streaming, function calls. |
+| | `google-generativeai` ≥ 0.8 | `GenerativeModel.generate_content`, streaming. Install via `egisai[google-legacy]`. |
+| | `boto3` (AWS Bedrock) | `bedrock-runtime` Converse / ConverseStream and `bedrock-agent-runtime` `InvokeAgent`. |
+| **Agent framework** | `openai-agents` | `Runner.run` — identity wrap; tool gating cascades to the OpenAI patch. |
+| | `claude-agent-sdk` | `ClaudeSDKClient` / `query()` — `PreToolUse` + `PostToolUse` hooks gate tool dispatch and tool results in-process. |
+| | `langchain` / `langchain-classic` | Classic `AgentExecutor.invoke` + modern `create_agent` (via LangGraph cascade). |
+| | `langgraph` | `Pregel.invoke` / `.stream` and `CompiledStateGraph` — identity wrap; cascades to provider patch. |
+| | `crewai` | `Agent.execute_task` — identity wrap. |
+| | `autogen` | `AssistantAgent.run` — identity wrap. |
+| | `agno` | `Agent.run` / `Agent.arun` — identity wrap. |
+| | `strands-agents` | `Agent.__call__` — identity wrap. |
+| | `smolagents` | Agent entry — identity wrap. |
+| | `llama-index` | `FunctionAgent` / `ReActAgent` / `CodeActAgent` / `AgentWorkflow` — identity wrap with workflow-handler awareness. |
+| | `pydantic-ai` | `Agent.run` — identity wrap. |
+| | `google-adk` | ADK entry — identity wrap. |
+| **HTTP fallback** | `httpx` / `requests` | Optional broad HTTP capture for libraries that bypass the official provider SDKs. Matches on known LLM provider hosts AND known model-call path tokens to avoid logging unrelated traffic. |
 
-Minimum versions are guidance; pin in your own `requirements.txt` for reproducible builds.
+Minimum versions are guidance; pin in your own `requirements.txt` for reproducible builds. Only frameworks that are actually importable in your environment are activated at runtime — if you don't install a framework's package, the SDK silently skips its patch.
 
 ---
 
@@ -310,11 +365,11 @@ For Bedrock Agents specifically, see [SECURITY.md](https://github.com/EgisLabs/e
 Releases are published to PyPI via automation. To verify a wheel cryptographically when verifying identity bindings published by the project:
 
 ```bash
-pip download egisai==0.10.0 --no-deps
+pip download egisai==0.28.0 --no-deps
 python -m sigstore verify identity \
   --cert-identity-regexp "https://github.com/EgisLabs/egisai-sdk/.+" \
   --cert-oidc-issuer "https://token.actions.githubusercontent.com" \
-  egisai-0.10.0-py3-none-any.whl
+  egisai-0.28.0-py3-none-any.whl
 ```
 
 Adjust the version to match the release you installed. A CycloneDX SBOM is attached to GitHub releases for supply-chain review.
