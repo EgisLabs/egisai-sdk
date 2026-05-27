@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.27.3] — 2026-05-27
+
+### Fixed
+
+- **`pip install egisai` now brings `click` on its own.** A fresh
+  install on a clean Python 3.10+ environment was broken since
+  `typer 0.26.0` (released early 2026) vendored its copy of click
+  into `typer/_click/` and dropped `click` from `Requires-Dist`.
+  spaCy still imports the external `click` directly in
+  `spacy/cli/_util.py` (`from click import NoSuchOption`), and
+  `spacy/__init__.py` eagerly loads that submodule on every plain
+  `import spacy`, so the missing transitive dep caused the
+  Presidio analyzer to fail to load on first `init()` with:
+
+      [egisai] PII NER analyzer failed to load
+      (ModuleNotFoundError: No module named 'click') — falling
+      back to regex+checksum detection.
+
+  The SDK kept running (failed-open, regex+checksum PII detection
+  stayed on), but name / location / GDPR-special-category text
+  was silently un-flagged on fresh installs until the operator
+  added `click` by hand. Now `egisai`'s `pyproject.toml` declares
+  `click>=8.0` as a direct runtime dep so pip resolves it
+  regardless of typer's vendoring choice. No SDK code changed —
+  this is purely a metadata bump.
+
+  Existing installs that already had `click` in `site-packages`
+  (any environment with flask, uvicorn, mypy, black, pip-tools,
+  or even pip itself) were never affected; this only repairs
+  greenfield installs.
+
+  Operators stuck on `0.27.2` can unblock themselves immediately
+  with `pip install click` — no need to wait for the upgrade.
+
+---
+
 ## [0.27.2] — 2026-05-26
 
 ### Changed

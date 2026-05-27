@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "egisai"
-version = "0.27.2"
+version = "0.27.3"
 description = "Native runtime governance SDK for AI agents — import egisai; egisai.init() and you're protected."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -65,6 +65,19 @@ dependencies = [
   "presidio-analyzer>=2.2.355,<3.0",
   "presidio-anonymizer>=2.2.355,<3.0",
   "spacy>=3.7.0,<4.0",
+  # ``click`` is a direct dep, not because the SDK imports click
+  # itself, but because spaCy does — ``spacy/cli/_util.py`` runs
+  # ``from click import NoSuchOption`` and ``spacy/__init__.py``
+  # eagerly imports ``spacy.cli.info`` on module load, so plain
+  # ``import spacy`` fails the moment click is missing. Until
+  # ``typer 0.26.0`` this was a transitive dep through
+  # ``typer → click``, but ``typer 0.26`` vendored click into
+  # ``typer/_click/`` and dropped it from ``Requires-Dist``. The
+  # result is that a fresh ``pip install spacy`` (and therefore a
+  # fresh ``pip install egisai``) no longer brings click in, and
+  # the Presidio NER analyzer fails to load on first ``init()``.
+  # Pinning click directly closes that gap until spaCy adapts.
+  "click>=8.0",
 ]
 
 [project.optional-dependencies]

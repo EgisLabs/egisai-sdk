@@ -14,7 +14,7 @@ plus an httpx / requests fallback.
 
 from __future__ import annotations
 
-__version__ = "0.27.2"
+__version__ = "0.27.3"
 
 from egisai._context import agent, register_agent, set_context
 from egisai._init import diagnostics, init, shutdown
