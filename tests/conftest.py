@@ -114,6 +114,10 @@ class FakeBackend:
         # call order; one entry per HTTP request.
         self.ensure_requests: list[dict[str, Any]] = []
         self.handshake_requests: list[dict[str, Any]] = []
+        # Startup-warning telemetry — captured per request so tests
+        # can pin both the payload shape and the no-payload-on-
+        # privacy-exit cases without standing up real HTTP.
+        self.startup_warnings: list[dict[str, Any]] = []
         self._next_agent_serial = 100
 
     def set_rules(self, rules: list[dict[str, Any]], etag: str = '"new"') -> None:
@@ -172,6 +176,16 @@ class FakeBackend:
             import json
 
             self.events_received.extend(json.loads(request.content.decode())["events"])
+            return httpx.Response(204)
+        if path.endswith("/v1/sdk/telemetry/startup-warning"):
+            import json
+
+            try:
+                self.startup_warnings.append(
+                    json.loads(request.content.decode())
+                )
+            except Exception:
+                self.startup_warnings.append({})
             return httpx.Response(204)
         if path.endswith("/v1/sdk/stream"):
             # We don't actually run SSE in unit tests — just return a non-streaming 200.

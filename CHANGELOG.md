@@ -7,19 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.27.3] — 2026-05-27
+## [0.28.0] — 2026-05-27
+
+This release closes one acute regression and adds the supporting
+infrastructure so the same class of "shipped a broken
+`pip install`" never goes unnoticed again. The user-facing
+changes ship in two halves: a direct dep bump that repairs fresh
+installs (the immediate fix); and a small, opt-in-via-default
+startup-telemetry hop that lets the operator's dashboard surface
+SDK-side install warnings before the next customer pings them.
 
 ### Fixed
 
 - **`pip install egisai` now brings `click` on its own.** A fresh
   install on a clean Python 3.10+ environment was broken since
-  `typer 0.26.0` (released early 2026) vendored its copy of click
-  into `typer/_click/` and dropped `click` from `Requires-Dist`.
-  spaCy still imports the external `click` directly in
-  `spacy/cli/_util.py` (`from click import NoSuchOption`), and
-  `spacy/__init__.py` eagerly loads that submodule on every plain
-  `import spacy`, so the missing transitive dep caused the
-  Presidio analyzer to fail to load on first `init()` with:
+  `typer 0.26.0` vendored its copy of click into `typer/_click/`
+  and dropped `click` from `Requires-Dist`. spaCy still imports
+  the external `click` directly in `spacy/cli/_util.py`
+  (`from click import NoSuchOption`), and `spacy/__init__.py`
+  eagerly loads that submodule on every plain `import spacy`, so
+  the missing transitive dep caused the Presidio analyzer to
+  fail to load on first `init()` with:
 
       [egisai] PII NER analyzer failed to load
       (ModuleNotFoundError: No module named 'click') — falling
@@ -28,10 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The SDK kept running (failed-open, regex+checksum PII detection
   stayed on), but name / location / GDPR-special-category text
   was silently un-flagged on fresh installs until the operator
-  added `click` by hand. Now `egisai`'s `pyproject.toml` declares
+  added `click` by hand. `egisai`'s `pyproject.toml` now declares
   `click>=8.0` as a direct runtime dep so pip resolves it
-  regardless of typer's vendoring choice. No SDK code changed —
-  this is purely a metadata bump.
+  regardless of typer's vendoring choice.
 
   Existing installs that already had `click` in `site-packages`
   (any environment with flask, uvicorn, mypy, black, pip-tools,
@@ -40,6 +47,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Operators stuck on `0.27.2` can unblock themselves immediately
   with `pip install click` — no need to wait for the upgrade.
+
+### Added
+
+- **Startup-warning telemetry — dashboard now shows when an
+  install reports an SDK init-time issue.** Previously, when a
+  customer's SDK hit a non-fatal init-time problem (today: the
+  PII NER analyzer failing to load), the only signal was a single
+  log line on the customer's own stderr. We — the platform
+  operator — had no way of knowing until the customer asked.
+
+  The SDK now fires a one-shot fire-and-forget POST to
+  `/v1/sdk/telemetry/startup-warning` whenever a warning fires.
+  The dashboard's new "SDK install warnings" banner (silent until
+  `total_recent > 0`) surfaces a count + per-code rollup + the
+  most recent N events, so a regression is visible the next time
+  the operator loads the dashboard instead of weeks later via a
+  support ticket.
+
+  **Privacy contract:** the payload carries operator-controlled
+  diagnostic columns only — a stable `code`, the exception class
+  name, a *sanitized* one-line error message (the SDK strips
+  obvious filesystem home-directory paths and truncates to 256
+  chars before transmission), the SDK version, the Python
+  version, and the OS family. No prompt text, no API key
+  material, no agent display names, no customer-identifying
+  value ever crosses this boundary. See
+  `egisai._backend.post_startup_warning` for the SDK-side
+  contract and `app/db/models/sdk_startup_warning.py` for the
+  backend storage shape.
+
+  **Reliability contract:** the send is fire-and-forget. Every
+  failure mode — backend down, 4xx, 5xx, slow network, missing
+  config, malformed exception — is swallowed silently inside
+  the telemetry function so the user's `egisai.init()` and
+  first model call are never delayed or blocked by this
+  diagnostic hop.
+
+  **No retries, one event per process.** Re-emitting on every
+  restart would inflate dashboard counts and bury new signals
+  under repeats.
+
+### Internal
+
+- **Pipeline hardening — never silently ship a broken
+  `pip install egisai` again.** Three new gates land alongside
+  the dep bump above:
+
+  1. **`ci.yml: fresh-install` matrix job.** Every PR / push now
+     builds the wheel, installs it into a brand-new venv (no
+     `[dev]` extras, no editable install) on each supported
+     Python × OS cell, and exercises the exact import chain a
+     customer hits on first `init()`. The class of failure that
+     bit us this week — "every existing dev venv has the dep
+     transitively, but a fresh `pip install` doesn't" — would
+     have been a red CI check from the moment of the regression.
+  2. **`nightly-install.yml` scheduled workflow.** Once a day
+     at 07:00 UTC, a fresh runner installs `egisai` from PyPI
+     (both `pinned` and `--upgrade-strategy eager` strategies)
+     and runs the same import smoke. Catches the case where our
+     code is unchanged but an upstream dep regression breaks the
+     already-published wheel for new customers. This is the
+     time-based safety net the click bug would have needed.
+  3. **`release.yml: smoke-install` gate.** A new step between
+     `build` and `sign` that installs the just-built wheel into
+     a fresh venv on a fresh runner and exercises the same
+     import smoke. The publish step now depends on this — a
+     wheel that can't be installed will never reach PyPI.
+
+  All three gates share the same script body (intentionally
+  inlined, not factored into a helper, so the mirror repo
+  stays standalone). The smoke covers `import egisai`,
+  `import spacy`, `import click`, the full
+  `presidio_analyzer` chain, and the public SDK surface.
 
 ---
 

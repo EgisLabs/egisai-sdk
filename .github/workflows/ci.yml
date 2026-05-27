@@ -79,3 +79,96 @@ jobs:
 
       - name: Validate distribution metadata
         run: twine check dist/*
+
+      - name: Upload built distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-ci
+          path: dist/
+          retention-days: 7
+
+  fresh-install:
+    # Simulates the experience a brand-new customer has when they run
+    # ``pip install egisai`` in an empty venv on a clean machine. None
+    # of the other CI jobs catch this class of failure: ``test`` does
+    # ``pip install -e ".[dev]"`` which seeds an editable install with
+    # every dev dep (some of which transitively bring in packages our
+    # runtime deps depend on but don't declare), so the failure mode
+    # "fresh install of the published wheel is broken because of a
+    # silently-missing transitive dep" never surfaces in ``test``.
+    #
+    # We hit that exact failure mode in 0.27.x when ``typer 0.26.0``
+    # vendored click into ``typer/_click/`` and dropped click from
+    # ``Requires-Dist``: every existing gate stayed green because every
+    # existing venv had click via some other path, but a real
+    # ``pip install egisai`` no longer brought it in and ``import
+    # spacy`` blew up on first ``egisai.init()``. The smoke matrix
+    # below makes that class of regression a red CI check from now on.
+    name: Fresh-install smoke (Py ${{ matrix.python-version }} on ${{ matrix.os }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Download built wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-ci
+          path: dist/
+
+      - name: Install wheel into a fresh venv (no extras, no editable)
+        # Intentionally no ``[dev]``, no ``-e``, no
+        # ``--upgrade-strategy eager``. This is the exact shape of a
+        # customer's first install — bare runtime deps only.
+        run: |
+          python -m venv /tmp/egisai-smoke
+          /tmp/egisai-smoke/bin/pip install --upgrade pip
+          /tmp/egisai-smoke/bin/pip install dist/*.whl
+
+      - name: Exercise the customer's import chain
+        # If any of these imports fail, the wheel is shipping with a
+        # silently-broken dep graph and no customer can ``init()``.
+        # Keep this step's surface tight: do NOT import the dev test
+        # helpers, do NOT mock anything — we want to reproduce the
+        # blast radius a real ``import egisai; egisai.init()`` has on
+        # day one.
+        run: |
+          /tmp/egisai-smoke/bin/python - <<'PY'
+          import importlib, sys
+          print(f"python: {sys.version.split()[0]}")
+
+          import egisai
+          print(f"egisai: {egisai.__version__}")
+
+          # The exact chain that previously raised on missing click.
+          # If typer / spaCy ever drop another transitive again this
+          # is the line that goes red.
+          import spacy
+          print(f"spacy: {spacy.__version__}")
+          from spacy.cli.download import download as _spacy_download  # noqa: F401
+
+          from presidio_analyzer import AnalyzerEngine  # noqa: F401
+          from presidio_analyzer.nlp_engine import NlpEngineProvider  # noqa: F401
+
+          # Click is the one we got bit by; assert it's importable so
+          # the failure message is friendly when this regresses again.
+          import click
+          print(f"click: {click.__version__}")
+
+          # Public SDK surface — these are the names customers import.
+          from egisai import init, shutdown, set_context, diagnostics  # noqa: F401
+          from egisai.policy import (  # noqa: F401
+              PolicyContext, PolicyDecision, PolicyRule,
+              evaluate_policies, evaluate_output_policies,
+          )
+          from egisai.policy.pii import sanitize, scan  # noqa: F401
+
+          print("OK — fresh install smoke green")
+          PY

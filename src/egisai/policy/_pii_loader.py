@@ -203,6 +203,20 @@ def _load_in_background(*, quiet: bool) -> None:
             exc.__class__.__name__,
             exc,
         )
+        # Surface the warning on the operator's dashboard via a
+        # fire-and-forget telemetry POST. The send itself is
+        # bulletproof (any failure is swallowed silently inside
+        # ``post_startup_warning``), but we still wrap the call in
+        # a defensive try/except so even a future regression in
+        # the import path can't break the daemon thread's
+        # fail-open contract. See ``_backend.post_startup_warning``
+        # for the privacy / reliability contract this call honors.
+        try:
+            from egisai._backend import post_startup_warning
+
+            post_startup_warning("pii_ner_loader_failed", exc)
+        except Exception:  # noqa: BLE001 - belt-and-suspenders, fail-open
+            pass
         with _lock:
             _state.error = exc
     finally:

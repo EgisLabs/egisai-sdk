@@ -1,0 +1,123 @@
+name: Nightly install check
+
+# Time-based safety net for the class of failure that no
+# push-based CI gate can catch on its own: an upstream dep regresses
+# in a way that breaks a fresh ``pip install egisai`` of the SAME
+# wheel we already shipped to PyPI weeks ago.
+#
+# The concrete case we got bit by: ``typer 0.26.0`` vendored click
+# into ``typer/_click/`` and dropped click from ``Requires-Dist``.
+# We didn't push any code, but the next fresh-venv install of our
+# already-published wheel started failing because typer no longer
+# pulled click transitively. Push-based CI (ci.yml) could not have
+# caught that — only a recurring check that re-installs the live
+# PyPI artifact in a brand-new environment can.
+#
+# This workflow runs daily at 07:00 UTC, picks the latest published
+# ``egisai`` version off PyPI, installs it in a clean venv on a
+# clean GitHub-hosted runner, and exercises the import chain a
+# customer hits on first ``egisai.init()``. If anything is broken,
+# the workflow goes red and GitHub emails the repo's commit author.
+#
+# Two matrix dimensions:
+#  - Python version: confirm the install is healthy on every
+#    supported interpreter (3.11 / 3.12 / 3.13).
+#  - Install strategy: ``pinned`` reproduces a customer who runs
+#    ``pip install egisai`` today against PyPI; ``eager`` reproduces
+#    a customer who upgrades aggressively with
+#    ``--upgrade-strategy eager`` (catches the case where our pins
+#    are too loose against a newly-released upstream).
+
+on:
+  schedule:
+    # 07:00 UTC daily — that's 00:00 PT (winter) / 23:00 PT (summer
+    # previous day) for the maintainer. Pick whichever wall-clock
+    # works for the operator; the cron value is intentionally not
+    # at the top of an hour so we're not in the cron-storm window
+    # that GitHub Actions occasionally throttles.
+    - cron: "0 7 * * *"
+  # Lets us trigger an ad-hoc run from the Actions UI — handy after
+  # noticing a problem in the wild and wanting to confirm the live
+  # install is still broken / fixed.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: pip install egisai (${{ matrix.strategy }} — Py ${{ matrix.python-version }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Don't ``fail-fast``: one matrix cell failing (e.g. a Python
+      # version with a transient PyPI cache issue) shouldn't hide the
+      # signal from the rest of the matrix. We want to see every
+      # combination's outcome.
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+        os: [ubuntu-latest, macos-latest]
+        strategy: [pinned, eager]
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Fresh venv
+        run: python -m venv /tmp/egisai-nightly
+
+      - name: Install egisai from PyPI (${{ matrix.strategy }})
+        # ``pinned`` = exactly what a customer typing ``pip install
+        # egisai`` gets today. ``eager`` adds
+        # ``--upgrade-strategy eager`` which forces transitive deps
+        # to their newest compatible versions, surfacing the case
+        # where our minimum-version pins are too loose against a new
+        # upstream release.
+        run: |
+          /tmp/egisai-nightly/bin/pip install --upgrade pip
+          if [ "${{ matrix.strategy }}" = "eager" ]; then
+            /tmp/egisai-nightly/bin/pip install --upgrade --upgrade-strategy eager egisai
+          else
+            /tmp/egisai-nightly/bin/pip install egisai
+          fi
+
+      - name: Report installed dep graph
+        # Always run, even if the smoke step below fails. Lets us
+        # eyeball the version snapshot when triaging "what changed
+        # since yesterday?"
+        if: always()
+        run: /tmp/egisai-nightly/bin/pip list
+
+      - name: Exercise the import chain a customer hits on first init()
+        # Identical body to the ci.yml ``fresh-install`` smoke step.
+        # Kept inline (not factored into a shared script) because
+        # there's no convenient way to share scripts across these
+        # standalone workflow files in the public mirror repo
+        # without inventing infrastructure.
+        run: |
+          /tmp/egisai-nightly/bin/python - <<'PY'
+          import sys
+          print(f"python: {sys.version.split()[0]}")
+
+          import egisai
+          print(f"egisai: {egisai.__version__}")
+
+          import spacy
+          print(f"spacy: {spacy.__version__}")
+          from spacy.cli.download import download as _spacy_download  # noqa: F401
+
+          from presidio_analyzer import AnalyzerEngine  # noqa: F401
+          from presidio_analyzer.nlp_engine import NlpEngineProvider  # noqa: F401
+
+          import click
+          print(f"click: {click.__version__}")
+
+          from egisai import init, shutdown, set_context, diagnostics  # noqa: F401
+          from egisai.policy import (  # noqa: F401
+              PolicyContext, PolicyDecision, PolicyRule,
+              evaluate_policies, evaluate_output_policies,
+          )
+          from egisai.policy.pii import sanitize, scan  # noqa: F401
+
+          print("OK — nightly install smoke green")
+          PY

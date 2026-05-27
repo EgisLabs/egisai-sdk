@@ -243,3 +243,108 @@ def post_events(events: list[dict[str, Any]]) -> None:
             "egisai event flush errored: %s",
             exc.__class__.__name__,
         )
+
+
+# ── SDK health telemetry ──────────────────────────────────────────
+#
+# One-shot fire-and-forget POST used when the SDK detects an init-
+# time problem the operator should know about — e.g. the PII NER
+# analyzer fails to load because of a missing transitive dep. The
+# SDK still falls open into its regex-fallback path and the user's
+# call site keeps working; this hop just surfaces the warning on
+# the operator's dashboard so they find out *before* the next
+# customer pings them about it.
+#
+# Privacy-side contract (per security-and-compliance.mdc):
+#
+#  - Payload carries operator-controlled diagnostic data only:
+#    a machine-readable ``code`` (e.g. ``pii_ner_loader_failed``),
+#    the exception class name, a sanitized one-line error message,
+#    and platform fingerprint bits (SDK version, Python version,
+#    OS family).
+#  - The error message is **scrubbed** for obvious filesystem
+#    paths (``/Users/<name>/`` → ``/Users/<redacted>/``) and
+#    truncated before transmission. We never ship the exception's
+#    traceback, locals, or repr of any in-process object.
+#  - No prompt text, response text, API key, agent name, agent ID,
+#    or customer-identifying value ever reaches this endpoint. The
+#    payload is, by design, the same shape we'd be comfortable
+#    surfacing on a public status page.
+#
+# Reliability contract:
+#
+#  - Fire-and-forget: catches every exception and never raises.
+#    A backend outage MUST NOT delay ``egisai.init()`` or break
+#    the user's first model call.
+#  - No retries: the warning fires once per process per code.
+#    Re-emitting on every restart would inflate dashboard counts
+#    and bury new signals under repeats.
+#  - Short timeout (3 s) so a slow / unreachable backend can't
+#    stall the PII loader's daemon thread for the default 10 s.
+
+
+def _sanitize_telemetry_string(raw: str, *, max_chars: int = 256) -> str:
+    """Scrub obvious filesystem paths and truncate.
+
+    The exception message comes from upstream code (spaCy, Presidio,
+    pip, …) and 99% of the time it's a short class-of-error string
+    like ``"No module named 'click'"``. The remaining 1% — file-
+    backed errors — can legitimately embed ``/Users/<operator>/…``
+    or ``/home/<operator>/…`` paths that we treat as PII for the
+    purposes of telemetry. A small regex scrub keeps the operator's
+    home-dir layout off our dashboards without losing the signal of
+    *which* file class blew up. Truncation caps the field for the
+    database column and prevents a tracebackish dump from clogging
+    the UI.
+    """
+    import re
+
+    s = re.sub(r"(/Users/|/home/)[^/\s'\"]+", r"\1<redacted>", raw)
+    s = re.sub(
+        r"([Cc]:[\\/]Users[\\/])[^\\/\s'\"]+",
+        r"\1<redacted>",
+        s,
+    )
+    return s[:max_chars]
+
+
+def post_startup_warning(code: str, exc: BaseException) -> None:
+    """Best-effort POST to surface an SDK init-time warning on the dashboard.
+
+    ``code`` is a stable machine identifier (e.g.
+    ``"pii_ner_loader_failed"``); ``exc`` is the exception the
+    caller already logged. Both are encoded into a tiny JSON blob,
+    POSTed to ``/v1/sdk/telemetry/startup-warning``, and forgotten.
+    Every failure mode (no client, no network, 4xx, 5xx, slow
+    backend, malformed exception) is swallowed — the function never
+    raises.
+    """
+    try:
+        from egisai._config import get_config_optional
+        from egisai._runtime import collect_runtime_fingerprint
+
+        cfg = get_config_optional()
+        if cfg is None:
+            return
+        rt = collect_runtime_fingerprint(sdk_version=cfg.sdk_version)
+        payload: dict[str, Any] = {
+            "code": code,
+            "error_class": exc.__class__.__name__,
+            "error_message": _sanitize_telemetry_string(str(exc)),
+            "sdk_version": cfg.sdk_version,
+            "python_version": rt.get("python"),
+            "os": rt.get("os"),
+        }
+        r = get_client().post(
+            "/v1/sdk/telemetry/startup-warning",
+            json=payload,
+            timeout=3.0,
+        )
+        if r.status_code >= 400 and LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug("startup-warning POST got HTTP %s", r.status_code)
+    except Exception as exc2:  # noqa: BLE001
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                "startup-warning POST errored: %s",
+                exc2.__class__.__name__,
+            )

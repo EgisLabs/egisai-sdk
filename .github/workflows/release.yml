@@ -82,12 +82,79 @@ jobs:
           name: dist
           path: dist/
 
+  smoke-install:
+    # Last line of defense before the wheel hits PyPI. Even if every
+    # earlier gate is green, we MUST confirm that the wheel we just
+    # built can actually be installed by a real customer in an empty
+    # venv with no extras, no editable install, no dev deps. This
+    # catches the failure class where the unit-test venv had every
+    # dep transitively satisfied (e.g. ``click`` pulled in by some
+    # dev dep) but a bare ``pip install <wheel>`` is broken because
+    # of a missing runtime dep — exactly what bit us when typer 0.26
+    # dropped click.
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Install the just-built wheel into a fresh venv
+        run: |
+          python -m venv /tmp/egisai-release-smoke
+          /tmp/egisai-release-smoke/bin/pip install --upgrade pip
+          /tmp/egisai-release-smoke/bin/pip install dist/*.whl
+
+      - name: Exercise the import chain a customer hits on first init()
+        run: |
+          /tmp/egisai-release-smoke/bin/python - <<'PY'
+          import sys
+          print(f"python: {sys.version.split()[0]}")
+
+          import egisai
+          print(f"egisai: {egisai.__version__}")
+
+          import spacy
+          print(f"spacy: {spacy.__version__}")
+          from spacy.cli.download import download as _spacy_download  # noqa: F401
+
+          from presidio_analyzer import AnalyzerEngine  # noqa: F401
+          from presidio_analyzer.nlp_engine import NlpEngineProvider  # noqa: F401
+
+          import click
+          print(f"click: {click.__version__}")
+
+          from egisai import init, shutdown, set_context, diagnostics  # noqa: F401
+          from egisai.policy import (  # noqa: F401
+              PolicyContext, PolicyDecision, PolicyRule,
+              evaluate_policies, evaluate_output_policies,
+          )
+          from egisai.policy.pii import sanitize, scan  # noqa: F401
+
+          print("OK — release smoke green")
+          PY
+
   sign:
     # Sigstore-sign the wheel + sdist via OIDC. The signature
     # certificate is bound to this workflow's GitHub OIDC identity,
     # so customers can verify the wheel was built from this repo's
     # tagged commit — no private key on our side.
-    needs: build
+    #
+    # Depends on ``smoke-install`` (not just ``build``) so we never
+    # sign — and therefore never publish — a wheel that can't be
+    # installed by a real customer. The smoke gate is the last
+    # line of defense before any byte hits PyPI.
+    needs: [build, smoke-install]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
