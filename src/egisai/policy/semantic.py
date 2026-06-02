@@ -26,12 +26,73 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
 LOGGER = logging.getLogger("egisai.policy.semantic")
+
+
+def _env_float(name: str, default: float, *, lo: float = 0.0) -> float:
+    """Parse a float env var with a sane fallback, clamped at ``lo``.
+
+    Returns ``default`` when the env var is missing, blank, or
+    unparseable. Operators tuning these knobs in production
+    typically set them in seconds; we clamp at ``lo`` so a stray
+    "0" doesn't make every judge call instantly time out (which
+    would silently turn ``semantic_guard`` into a no-op under the
+    default ``on_outage="allow"`` mode — exactly the kind of
+    governance regression compliance auditors hate).
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        parsed = float(raw)
+    except ValueError:
+        LOGGER.warning(
+            "%s=%r is not a valid float — falling back to default %.1f",
+            name, raw, default,
+        )
+        return default
+    return max(lo, parsed)
+
+
+# ── SDK-side judge HTTP knobs ────────────────────────────────────────
+#
+# The judge endpoint is the only network call inside the policy
+# evaluation hot path. Its tail latency directly inflates the
+# dashboard's ``policy_latency_ms`` column, so the SDK gives
+# operators two knobs they can tighten without re-installing:
+#
+#   * ``EGISAI_JUDGE_TIMEOUT_SECS`` — maximum wall-clock the SDK
+#     waits on a single round-trip to ``/v1/sdk/judge``. The
+#     backend's own OpenAI-judge timeout is 15 s, so anything
+#     much higher than that just lets a slow backend silently
+#     widen the SDK's stall window. The default lands at 8.0 s
+#     to give operators a healthier worst-case while still
+#     leaving comfortable headroom for normal P50 traffic
+#     (~0.5–2 s round-trip).
+#
+#   * ``EGISAI_JUDGE_RETRY_AFTER_MAX_SECS`` — clamp on the
+#     ``Retry-After`` header value the SDK honors on HTTP 429.
+#     A misconfigured upstream proxy can return ``Retry-After:
+#     90`` and freeze the call for 90 s per attempt × 3 attempts.
+#     The clamp guarantees a single retry costs at most this
+#     many seconds even when the upstream tells us to wait
+#     longer. Default 5.0 s is plenty of breathing room for a
+#     real bursty rate limit while keeping a misbehaving header
+#     from holding governance hostage.
+#
+# Both are read every time a ``SemanticBlocker`` is constructed
+# (i.e. once per ``egisai.init()``), so changing the env var
+# requires re-initialising the SDK — same lifecycle as every
+# other knob (api_key, app, etc.). This is intentional: per-call
+# tunables would be a footgun for compliance.
+_DEFAULT_JUDGE_TIMEOUT_SECS = 8.0
+_DEFAULT_JUDGE_RETRY_AFTER_MAX_SECS = 5.0
 
 
 # ── Public surface ────────────────────────────────────────────────────
@@ -73,6 +134,8 @@ class SemanticBlocker:
         platform_api_key: str,
         platform_base_url: str,
         on_outage: str = "allow",
+        judge_timeout_secs: float | None = None,
+        judge_retry_after_max_secs: float | None = None,
     ) -> None:
         if on_outage not in ("allow", "block"):
             raise ValueError(
@@ -81,7 +144,25 @@ class SemanticBlocker:
         self._api_key = platform_api_key
         self._base_url = platform_base_url.rstrip("/")
         self._on_outage = on_outage
-        self._http_client = httpx.Client(timeout=20.0)
+        # Resolution order for each knob: explicit constructor
+        # arg → env var override → tuned default. Constructor args
+        # exist primarily for tests; production callers go through
+        # ``egisai.init()`` which lets the env vars win.
+        if judge_timeout_secs is None:
+            judge_timeout_secs = _env_float(
+                "EGISAI_JUDGE_TIMEOUT_SECS",
+                _DEFAULT_JUDGE_TIMEOUT_SECS,
+                lo=0.5,
+            )
+        if judge_retry_after_max_secs is None:
+            judge_retry_after_max_secs = _env_float(
+                "EGISAI_JUDGE_RETRY_AFTER_MAX_SECS",
+                _DEFAULT_JUDGE_RETRY_AFTER_MAX_SECS,
+                lo=0.1,
+            )
+        self._judge_timeout_secs = float(judge_timeout_secs)
+        self._judge_retry_after_max_secs = float(judge_retry_after_max_secs)
+        self._http_client = httpx.Client(timeout=self._judge_timeout_secs)
         self._async_http_client: httpx.AsyncClient | None = None
 
     # ── Public API ────────────────────────────────────────────────────
@@ -223,7 +304,9 @@ class SemanticBlocker:
 
     def _ensure_async_client(self) -> httpx.AsyncClient:
         if self._async_http_client is None:
-            self._async_http_client = httpx.AsyncClient(timeout=20.0)
+            self._async_http_client = httpx.AsyncClient(
+                timeout=self._judge_timeout_secs,
+            )
         return self._async_http_client
 
     def _post_with_429_retry(self, body: dict[str, Any]) -> httpx.Response:
@@ -284,13 +367,39 @@ class SemanticBlocker:
         }
 
     def _retry_after_seconds(self, response: httpx.Response) -> float:
+        """Parse + clamp the ``Retry-After`` header.
+
+        Clamp is two-sided:
+
+        * Lower bound 0.1 s — sleeping below 100 ms hammers the
+          upstream and is rarely what an operator actually wanted
+          when they set the header to ``"0"``.
+        * Upper bound ``self._judge_retry_after_max_secs`` (default
+          5 s, env-overridable) — guards against a misconfigured
+          upstream proxy or rogue 429 emitter shipping a header
+          like ``Retry-After: 90`` and freezing every governed
+          call for 90 s × ``_RETRY_429_MAX`` attempts. With three
+          retries that turns a single misconfigured upstream into
+          a 270-second policy stall — completely unacceptable for
+          something that runs inside the SDK's hot path.
+
+        Note: the HTTP/1.1 spec also allows ``Retry-After`` to be
+        an HTTP-date instead of a delta-seconds integer. The SDK
+        does not honor that variant — production observation shows
+        it's used by zero major LLM platforms / CDNs in front of
+        our judge endpoint, and parsing dates here is more risk
+        than reward (timezone sources of error, clock skew). On a
+        non-numeric header we fall back to the fixed
+        ``_RETRY_429_FALLBACK_S`` and proceed with the next attempt.
+        """
         retry_after_raw = response.headers.get("Retry-After")
         if not retry_after_raw:
             return self._RETRY_429_FALLBACK_S
         try:
-            return max(0.1, float(retry_after_raw))
+            parsed = float(retry_after_raw)
         except ValueError:
             return self._RETRY_429_FALLBACK_S
+        return max(0.1, min(parsed, self._judge_retry_after_max_secs))
 
 
 _legacy_warning_emitted = False

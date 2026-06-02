@@ -14,6 +14,7 @@ For each governed call:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable
@@ -27,9 +28,11 @@ from egisai._config import get_config
 from egisai._context import (
     ensure_trace_id,
     get_context,
+    get_init_latency,
     get_policy_checked,
     get_policy_usage,
     get_source,
+    reset_init_latency,
     reset_policy_usage,
     reset_trace,
     set_policy_checked,
@@ -506,6 +509,11 @@ def _run_input_phase(
     ``matched_policies``, …) for older backends and the new
     structured ``prompt_decision`` block consumed by 0.12.4+.
     """
+    # Reset the init-latency contextvar BEFORE we start the policy
+    # timer so the next call's measurement is independent of any
+    # prior state. The contextvar is per-call (asyncio task / thread)
+    # so concurrent calls don't poison each other.
+    reset_init_latency()
     policy_started = time.monotonic()
     decision = evaluate(
         InputCall(
@@ -516,7 +524,19 @@ def _run_input_phase(
             stream=stream,
         )
     )
-    ev["policy_latency_ms"] = int((time.monotonic() - policy_started) * 1000)
+    elapsed_ms = int((time.monotonic() - policy_started) * 1000)
+    # Subtract one-shot warm-up wall-clock (PII NER loader on call
+    # #1) from the policy column. The wait is library init, not
+    # per-call governance work — the dashboard's
+    # ``policy_latency_ms`` should reflect the cost the operator's
+    # rules actually paid, not "how long the SDK took to start up
+    # the very first time". The cold-start cost is still surfaced
+    # on ``init_latency_ms`` so SOC 2 / capacity-planning use cases
+    # don't lose the signal.
+    init_ms = get_init_latency()
+    ev["policy_latency_ms"] = max(0, elapsed_ms - init_ms)
+    if init_ms > 0:
+        ev["init_latency_ms"] = init_ms
     policy_in, policy_out = get_policy_usage()
     ev["policy_tokens_in"] = policy_in
     ev["policy_tokens_out"] = policy_out
@@ -629,6 +649,12 @@ def _run_output_phase(
     # evaluation below and then goes out of scope with this function.
 
     prev_pol_in, prev_pol_out = get_policy_usage()
+    # Reset the init-latency contextvar so any cold-start wait paid
+    # inside this phase (extremely rare — Phase 1's deterministic
+    # checks are already loaded by call-#1's input phase, but
+    # framework patches that route the OUTPUT side first like
+    # ``claude_agent_sdk`` may pay it here) is booked separately.
+    reset_init_latency()
     policy_started = time.monotonic()
 
     decision = evaluate_output(
@@ -646,8 +672,13 @@ def _run_output_phase(
 
     if ev is not None:
         elapsed_ms = int((time.monotonic() - policy_started) * 1000)
+        init_ms = get_init_latency()
         cur_pol_in, cur_pol_out = get_policy_usage()
-        ev["policy_latency_ms"] = int(ev.get("policy_latency_ms") or 0) + elapsed_ms
+        ev["policy_latency_ms"] = int(ev.get("policy_latency_ms") or 0) + max(
+            0, elapsed_ms - init_ms
+        )
+        if init_ms > 0:
+            ev["init_latency_ms"] = int(ev.get("init_latency_ms") or 0) + init_ms
         ev["policy_tokens_in"] = int(ev.get("policy_tokens_in") or 0) + max(
             0, cur_pol_in - prev_pol_in
         )
@@ -1013,7 +1044,25 @@ async def _async_gate_call_inner(
     reset_policy_usage()
     step_started = time.monotonic()
     try:
-        decision = _run_input_phase(
+        # Async gate hot-path: ``_run_input_phase`` ultimately calls
+        # ``SemanticBlocker.check()`` which is a *blocking* httpx
+        # round-trip to ``/v1/sdk/judge``. Calling it directly from
+        # an asyncio coroutine pins the entire event loop until the
+        # judge responds (median ~500 ms, P99 several seconds), so
+        # *every other* concurrent request on the same loop —
+        # tools, websockets, queue consumers, framework keep-alives
+        # — stalls. ``asyncio.to_thread`` parks the synchronous body
+        # on a worker thread; Python 3.9+ propagates the current
+        # ContextVar snapshot (identity record, source, policy
+        # usage accumulator, init-latency accumulator) into the
+        # worker so behavior is byte-identical to a direct call.
+        # We don't propagate ContextVar **writes** back to the
+        # parent task — that's fine because every accumulator we
+        # care about is read inside the same phase that wrote it,
+        # and the audit ``ev`` dict is mutated in place (dict
+        # references survive thread boundaries).
+        decision = await asyncio.to_thread(
+            _run_input_phase,
             source=source,
             target=target,
             model=model,
@@ -1046,7 +1095,11 @@ async def _async_gate_call_inner(
         ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
         _stamp_usage(ev, response, extract_usage)
 
-        output_decision = _run_output_phase(
+        # Same to_thread wrap as the input phase — output-side
+        # ``semantic_guard`` rules also issue a blocking judge
+        # HTTP call, so we keep the event loop free here too.
+        output_decision = await asyncio.to_thread(
+            _run_output_phase,
             response=response,
             payload=payload,
             source=source,

@@ -136,6 +136,19 @@ def _maybe_wait_for_pii_analyzer(rules: list) -> None:
         warm = _pii_loader.wait_for_warm(timeout)
         elapsed_ms = int((time.monotonic() - started) * 1000)
         _warmup_done = True
+        # Per-call accounting: book this one-shot wait under the
+        # init-latency contextvar so the gate's surrounding policy
+        # timer can subtract it before stamping ``policy_latency_ms``
+        # on the audit event. Without this the dashboard's
+        # "policy enforcement latency" column for call #1 of every
+        # fresh process bundles the spaCy/Presidio model load
+        # (~2 s typical, up to ~90 s on first install) into what
+        # operators read as governance time. The actual cold-start
+        # cost is still visible — it just lands on
+        # ``ev["init_latency_ms"]`` instead of being silently
+        # attributed to per-call policy work.
+        from egisai._context import add_init_latency
+        add_init_latency(elapsed_ms)
         # Both branches go through the ``egisai.evaluator`` logger
         # rather than ``sys.stderr`` directly. Default Python logging
         # config is WARNING+, so SUCCESS (.info) is silent unless the

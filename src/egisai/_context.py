@@ -55,6 +55,26 @@ _policy_usage: contextvars.ContextVar[tuple[int, int]] = contextvars.ContextVar(
     "egisai_policy_usage", default=(0, 0)
 )
 
+# Per-call accumulator for **init-time wall-clock** the gate paid that
+# was previously bundled into ``policy_latency_ms``. The canonical
+# contributor is the one-shot PII NER (Presidio + spaCy) warm-up wait
+# inside ``_maybe_wait_for_pii_analyzer`` — it can take up to
+# ``EGISAI_PII_WARMUP_TIMEOUT_SECS`` (default 2 s) on call #1 of a
+# fresh process. Counting that as "policy enforcement latency"
+# misattributes a one-shot library load to per-call governance work
+# and makes the dashboard's ``policy_latency_ms`` number look
+# permanently inflated for short-lived workloads.
+#
+# The accumulator is filled by code paths that pay the wait, and the
+# gate (``_run_input_phase`` / ``_run_output_phase``) reads + clears
+# it BEFORE stamping ``policy_latency_ms`` on the audit event. The
+# init time is then surfaced separately on ``ev["init_latency_ms"]``
+# so operators can still see the cold-start cost — just not in the
+# governance column.
+_init_latency_ms: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "egisai_init_latency_ms", default=0
+)
+
 # Compat alias — the unified cache lives in ``_auto_agent`` now. Tests
 # in ``conftest.py`` clear ``_agent_id_cache`` explicitly so we keep
 # the symbol bound to the new shared dict to preserve their semantics.
@@ -270,3 +290,33 @@ def add_policy_usage(tokens_in: int, tokens_out: int) -> None:
 def get_policy_usage() -> tuple[int, int]:
     """Return ``(tokens_in, tokens_out)`` consumed by the policy step."""
     return _policy_usage.get()
+
+
+def reset_init_latency() -> None:
+    """Zero out the per-call init-time accumulator.
+
+    Called at the top of the gate's policy step so a previous turn's
+    accumulator (or a stray contextvar default) doesn't bleed into
+    this call's measurement.
+    """
+    _init_latency_ms.set(0)
+
+
+def add_init_latency(elapsed_ms: int) -> None:
+    """Add ``elapsed_ms`` to the per-call init-time accumulator.
+
+    Code paths that pay one-shot warm-up wall-clock (PII NER loader
+    today; future analyzers may add to this) call this helper with
+    however many milliseconds they actually waited. The gate later
+    pops the total via :func:`get_init_latency` and surfaces it on
+    ``ev["init_latency_ms"]`` instead of bundling it into
+    ``policy_latency_ms``.
+    """
+    if elapsed_ms <= 0:
+        return
+    _init_latency_ms.set(_init_latency_ms.get() + int(elapsed_ms))
+
+
+def get_init_latency() -> int:
+    """Return ms accumulated in the per-call init-time accumulator."""
+    return _init_latency_ms.get()

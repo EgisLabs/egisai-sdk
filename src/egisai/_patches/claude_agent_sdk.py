@@ -70,6 +70,7 @@ Import-guarded; fail-open.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 import time
@@ -85,9 +86,11 @@ from egisai._auto_agent import (
 )
 from egisai._config import get_config
 from egisai._context import (
+    get_init_latency,
     get_policy_checked,
     get_policy_usage,
     get_source,
+    reset_init_latency,
     reset_policy_usage,
     reset_trace,
     set_policy_checked,
@@ -451,9 +454,24 @@ def _build_pretooluse_callback(
         try:
             with scope_cm:
                 prev_pol_in, prev_pol_out = get_policy_usage()
+                # Init-latency split: a PreToolUse hook can be the
+                # very first egisai entry-point in a fresh process
+                # (no input phase ran yet on this client), so the
+                # one-shot PII NER warm-up may land here. Book it
+                # under ``init_latency_ms`` instead of letting it
+                # inflate the per-tool ``policy_latency_ms``.
+                reset_init_latency()
                 policy_started = time.monotonic()
                 try:
-                    decision = evaluate_output(
+                    # PreToolUse fires inside an async hook callback
+                    # — running ``evaluate_output`` synchronously
+                    # here would block the asyncio event loop on the
+                    # judge HTTP round-trip. Park it on a worker so
+                    # other coroutines (especially other PreToolUse
+                    # hooks for sibling tools in the same turn) keep
+                    # making progress.
+                    decision = await asyncio.to_thread(
+                        evaluate_output,
                         OutputCall(
                             source=SOURCE_NAME,
                             target=f"{TARGET_DEFAULT}.tool_call",
@@ -465,7 +483,7 @@ def _build_pretooluse_callback(
                             ],
                             mcp_targets=mcp_target,
                             stream=True,
-                        )
+                        ),
                     )
                 except Exception:  # noqa: BLE001
                     LOGGER.debug(
@@ -477,8 +495,12 @@ def _build_pretooluse_callback(
                     decisions[tuid] = "allow"
                     return _hook_response_allow()
 
-                elapsed_policy_ms = int(
+                elapsed_policy_ms_raw = int(
                     (time.monotonic() - policy_started) * 1000
+                )
+                hook_init_ms = get_init_latency()
+                elapsed_policy_ms = max(
+                    0, elapsed_policy_ms_raw - hook_init_ms
                 )
                 cur_pol_in, cur_pol_out = get_policy_usage()
 
@@ -521,6 +543,8 @@ def _build_pretooluse_callback(
                         max(0, (time.monotonic() - started) * 1000)
                     ),
                 }
+                if hook_init_ms > 0:
+                    ev["init_latency_ms"] = hook_init_ms
 
                 ev["response_decision"] = _decision_block(decision)
                 if decision.verdict == "block":
@@ -790,9 +814,18 @@ def _build_posttooluse_callback(
         try:
             with scope_cm:
                 prev_pol_in, prev_pol_out = get_policy_usage()
+                # Init-latency split (see PreToolUse hook for the
+                # full rationale): one-shot warm-up wait does NOT
+                # count toward governance time on this row.
+                reset_init_latency()
                 policy_started = time.monotonic()
                 try:
-                    decision = evaluate_output(
+                    # PostToolUse hook is async — keep the event
+                    # loop free during the (potentially blocking)
+                    # judge round-trip. See PreToolUse for the
+                    # full rationale.
+                    decision = await asyncio.to_thread(
+                        evaluate_output,
                         OutputCall(
                             source=SOURCE_NAME,
                             target=f"{TARGET_DEFAULT}.tool_result",
@@ -807,7 +840,7 @@ def _build_posttooluse_callback(
                             mcp_targets=[],
                             stream=True,
                             allow_sanitize=True,
-                        )
+                        ),
                     )
                 except Exception:  # noqa: BLE001
                     LOGGER.debug(
@@ -829,8 +862,12 @@ def _build_posttooluse_callback(
                 # Verdict is sanitize or block — emit an audit step
                 # row AND substitute the response Claude sees.
 
-                elapsed_policy_ms = int(
+                elapsed_policy_ms_raw = int(
                     (time.monotonic() - policy_started) * 1000
+                )
+                hook_init_ms = get_init_latency()
+                elapsed_policy_ms = max(
+                    0, elapsed_policy_ms_raw - hook_init_ms
                 )
                 cur_pol_in, cur_pol_out = get_policy_usage()
 
@@ -895,6 +932,8 @@ def _build_posttooluse_callback(
                     ),
                     "response_decision": _decision_block(decision),
                 }
+                if hook_init_ms > 0:
+                    ev["init_latency_ms"] = hook_init_ms
                 if decision.verdict == "block":
                     ev["reason_code"] = decision.reason_code
                     ev["reason"] = decision.message
@@ -1446,6 +1485,10 @@ def _dispatch_tool_call_step(
     }
 
     prev_pol_in, prev_pol_out = get_policy_usage()
+    # Init-latency split: same accounting shape as the hook-active
+    # paths so legacy advisory rows also show governance time
+    # without the spaCy/Presidio cold-start cost folded in.
+    reset_init_latency()
     policy_started = time.monotonic()
     try:
         decision = evaluate_output(
@@ -1467,9 +1510,12 @@ def _dispatch_tool_call_step(
         )
         decision = None
 
-    elapsed_ms = int((time.monotonic() - policy_started) * 1000)
+    elapsed_ms_raw = int((time.monotonic() - policy_started) * 1000)
+    init_ms = get_init_latency()
     cur_pol_in, cur_pol_out = get_policy_usage()
-    ev["policy_latency_ms"] = elapsed_ms
+    ev["policy_latency_ms"] = max(0, elapsed_ms_raw - init_ms)
+    if init_ms > 0:
+        ev["init_latency_ms"] = init_ms
     ev["policy_tokens_in"] = max(0, cur_pol_in - prev_pol_in)
     ev["policy_tokens_out"] = max(0, cur_pol_out - prev_pol_out)
     ev["latency_ms"] = int(max(0, (time.monotonic() - started_at) * 1000))
@@ -1560,6 +1606,34 @@ def _run_output_phase(
     tool_calls = list(signals.get("tool_calls", []))
     mcp_targets = list(signals.get("mcp_targets", []))
 
+    # When PreToolUse hooks are wired we already evaluated every
+    # ``tool_call`` / ``tool_name`` / ``mcp_target`` individually as
+    # the CLI requested them — emitting a per-tool ``tool_call`` step
+    # row apiece. Re-running those signals through ``evaluate_output``
+    # here would issue a second ``semantic_guard`` judge round-trip
+    # for every tool the model invoked (the engine's tool_calls loop
+    # in ``_semantic_guard_match`` is sequential, so an N-tool turn
+    # paid 2N round-trips before this fix). The doubling shows up on
+    # the dashboard as inflated ``policy_latency_ms`` AND
+    # ``policy_tokens_*`` aggregated across the Run's steps.
+    #
+    # The fix: when hooks were active, only feed the *text* signal to
+    # this phase — the assistant's accumulated ``TextBlock`` content
+    # was NOT gated by PreToolUse, so text-only rules
+    # (``deny_output_regex`` / ``semantic_guard.targets=["text"]`` /
+    # ``pii_scan`` on output) still need to fire here. Tool/MCP
+    # signals are dropped because the PreToolUse hook already
+    # emitted authoritative per-tool decisions.
+    #
+    # Hooks-off path is unchanged: this phase is the only place
+    # those signals get evaluated, so we MUST keep them in the
+    # OutputCall for advisory-mode framework users.
+    saw_tool_signals_pre_filter = bool(tool_names or tool_calls or mcp_targets)
+    if hooks_active:
+        tool_names = []
+        tool_calls = []
+        mcp_targets = []
+
     if not (text or tool_names or tool_calls or mcp_targets):
         return None
 
@@ -1567,6 +1641,10 @@ def _run_output_phase(
     # privacy contract in the docstring.
 
     prev_pol_in, prev_pol_out = get_policy_usage()
+    # Init-latency split: same accounting as ``_common._run_output_phase`` —
+    # one-shot library cold-start (PII NER load) goes on
+    # ``init_latency_ms`` instead of ``policy_latency_ms``.
+    reset_init_latency()
     policy_started = time.monotonic()
 
     try:
@@ -1589,8 +1667,13 @@ def _run_output_phase(
         return None
 
     elapsed_ms = int((time.monotonic() - policy_started) * 1000)
+    init_ms = get_init_latency()
     cur_pol_in, cur_pol_out = get_policy_usage()
-    ev["policy_latency_ms"] = int(ev.get("policy_latency_ms") or 0) + elapsed_ms
+    ev["policy_latency_ms"] = int(ev.get("policy_latency_ms") or 0) + max(
+        0, elapsed_ms - init_ms
+    )
+    if init_ms > 0:
+        ev["init_latency_ms"] = int(ev.get("init_latency_ms") or 0) + init_ms
     ev["policy_tokens_in"] = int(ev.get("policy_tokens_in") or 0) + max(
         0, cur_pol_in - prev_pol_in
     )
@@ -1615,9 +1698,20 @@ def _run_output_phase(
     # ``enforced`` on the individual ``tool_call`` rows —
     # independent signal.
     if decision.verdict == "block":
-        had_tool_structured_activity = len(tool_calls) > 0
+        # ``saw_tool_signals_pre_filter`` reads the unfiltered signal
+        # set so the enforced-vs-advisory decision still reflects
+        # **original CLI activity**. After the dedupe fix above we
+        # zero out tool_calls/tool_names/mcp_targets locally when
+        # hooks are active — so a naive ``len(tool_calls)`` post-
+        # filter check would always be False and incorrectly stamp
+        # ``enforced`` on a turn whose tools already ran in the CLI
+        # subprocess. The pre-filter snapshot preserves the original
+        # auditor-facing semantics:
+        #   hooks_active + no tools          → ``enforced``  (text-only block)
+        #   hooks_active + tools             → ``advisory``  (tools already ran)
+        #   hooks_active=False (any signals) → ``advisory``  (subprocess ran)
         if (
-            hooks_active and not had_tool_structured_activity
+            hooks_active and not saw_tool_signals_pre_filter
         ):
             block_status = ENFORCEMENT_ENFORCED
         else:
@@ -2065,7 +2159,19 @@ def _wrap_client_receive_messages(orig: Any) -> Any:
                             )
                             _stamp_usage_from_result(ev, message)
 
-                            decision = _run_output_phase(
+                            # ``_run_output_phase`` calls
+                            # ``evaluate_output`` which can issue a
+                            # *blocking* judge HTTP round-trip for
+                            # ``semantic_guard`` rules. Inside an
+                            # async receive loop that would freeze
+                            # every other coroutine on this event
+                            # loop until the judge responds. Park
+                            # the whole synchronous phase on a
+                            # worker thread instead so concurrent
+                            # client work (other inflight queries,
+                            # streaming consumers) stays responsive.
+                            decision = await asyncio.to_thread(
+                                _run_output_phase,
                                 ev=ev,
                                 signals=signals,
                                 model=model,

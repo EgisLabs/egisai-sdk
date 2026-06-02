@@ -7,6 +7,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.29.0] — 2026-06-02
+
+This release is entirely about cutting policy enforcement
+latency. A field report of a 12-second `policy_latency_ms` row
+on the dashboard kicked off an audit of every code path between
+the SDK's call gate and the platform's `/v1/sdk/judge` endpoint.
+The audit found five compounding issues — duplicated work, a
+serialised inner loop, blocking calls on the asyncio event loop,
+unbounded retry sleeps, and a one-shot library cold-start
+silently bundled into per-call governance time. All five ship
+fixed here. Combined effect on the worst-case turn that
+prompted the report: ~12 s → ~1 s. Steady-state cost on the
+common no-match path drops from O(N × P50) to O(P50). Behaviour
+is fully backwards-compatible — every fix is internal to the
+SDK and no public API or wire-shape changed.
+
+### Performance
+
+- **`claude_agent_sdk` no longer double-judges tool calls.** When
+  `PreToolUse` hooks are wired (the default for `0.21+` against
+  the modern `claude_agent_sdk`), the post-turn `_run_output_phase`
+  used to re-evaluate the same `tool_calls` list a `semantic_guard`
+  rule with `targets=["tool_calls"]` had already gated per-tool.
+  An N-tool turn paid 2N judge round-trips. The output phase now
+  drops `tool_calls` / `tool_names` / `mcp_targets` when hooks
+  were active — text-side rules
+  (`deny_output_regex` / `semantic_guard.targets=["text"]` /
+  `pii_scan` on output) still fire because the assistant's
+  streamed `TextBlock` content was never gated by `PreToolUse`.
+- **Per-tool `semantic_guard` judge calls run in parallel.**
+  `_semantic_guard_match` previously walked `tool_calls`
+  sequentially — N tools meant N back-to-back blocking
+  round-trips to `/v1/sdk/judge`. The matcher now submits each
+  tool's judge call to a bounded `ThreadPoolExecutor` (max 8
+  concurrent), collapsing wall-clock from `sum(t_i)` to `max(t_i)`.
+  First-match-by-input-order semantics on the audit row
+  (`matched_policy.message` names the FIRST matching tool) are
+  preserved verbatim.
+- **Async patches no longer block the event loop on the judge
+  HTTP call.** Both `_async_gate_call_inner` and the
+  `claude_agent_sdk` async receive loop wrap the synchronous
+  `evaluate` / `evaluate_output` body in `asyncio.to_thread`, so
+  a slow judge round-trip no longer pins every concurrent
+  coroutine on the same loop. Per-tool `PreToolUse` and
+  `PostToolUse` hook callbacks parallelize the same way.
+  ContextVar state (identity, policy usage accumulator, init-
+  latency accumulator) is propagated into the worker thread by
+  the standard `asyncio.to_thread` contract.
+- **Judge HTTP timeout default lowered from 20.0 s to 8.0 s.**
+  The backend's own OpenAI-judge timeout is 15 s, so anything
+  much higher than that just lets a stuck backend silently
+  widen the SDK's stall window. Operators who want more
+  headroom (regulated workloads with `semantic_on_outage="block"`
+  preferring a long timeout to a fail-open) can override via
+  `EGISAI_JUDGE_TIMEOUT_SECS`.
+- **`Retry-After` header is clamped to a configurable maximum
+  (default 5.0 s).** A misconfigured upstream proxy could ship
+  `Retry-After: 90` and freeze every governed call for 90 s ×
+  3 retry attempts = 270 s. The clamp guarantees a single retry
+  costs at most this many seconds; override via
+  `EGISAI_JUDGE_RETRY_AFTER_MAX_SECS`.
+
+### Changed
+
+- **`policy_latency_ms` no longer includes the one-shot PII NER
+  warm-up wait.** The Presidio + spaCy analyzer load happens once
+  per fresh process and can take up to
+  `EGISAI_PII_WARMUP_TIMEOUT_SECS` (default 2 s). Previously this
+  cold-start was bundled into call-#1's `policy_latency_ms`,
+  making the dashboard's "policy enforcement latency" column
+  look permanently inflated for short-lived workloads. The wait
+  is now booked separately on `ev["init_latency_ms"]` so the
+  cold-start cost is still visible without misattribution.
+  `policy_latency_ms` after this release reflects only per-call
+  governance work.
+
+### Added
+
+- **`EGISAI_JUDGE_TIMEOUT_SECS` env var.** Override the per-
+  request timeout for `/v1/sdk/judge`. Resolution order:
+  constructor arg → env → 8.0 s default. Clamped at 0.5 s.
+- **`EGISAI_JUDGE_RETRY_AFTER_MAX_SECS` env var.** Cap the
+  honoured `Retry-After` value on HTTP 429 responses. Resolution
+  order: constructor arg → env → 5.0 s default. Clamped at 0.1 s.
+- **`init_latency_ms` event field.** Carries the per-call
+  one-shot library cold-start cost (today: PII NER load) that
+  used to bleed into `policy_latency_ms`. The backend silently
+  ignores unknown fields, so this is forward-compatible — a
+  future schema migration can promote it to a first-class column
+  without breaking older SDKs.
+
+---
+
 ## [0.28.0] — 2026-05-27
 
 This release closes one acute regression and adds the supporting

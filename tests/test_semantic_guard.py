@@ -318,3 +318,103 @@ def test_threshold_is_forwarded_and_judge_model_is_not() -> None:
     )
     assert captured["body"]["prompt_text"] == "Delete all users"
     assert captured["body"]["intents"] == ["delete rows from a database table"]
+
+
+# ── Retry-After is clamped (BUG 8) ────────────────────────────────────
+
+
+def test_retry_after_header_is_clamped_to_configured_max() -> None:
+    """A misconfigured upstream proxy can ship ``Retry-After: 90``
+    on an HTTP 429. Without a clamp the SDK sleeps 90 s × 3
+    retry attempts = 270 s on every call routed through that
+    proxy — turning a single misbehaving rate-limit emitter into
+    a 4½-minute policy stall on the SDK's hot path.
+
+    The clamp is the configurable upper bound
+    ``judge_retry_after_max_secs`` (default 5.0 s,
+    ``EGISAI_JUDGE_RETRY_AFTER_MAX_SECS`` env override). This
+    test pins both halves of the contract:
+
+    * a header within the cap is honored verbatim, and
+    * a header far above the cap returns the clamp ceiling.
+    """
+    from egisai.policy.semantic import SemanticBlocker
+
+    blocker = SemanticBlocker(
+        platform_api_key="egis_live_test",
+        platform_base_url="http://fake-platform",
+        judge_retry_after_max_secs=5.0,
+    )
+
+    short_resp = httpx.Response(429, headers={"Retry-After": "2"})
+    assert blocker._retry_after_seconds(short_resp) == 2.0, (
+        "values within the cap must round-trip unchanged"
+    )
+
+    long_resp = httpx.Response(429, headers={"Retry-After": "90"})
+    assert blocker._retry_after_seconds(long_resp) == 5.0, (
+        "values above the cap must clamp to the configured maximum "
+        "(default 5.0s) — guards against a 270-second policy stall "
+        "from a single misconfigured upstream"
+    )
+
+    # Negative / zero values clamp to the lower bound (0.1s) so the
+    # SDK doesn't busy-loop on an upstream that says "retry now".
+    zero_resp = httpx.Response(429, headers={"Retry-After": "0"})
+    assert blocker._retry_after_seconds(zero_resp) == 0.1
+
+    # Bogus header → fixed fallback, NOT clamp ceiling — preserves
+    # the existing fallback semantics so a flaky proxy that ships
+    # garbage doesn't suddenly maximise per-attempt sleep.
+    bad_resp = httpx.Response(429, headers={"Retry-After": "next-tuesday"})
+    assert blocker._retry_after_seconds(bad_resp) == blocker._RETRY_429_FALLBACK_S
+
+
+def test_judge_timeout_default_is_lowered() -> None:
+    """The SDK's default judge HTTP timeout was 20 s pre-fix —
+    far higher than the backend's own 15 s OpenAI-judge timeout,
+    so a single stuck backend stalled SDK calls for 20 s and
+    bloated ``policy_latency_ms`` accordingly. The fix lowers the
+    default to 8.0 s while leaving operators a per-process knob
+    (``EGISAI_JUDGE_TIMEOUT_SECS``) for environments that need
+    more headroom (regulated workloads where the operator
+    explicitly chose ``semantic_on_outage="block"`` and prefers a
+    long timeout over a fail-open).
+    """
+    from egisai.policy.semantic import (
+        _DEFAULT_JUDGE_TIMEOUT_SECS,
+        SemanticBlocker,
+    )
+
+    assert _DEFAULT_JUDGE_TIMEOUT_SECS == 8.0
+    blocker = SemanticBlocker(
+        platform_api_key="egis_live_test",
+        platform_base_url="http://fake-platform",
+    )
+    assert blocker._judge_timeout_secs == 8.0
+
+
+def test_judge_timeout_env_override(monkeypatch) -> None:
+    """``EGISAI_JUDGE_TIMEOUT_SECS`` overrides the default."""
+    from egisai.policy.semantic import SemanticBlocker
+
+    monkeypatch.setenv("EGISAI_JUDGE_TIMEOUT_SECS", "3.5")
+    blocker = SemanticBlocker(
+        platform_api_key="egis_live_test",
+        platform_base_url="http://fake-platform",
+    )
+    assert blocker._judge_timeout_secs == 3.5
+
+
+def test_judge_retry_after_max_env_override(monkeypatch) -> None:
+    """``EGISAI_JUDGE_RETRY_AFTER_MAX_SECS`` overrides the default."""
+    from egisai.policy.semantic import SemanticBlocker
+
+    monkeypatch.setenv("EGISAI_JUDGE_RETRY_AFTER_MAX_SECS", "12.0")
+    blocker = SemanticBlocker(
+        platform_api_key="egis_live_test",
+        platform_base_url="http://fake-platform",
+    )
+    assert blocker._judge_retry_after_max_secs == 12.0
+    long_resp = httpx.Response(429, headers={"Retry-After": "90"})
+    assert blocker._retry_after_seconds(long_resp) == 12.0

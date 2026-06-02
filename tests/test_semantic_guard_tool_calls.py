@@ -158,11 +158,23 @@ def test_matcher_judges_tool_call_when_targets_include_tool_calls() -> None:
     assert body["intents"] == ["delete rows from a database table"]
 
 
-def test_matcher_short_circuits_on_first_matching_tool() -> None:
-    """When a turn has multiple tool calls, the matcher returns on
-    the first one that matches. Subsequent tools don't pay for a
-    judge round-trip — cost matters when an agent fans out 10+
-    tools per turn."""
+def test_matcher_blames_first_matching_tool_in_input_order() -> None:
+    """When multiple tool calls in a turn match, the matcher's
+    audit row blames the FIRST matching tool by input order — that
+    keeps the dashboard's per-turn narrative deterministic ("the
+    agent tried to do X first") regardless of which judge call
+    happened to return first under parallelism.
+
+    Cost note (BUG 3 fix, 0.30+): tool_calls evaluation now runs
+    every per-tool judge round-trip in parallel inside a bounded
+    thread pool, so the matcher pays for ALL N tools instead of
+    short-circuiting on the first match. Trade-off: we burn 3x
+    judge cost in the rare "first tool matches" case to collapse
+    wall-clock latency from ``sum(t_i)`` to ``max(t_i)`` in the
+    common "no match across N tools" case. Pre-fix a 6-tool turn
+    paid ~3.6 s sequentially when nothing matched; post-fix it
+    pays ~0.6 s. The match-blame contract below stays unchanged.
+    """
     from egisai.policy.engine import _semantic_guard_match
 
     calls: list[str] = []
@@ -170,9 +182,7 @@ def test_matcher_short_circuits_on_first_matching_tool() -> None:
     def transport_handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode())
         calls.append(body["prompt_text"])
-        # Match on the FIRST request; subsequent ones must never
-        # reach the platform.
-        if len(calls) == 1:
+        if "db_execute" in body["prompt_text"]:
             return httpx.Response(
                 200, json=_stub_judge_match("delete rows from a database table"),
             )
@@ -196,18 +206,24 @@ def test_matcher_short_circuits_on_first_matching_tool() -> None:
     )
 
     assert record is not None
-    assert "'db_execute'" in record.message
-    assert len(calls) == 1, (
-        "matcher must short-circuit on the first matching tool — "
-        "wasting judge calls on subsequent tools costs the operator money"
+    assert "'db_execute'" in record.message, (
+        "the audit message must name the FIRST matching tool by "
+        "input order even when judge calls run in parallel"
     )
 
 
 def test_matcher_walks_every_tool_until_a_match() -> None:
-    """If the first N tool calls don't match, the matcher keeps
-    going until one does (or runs out). This is the contract that
-    makes the rule useful: a destructive tool buried among benign
-    ones still gets caught."""
+    """If the first N tool calls don't match, the matcher's
+    verdict still attributes the block to the tool that DID match.
+    This is the contract that makes the rule useful: a destructive
+    tool buried among benign ones still gets caught and named.
+
+    Pre-0.30 the matcher short-circuited and only paid for judge
+    calls up to the first match. Post-fix it parallelizes every
+    tool's judge call inside a bounded thread pool, so the wall-
+    clock for an N-tool turn collapses toward the slowest single
+    call instead of the sum. The naming contract is unchanged.
+    """
     from egisai.policy.engine import _semantic_guard_match
 
     calls: list[str] = []
@@ -215,7 +231,6 @@ def test_matcher_walks_every_tool_until_a_match() -> None:
     def transport_handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode())
         calls.append(body["prompt_text"])
-        # Match ONLY on the third tool. The first two return no_match.
         if "destroy_production" in body["prompt_text"]:
             return httpx.Response(
                 200, json=_stub_judge_match("wipe the production database"),
@@ -242,7 +257,76 @@ def test_matcher_walks_every_tool_until_a_match() -> None:
 
     assert record is not None
     assert "'destroy_production'" in record.message
-    assert len(calls) == 3, "matcher must have walked the first three tools"
+    # Parallel evaluation: the matcher fires all 4 judge calls
+    # concurrently regardless of which one matches. Asserting
+    # ``len(calls) == 4`` pins the new contract; the old "walked
+    # exactly 3" assertion was a sequential-loop artifact.
+    assert len(calls) == 4, (
+        "every tool gets a parallel judge call (post-BUG-3 fix); "
+        "no early termination in the input order"
+    )
+
+
+def test_matcher_parallelizes_judge_calls_for_multi_tool_turns() -> None:
+    """Regression — BUG 3: when ``targets=["tool_calls"]`` and the
+    turn has N tools, the matcher MUST NOT issue N sequential
+    judge round-trips. Pre-fix this loop was strictly serial — a
+    6-tool turn paid ~6 × P50 judge latency in policy_latency_ms
+    on its own. Post-fix it parks each tool's blocking
+    ``semantic_blocker.check`` on a worker thread so wall-clock
+    collapses to ``max(t_i) + thread overhead`` rather than
+    ``sum(t_i)``.
+
+    The test stubs the judge with a per-call sleep so a *strictly
+    sequential* implementation would take ``N × delay`` and a
+    *parallel* implementation takes ~``delay``. Asserting on the
+    elapsed wall-clock makes the regression alarm fire if some
+    future refactor accidentally re-serialises the loop.
+    """
+    import time as _time
+
+    from egisai.policy.engine import _semantic_guard_match
+
+    delay_per_call = 0.15  # 150 ms each — exaggerates the difference
+    n_tools = 6
+
+    def transport_handler(request: httpx.Request) -> httpx.Response:
+        _time.sleep(delay_per_call)
+        return httpx.Response(200, json=_stub_judge_no_match())
+
+    blocker = _make_blocker(transport_handler)
+
+    started = _time.monotonic()
+    record = _semantic_guard_match(
+        policy=_rule(
+            intents=["wipe the production database"],
+            targets=["tool_calls"],
+        ),
+        text="",
+        tool_calls=[
+            {"name": f"safe_tool_{i}", "input": {"i": i}}
+            for i in range(n_tools)
+        ],
+        semantic_blocker=blocker,
+        side="output",
+    )
+    elapsed = _time.monotonic() - started
+
+    assert record is None, (
+        "no match expected — every tool returns no_match"
+    )
+    # Sequential lower bound: ``n_tools * delay_per_call`` =
+    # 6 × 150 ms = 900 ms. Parallel upper bound (with thread pool
+    # overhead): generous 600 ms ceiling. We anchor the assertion
+    # well below the sequential lower bound so a flake-free CI
+    # signal still proves parallelism.
+    sequential_floor = n_tools * delay_per_call
+    assert elapsed < sequential_floor * 0.7, (
+        f"expected parallel evaluation; took {elapsed:.2f}s for "
+        f"{n_tools} tools at {delay_per_call:.2f}s each. "
+        f"Sequential lower bound is {sequential_floor:.2f}s; the "
+        f"matcher must collapse to ~max(t_i) + pool overhead."
+    )
 
 
 # ── 2. Backwards-compat: no ``targets`` field = text-only ────────────

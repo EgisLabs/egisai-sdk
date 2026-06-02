@@ -183,6 +183,55 @@ def test_loading_with_pii_rule_waits_with_timeout(caplog):
     assert any("waited" in m and "PII NER analyzer" in m for m in info_messages)
 
 
+def test_warmup_wait_books_init_latency_not_policy_latency():
+    """Regression — BUG 4 split: when the gate actually waits, the
+    elapsed wall-clock MUST land on the per-call ``init_latency_ms``
+    accumulator, not bundled into ``policy_latency_ms``.
+
+    Pre-fix the warm-up wait inflated call-#1's
+    ``policy_latency_ms`` by up to ``EGISAI_PII_WARMUP_TIMEOUT_SECS``
+    (default 2 s) for every fresh process — operators read the
+    dashboard's "policy enforcement latency" column and saw a
+    one-shot library cold-start charged against per-call
+    governance work. Post-fix the wait is booked separately so the
+    cold-start cost is still visible (on ``init_latency_ms``)
+    without misattribution.
+    """
+    from egisai._context import (
+        get_init_latency,
+        reset_init_latency,
+    )
+
+    reset_init_latency()
+    assert get_init_latency() == 0, (
+        "sanity: contextvar should be 0 at the top of the test"
+    )
+
+    # ``wait_for_warm`` returns True after pretending the analyzer
+    # warmed; the gate's elapsed-time accounting wraps the call so
+    # we use a side-effect that sleeps a measurable amount of time.
+    def _fake_wait(_timeout: float) -> bool:
+        time.sleep(0.06)  # 60 ms — small but unambiguously > 0
+        return True
+
+    with patch.object(_pii_loader, "is_settled", return_value=False), patch.object(
+        _pii_loader, "wait_for_warm", side_effect=_fake_wait
+    ):
+        _evaluator._maybe_wait_for_pii_analyzer([_pii_rule()])
+
+    booked = get_init_latency()
+    assert booked >= 50, (
+        f"the 60 ms simulated warm-up wait must be booked under "
+        f"init_latency_ms (got {booked} ms)"
+    )
+    # Generous upper bound to guard against the gate accidentally
+    # booking some unrelated wall-clock against init.
+    assert booked < 1000, (
+        f"init_latency_ms accumulator picked up suspiciously more "
+        f"than the simulated 60 ms wait: {booked}"
+    )
+
+
 def test_loading_success_is_silent_on_stderr_by_default(capsys):
     """Hard guarantee for the success path: nothing on stderr.
 

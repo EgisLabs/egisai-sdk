@@ -7,6 +7,7 @@ Evaluates ``PolicyRule`` objects against an input or output
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -617,10 +618,46 @@ def _semantic_guard_match(
                 ),
             )
 
-    # Phase B — tool_calls target. Each tool gets its own judge call
-    # so the audit row's ``matched_policy`` message can name the
-    # specific tool that tripped the rule. First match wins.
+    # Phase B — tool_calls target. Each tool gets its own judge
+    # call so the audit row's ``matched_policy`` message can name
+    # the specific tool that tripped the rule. First-match-by-input-
+    # order wins.
+    #
+    # Parallelism (BUG 3 fix): pre-fix this loop was strictly
+    # sequential — N tool calls in a turn meant N round-trips back-
+    # to-back to ``/v1/sdk/judge``. With a P50 judge latency of
+    # ~600 ms, a turn that calls 6 tools paid ~3.6 s in policy
+    # latency on its own. Now each tool's judge call runs on its
+    # own thread (ThreadPoolExecutor), so wall-clock latency for
+    # the whole batch collapses toward the *single slowest* call
+    # rather than the *sum*.
+    #
+    # Why threads, not asyncio: ``_semantic_guard_match`` is a
+    # synchronous helper called from synchronous patch paths
+    # (sync OpenAI/Anthropic users) AND from worker threads spawned
+    # by ``asyncio.to_thread`` in the async patches. Either way the
+    # inner unit of work — ``semantic_blocker.check`` — is a
+    # blocking ``httpx.Client`` POST. Threads parallelize cleanly
+    # without forcing the engine to be async-aware.
+    #
+    # Why bounded: the platform's judge endpoint enforces a per-
+    # tenant rate limit. Spawning 100 parallel calls for a 100-tool
+    # turn would just rate-limit ourselves into ``Retry-After``
+    # storms (now bounded by ``judge_retry_after_max_secs`` — see
+    # BUG 8 — but still wasteful). 8 is the empirical sweet spot:
+    # most turns have ≤ 4 tools so we never hit the ceiling, and
+    # outlier turns with many tools degrade gracefully into
+    # serialized batches of 8.
+    #
+    # First-match-by-input-order semantics are preserved: we
+    # collect every result, then walk the input order and return
+    # the first match. Cost trade-off: in the rare case where the
+    # *first* tool would have matched and short-circuited the rest,
+    # we still pay all N judge calls under parallelism. That's
+    # acceptable — the *common* case (no match across N tools) is
+    # exactly the case that benefits most from parallelism.
     if "tool_calls" in targets and tool_calls:
+        normalized: list[tuple[str, str]] = []
         for tc in tool_calls:
             if not isinstance(tc, dict):
                 continue
@@ -633,7 +670,55 @@ def _semantic_guard_match(
             synthesized = _synthesize_tool_call_text(name, args)
             if not synthesized:
                 continue
+            normalized.append((name, synthesized))
+
+        if not normalized:
+            return None
+
+        # Single-tool: skip the executor overhead entirely. Most
+        # turns hit this path.
+        if len(normalized) == 1:
+            name, synthesized = normalized[0]
             match = semantic_blocker.check(synthesized, policy.config)
+            if match is None:
+                return None
+            return MatchedPolicyRecord(
+                name=policy.name,
+                type=policy.type,
+                verdict="block",
+                reason_code="semantic_blocked_tool",
+                message=policy.config.get(
+                    "message",
+                    (
+                        f"Tool call '{name}' matches blocked intent: "
+                        f"'{match.intent}'"
+                    ),
+                ),
+            )
+
+        # Parallel path. ``max_workers`` is min(8, batch size) so a
+        # 3-tool turn doesn't spawn 8 idle threads.
+        max_workers = min(_TOOL_JUDGE_MAX_WORKERS, len(normalized))
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="egisai-judge",
+        ) as pool:
+            futures = [
+                pool.submit(semantic_blocker.check, synthesized, policy.config)
+                for _, synthesized in normalized
+            ]
+            results: list[Any] = []
+            for f in futures:
+                try:
+                    results.append(f.result())
+                except Exception:  # noqa: BLE001
+                    # A single judge call failed; treat as no-match
+                    # for that tool and continue. Honours the
+                    # platform-level fail-open contract — one dead
+                    # tool eval doesn't poison the whole batch.
+                    results.append(None)
+
+        for (name, _synthesized), match in zip(normalized, results, strict=True):
             if match is None:
                 continue
             return MatchedPolicyRecord(
@@ -651,6 +736,13 @@ def _semantic_guard_match(
             )
 
     return None
+
+
+# Cap on the per-call thread pool the parallel tool_calls judge
+# matcher uses. Tuning notes live above the call site; this
+# constant is module-level so tests / advanced operators could
+# monkeypatch it temporarily without forking the engine.
+_TOOL_JUDGE_MAX_WORKERS = 8
 
 
 def _synthesize_tool_call_text(name: str, args: Any) -> str:

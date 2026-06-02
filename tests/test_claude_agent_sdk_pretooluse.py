@@ -1504,3 +1504,219 @@ def _stub_judge_match_dict(intent: str) -> dict[str, Any]:
         "tokens_in": 220,
         "tokens_out": 10,
     }
+
+
+def _install_counting_judge(
+    verdict_for_text: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Same as ``_install_mock_judge`` but records every request body.
+
+    Returns the list the handler appends to so tests can assert how
+    many judge round-trips actually fired during a turn — the linchpin
+    of the dedupe regression (BUG 2): when PreToolUse already gated
+    each tool individually, the parent ``_run_output_phase`` MUST NOT
+    re-issue a second wave of judge calls against the same tool_calls
+    list. Pre-fix this test would observe 2N round-trips for an N-tool
+    turn; post-fix it must observe exactly N.
+    """
+    import httpx as _httpx
+
+    from egisai import _evaluator
+    from egisai.policy.semantic import SemanticBlocker
+
+    bodies: list[str] = []
+
+    def transport_handler(request: _httpx.Request) -> _httpx.Response:
+        raw = request.content.decode()
+        bodies.append(raw)
+        body = __import__("json").loads(raw)
+        prompt_text = body.get("prompt_text", "")
+        for needle, response in verdict_for_text.items():
+            if needle in prompt_text:
+                return _httpx.Response(200, json=response)
+        return _httpx.Response(
+            200,
+            json={
+                "match": False,
+                "intent": "",
+                "confidence": 0.0,
+                "tokens_in": 0,
+                "tokens_out": 0,
+            },
+        )
+
+    blocker = SemanticBlocker(
+        platform_api_key="egis_live_test",
+        platform_base_url="http://fake-platform",
+    )
+    blocker._http_client = _httpx.Client(
+        transport=_httpx.MockTransport(transport_handler)
+    )
+    _evaluator._blocker = blocker
+    return bodies
+
+
+def test_semantic_guard_tool_target_does_not_double_judge_when_hooks_active(
+    fake_claude_with_hooks: tuple[Any, type, types.ModuleType],
+) -> None:
+    """Regression — BUG 2 dedupe: when PreToolUse hooks are wired,
+    the per-turn ``_run_output_phase`` at ``ResultMessage`` MUST NOT
+    re-evaluate the accumulated tool_calls. The PreToolUse hook
+    already issued an authoritative per-tool judge round-trip and
+    emitted a per-tool ``tool_call`` step row apiece; running the
+    same tool_calls through ``_semantic_guard_match`` a second time
+    in the parent phase doubles the wall-clock policy_latency_ms
+    AND the policy_tokens_* charges on the dashboard.
+
+    Test shape:
+
+    * Operator has a ``semantic_guard`` rule with
+      ``targets=["tool_calls"]``.
+    * Agent emits 3 ``ToolUseBlock``s in a single turn, none of
+      which match (judge replies match=False every time).
+    * After the turn, the judge MUST have been called exactly 3
+      times — once per PreToolUse hook invocation — NEVER 6.
+
+    Pre-fix this would have measured 6 judge round-trips because
+    the parent ``_run_output_phase`` iterated the same 3 tool_calls
+    list and re-judged each one until first match. Post-fix the
+    parent phase passes ``tool_calls=[]`` whenever ``hooks_active``
+    is True.
+    """
+    fake_backend, client_cls, mod = fake_claude_with_hooks
+    _load_rules(_semantic_tool_rule(intent="wipe the production database"))
+    judge_bodies = _install_counting_judge({})  # never matches
+
+    mod.__script__ = [
+        AssistantMessage(
+            [
+                ToolUseBlock("Read", {"path": "/etc/hostname"}, id_="tu1"),
+                ToolUseBlock("Read", {"path": "/etc/release"}, id_="tu2"),
+                ToolUseBlock("Read", {"path": "/proc/cpuinfo"}, id_="tu3"),
+            ]
+        ),
+        ResultMessage(),
+    ]
+
+    async def run() -> None:
+        opts = _ClaudeAgentOptions()
+        async with client_cls(options=opts) as client:
+            await client.query("Tell me about this machine.")
+            async for _ in client.receive_response():
+                pass
+
+    asyncio.run(run())
+    _flush()
+
+    invocations = mod.__hook_invocations__
+    assert len(invocations) == 3, (
+        "PreToolUse must fire exactly once per tool — sanity check "
+        "before we count judge calls."
+    )
+
+    synthesized_calls = [
+        b for b in judge_bodies if "invoke tool" in b
+    ]
+    assert len(synthesized_calls) == 3, (
+        f"Pre-fix: parent _run_output_phase re-iterated tool_calls "
+        f"and double-judged each, producing 6 round-trips. Post-fix: "
+        f"PreToolUse alone gates tool_calls and the parent phase "
+        f"skips them. Got {len(synthesized_calls)} judge calls "
+        f"(expected 3): {synthesized_calls}"
+    )
+
+    # Belt-and-braces: token spend on the parent model_call step
+    # should reflect ONLY the user-prompt input-phase tokens (zero
+    # in this fixture — the input rule wasn't a semantic_guard rule
+    # against text). Per-tool tool_call step rows carry their own
+    # PreToolUse policy_tokens_* tallies. The legacy double-counting
+    # showed up as inflated tokens on the model_call row; this asserts
+    # the row no longer carries the doubled charge.
+    model_steps = _step_events(fake_backend.events_received, kind="model_call")
+    assert model_steps, "expected a model_call step on the Run"
+    parent = model_steps[-1]
+    assert (parent.get("policy_tokens_in") or 0) == 0, (
+        "the parent model_call step must not carry tool-call judge "
+        "tokens — those belong on per-tool tool_call rows"
+    )
+    assert (parent.get("policy_tokens_out") or 0) == 0
+
+
+def test_semantic_guard_text_block_still_fires_when_hooks_active(
+    fake_claude_with_hooks: tuple[Any, type, types.ModuleType],
+) -> None:
+    """Counter-regression for BUG 2: dropping tool_calls from the
+    parent ``_run_output_phase`` MUST NOT also drop the assistant
+    text signal. ``deny_output_regex`` /
+    ``semantic_guard.targets=["text"]`` rules fire on the
+    ``TextBlock`` content the model streamed alongside its tool
+    calls — that text was NEVER gated by PreToolUse, so the parent
+    phase is the only place it gets evaluated.
+
+    Test shape:
+
+    * Operator has a ``deny_output_regex`` rule on a sentence the
+      model says.
+    * Agent emits an ``AssistantMessage`` with both a ``TextBlock``
+      (carrying the matching phrase) and a ``ToolUseBlock``.
+    * The output phase MUST still block on the matching text even
+      though ``hooks_active=True`` and tool_calls were dropped.
+    """
+    fake_backend, client_cls, mod = fake_claude_with_hooks
+    _load_rules(
+        {
+            "id": "regex-out-1",
+            "name": "block-output-secrets",
+            "type": "deny_output_regex",
+            "tenant": None,
+            "config": {
+                # ``deny_output_regex`` reads its regex from
+                # ``config["pattern"]`` (singular). ``patterns``
+                # (plural) is the schema for ``deny_tool_call`` /
+                # ``deny_mcp_call`` etc; using it here would silently
+                # no-op the rule.
+                "pattern": r"forbidden phrase",
+                "message": "Blocked output content.",
+            },
+        }
+    )
+
+    mod.__script__ = [
+        AssistantMessage(
+            [
+                TextBlock(
+                    "Sure, here's the forbidden phrase you asked for."
+                ),
+                ToolUseBlock("Read", {"path": "/etc/hostname"}, id_="tu_x"),
+            ]
+        ),
+        ResultMessage(),
+    ]
+
+    async def run() -> None:
+        opts = _ClaudeAgentOptions()
+        async with client_cls(options=opts) as client:
+            await client.query("Help me with something.")
+            try:
+                async for _ in client.receive_response():
+                    pass
+            except PermissionError:
+                pass
+
+    asyncio.run(run())
+    _flush()
+
+    model_steps = _step_events(fake_backend.events_received, kind="model_call")
+    assert model_steps, "expected a model_call step"
+    parent = model_steps[-1]
+    assert parent.get("verdict") == "block", (
+        "text-side rules MUST still fire from the parent output "
+        "phase even when tool signals are deduped — the assistant "
+        "text was never evaluated by PreToolUse."
+    )
+    assert parent.get("matched_policy") == "block-output-secrets"
+    # When hooks were active AND tool signals appeared, an
+    # output-phase block stamps ``advisory`` (subprocess already
+    # ran the tool turn even though the SDK refused the response
+    # at the boundary).
+    assert parent.get("enforcement_status") == "advisory"
