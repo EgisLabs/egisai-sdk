@@ -1676,6 +1676,48 @@ def _stamp_usage_from_result(ev: dict[str, Any], result: Any) -> None:
         ev["cost_usd"] = cost_f
 
 
+def _stamp_error_from_result(ev: dict[str, Any], result: Any) -> None:
+    """Surface a failed model turn onto the audit row.
+
+    The Claude Code CLI signals an upstream model failure (the selected
+    model id is not available to the API key, a 429/5xx overload, a
+    provider outage, …) by setting ``ResultMessage.is_error`` together
+    with an ``api_error_status`` and a diagnostic ``result`` string —
+    *while still reporting* ``subtype="success"`` and a zeroed ``usage``
+    block. Without this, the wrapper would record the turn as a clean
+    ``verdict=allow`` run that "completed successfully" with ``0`` tokens
+    and ``$0`` cost — visually indistinguishable from a genuine
+    zero-cost turn and the single most common source of "why are my
+    Claude Agent SDK tokens 0?" confusion. The model never ran; the
+    tokens aren't lost, they were never spent.
+
+    We copy the failure onto the event (``error`` + ``api_error_status``)
+    so the dashboard renders an errored run with an actionable reason
+    instead of a silent zero.
+
+    Privacy: ``result`` is read **only** on the error path, where it is
+    a CLI-generated diagnostic string (e.g. "There's an issue with the
+    selected model …"), never a model completion. The SDK's
+    never-persist-model-output contract is unaffected.
+    """
+    if not bool(getattr(result, "is_error", False)):
+        return
+    status = getattr(result, "api_error_status", None)
+    detail = getattr(result, "result", None)
+    parts = ["model call failed"]
+    if status is not None:
+        parts.append(f"(HTTP {status})")
+    if isinstance(detail, str) and detail.strip():
+        snippet = detail.strip().replace("\n", " ")
+        if len(snippet) > 200:
+            snippet = snippet[:197] + "…"
+        parts.append(f"— {snippet}")
+    # Don't clobber an error a higher layer already recorded.
+    ev.setdefault("error", " ".join(parts))
+    if status is not None:
+        ev.setdefault("api_error_status", status)
+
+
 def _run_output_phase(
     *,
     ev: dict[str, Any],
@@ -2273,6 +2315,7 @@ def _wrap_client_receive_messages(orig: Any) -> Any:
                                 max(0, (time.monotonic() - started) * 1000)
                             )
                             _stamp_usage_from_result(ev, message)
+                            _stamp_error_from_result(ev, message)
 
                             # ``_run_output_phase`` calls
                             # ``evaluate_output`` which can issue a
@@ -2319,7 +2362,7 @@ def _wrap_client_receive_messages(orig: Any) -> Any:
                             _safe_enqueue(ev)
                             _clear_inflight(self)
                             if current_run() is not None:
-                                close_run()
+                                close_run(error=ev.get("error"))
                             # Reset for the next turn — same
                             # ``receive_messages`` call may span
                             # multiple ``query()`` turns.
@@ -2548,6 +2591,7 @@ def _wrap_module_query(orig: Any) -> Any:
                                     max(0, (time.monotonic() - started) * 1000)
                                 )
                                 _stamp_usage_from_result(ev, message)
+                                _stamp_error_from_result(ev, message)
                                 module_hooks_active = _hooks_supported() and (
                                     options is not None
                                 )
@@ -2569,7 +2613,7 @@ def _wrap_module_query(orig: Any) -> Any:
                                 _safe_enqueue(ev)
                                 enqueued = True
                                 if run_opened and current_run() is not None:
-                                    close_run()
+                                    close_run(error=ev.get("error"))
                                     run_opened = False
                                 if (
                                     decision_out is not None

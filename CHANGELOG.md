@@ -7,10 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.29.1] — 2026-06-20
+## [0.29.2] — 2026-06-21
 
 ### Fixed
 
+- **`claude_agent_sdk` no longer hides failed model calls as
+  clean zero-token runs.** When the Claude Code CLI can't run the
+  requested model — the model id isn't available to the
+  `ANTHROPIC_API_KEY`, a 429/5xx overload, a provider outage — it
+  returns `ResultMessage.is_error` with an `api_error_status` and a
+  diagnostic string, *but still* reports `subtype="success"` and a
+  zeroed `usage` block. The wrapper read `usage` (so tokens were
+  `0`) but ignored `is_error`, recording the turn as a clean
+  `verdict=allow` run that "completed successfully" with `0 in /
+  0 out` and `$0`. That is the single most common cause of "why are
+  my Claude Agent SDK tokens 0?" — the model never ran, the tokens
+  were never spent. The terminal handler now copies `is_error` /
+  `api_error_status` / the diagnostic onto the audit row
+  (`error` + `api_error_status`) and threads it into `close_run`,
+  so the dashboard renders an errored run with an actionable reason
+  instead of a silent zero. `result` is read only on the error path
+  (a CLI diagnostic string, never a model completion), so the
+  never-persist-model-output contract is unaffected.
 - **`claude_agent_sdk` runs no longer under-report model tokens.**
   The Claude Agent SDK prompt-caches the system prompt and tool
   schema aggressively, so a turn's uncached `input_tokens` is
