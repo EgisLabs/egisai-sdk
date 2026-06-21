@@ -672,7 +672,7 @@ def test_evaluate_output_policies_routes_tool_calls_to_matcher() -> None:
         )],
         OutputPolicyContext(
             tenant="t",
-            model="claude-sonnet-4",
+            model="claude-opus-4-8",
             text="",  # PreToolUse path — no model text yet
             tool_names=["destroy_production"],
             tool_calls=[
@@ -710,7 +710,7 @@ def test_evaluate_output_policies_allows_when_targets_excludes_tool_calls() -> N
         [_rule(intents=["wipe the production database"], targets=None)],
         OutputPolicyContext(
             tenant="t",
-            model="claude-sonnet-4",
+            model="claude-opus-4-8",
             text="",  # no text ⇒ legacy text-only matcher short-circuits
             tool_names=["destroy_production"],
             tool_calls=[

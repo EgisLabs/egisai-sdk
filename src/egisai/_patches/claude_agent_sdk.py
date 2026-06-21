@@ -1539,26 +1539,141 @@ def _is_result_message(message: Any) -> bool:
     return type(message).__name__ == "ResultMessage"
 
 
-def _stamp_usage_from_result(ev: dict[str, Any], result: Any) -> None:
-    """Pull tokens + cost off a ``ResultMessage`` onto the audit row."""
-    cost = getattr(result, "total_cost_usd", None)
-    if cost is not None:
-        try:
-            ev["cost_usd"] = float(cost)
-        except (TypeError, ValueError):
-            pass
-    inner = getattr(result, "usage", None)
-    if isinstance(inner, dict):
-        for k_in, k_out in (
-            ("input_tokens", "tokens_in"),
-            ("output_tokens", "tokens_out"),
+def _coerce_token_int(value: Any) -> int | None:
+    """Best-effort int coercion that rejects bools and non-numerics."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def _usage_block_tokens(usage: Any) -> tuple[int | None, int | None]:
+    """Read ``(tokens_in, tokens_out)`` off a Claude ``usage`` mapping.
+
+    ``tokens_in`` is the **sum** of the uncached ``input_tokens`` and
+    both cache counters (``cache_read_input_tokens`` +
+    ``cache_creation_input_tokens``). The Claude Agent SDK prompt-caches
+    the system prompt + tool schema aggressively, so the uncached
+    ``input_tokens`` alone is routinely a single-digit remainder while
+    the bulk of the prompt the model actually processed lands in the
+    cache counters. Summing them keeps the dashboard's "Model In"
+    honest instead of reporting a misleading ``6`` for a turn that fed
+    the model tens of thousands of tokens.
+    """
+    if not isinstance(usage, dict):
+        return (None, None)
+    tin = 0
+    saw_in = False
+    for key in (
+        "input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ):
+        n = _coerce_token_int(usage.get(key))
+        if n is not None:
+            tin += n
+            saw_in = True
+    tout = _coerce_token_int(usage.get("output_tokens"))
+    return (tin if saw_in else None, tout)
+
+
+def _model_usage_tokens(
+    model_usage: Any,
+) -> tuple[int | None, int | None, float | None]:
+    """Aggregate Claude Code's per-model ``model_usage`` breakdown.
+
+    The CLI reports authoritative per-model figures under
+    ``ResultMessage.model_usage`` (camelCase keys: ``inputTokens`` /
+    ``outputTokens`` / ``cacheReadInputTokens`` /
+    ``cacheCreationInputTokens`` / ``costUSD``). This is the fallback
+    used when the aggregate ``usage`` block is missing or reports all
+    zeros, so a future CLI build that stops populating the aggregate
+    block can't silently zero out the dashboard's token columns.
+    """
+    if not isinstance(model_usage, dict) or not model_usage:
+        return (None, None, None)
+    tin = 0
+    tout = 0
+    cost = 0.0
+    saw_tok = False
+    saw_cost = False
+    for entry in model_usage.values():
+        if not isinstance(entry, dict):
+            continue
+        for key in (
+            "inputTokens",
+            "cacheReadInputTokens",
+            "cacheCreationInputTokens",
         ):
-            val = inner.get(k_in)
-            if val is not None:
-                try:
-                    ev[k_out] = int(val)
-                except (TypeError, ValueError):
-                    pass
+            n = _coerce_token_int(entry.get(key))
+            if n is not None:
+                tin += n
+                saw_tok = True
+        n_out = _coerce_token_int(entry.get("outputTokens"))
+        if n_out is not None:
+            tout += n_out
+            saw_tok = True
+        c = entry.get("costUSD")
+        if isinstance(c, (int, float)) and not isinstance(c, bool):
+            cost += float(c)
+            saw_cost = True
+    return (
+        tin if saw_tok else None,
+        tout if saw_tok else None,
+        cost if saw_cost else None,
+    )
+
+
+def _stamp_usage_from_result(ev: dict[str, Any], result: Any) -> None:
+    """Pull tokens + cost off a ``ResultMessage`` onto the audit row.
+
+    Sources, in priority order:
+
+    1. The aggregate ``usage`` block — uncached ``input_tokens`` plus
+       both cache counters on the input side, ``output_tokens`` on the
+       output side (see :func:`_usage_block_tokens`).
+    2. The per-model ``model_usage`` breakdown — used only when (1) is
+       absent or reports all zeros (see :func:`_model_usage_tokens`).
+
+    Cost mirrors the same fallback: ``total_cost_usd`` first, then the
+    summed ``costUSD`` across ``model_usage`` entries.
+
+    NB: an *errored* model turn (e.g. the selected model id is not
+    available to the API key — the CLI returns ``is_error`` with a
+    zeroed ``usage`` block and an empty ``model_usage``) legitimately
+    stamps ``0`` here. A run that shows ``0 in / 0 out`` and ``$0`` is
+    therefore the signature of a model call that never actually ran,
+    not a lost token count.
+    """
+    inner = getattr(result, "usage", None)
+    tin, tout = _usage_block_tokens(inner)
+
+    cost = getattr(result, "total_cost_usd", None)
+    try:
+        cost_f: float | None = float(cost) if cost is not None else None
+    except (TypeError, ValueError):
+        cost_f = None
+
+    # Aggregate ``usage`` absent or all-zero → fall back to the
+    # per-model breakdown before giving up on the row.
+    if not tin and not tout:
+        mu_in, mu_out, mu_cost = _model_usage_tokens(
+            getattr(result, "model_usage", None)
+        )
+        if mu_in is not None:
+            tin = mu_in
+        if mu_out is not None:
+            tout = mu_out
+        if (cost_f is None or cost_f == 0.0) and mu_cost is not None:
+            cost_f = mu_cost
+
+    if tin is not None:
+        ev["tokens_in"] = int(tin)
+    if tout is not None:
+        ev["tokens_out"] = int(tout)
+    if cost_f is not None:
+        ev["cost_usd"] = cost_f
 
 
 def _run_output_phase(

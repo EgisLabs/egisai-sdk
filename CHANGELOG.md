@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.29.1] — 2026-06-20
+
+### Fixed
+
+- **`claude_agent_sdk` runs no longer under-report model tokens.**
+  The Claude Agent SDK prompt-caches the system prompt and tool
+  schema aggressively, so a turn's uncached `input_tokens` is
+  routinely a single-digit remainder while the real prompt the
+  model processed lives in `cache_read_input_tokens` /
+  `cache_creation_input_tokens`. `_stamp_usage_from_result`
+  previously read only `input_tokens`, so the dashboard's
+  "Model In" showed e.g. `6` for a turn that actually fed the
+  model tens of thousands of tokens. Input tokens are now the
+  sum of the uncached count and both cache counters.
+- **Token capture is robust to a zeroed aggregate `usage` block.**
+  When `ResultMessage.usage` is missing or all-zero, the stamp now
+  falls back to the authoritative per-model `model_usage`
+  breakdown (camelCase `inputTokens` / `outputTokens` /
+  `cacheReadInputTokens` / `cacheCreationInputTokens` / `costUSD`)
+  before giving up on the row. Cost falls back the same way
+  (`total_cost_usd` → summed `costUSD`).
+
+### Note
+
+- A `claude_agent_sdk` run that still shows `0 in / 0 out` and
+  `$0` is the signature of a model call that **never actually ran**
+  — typically the selected model id is not available to the
+  `ANTHROPIC_API_KEY` in use (the CLI returns `is_error` with a
+  zeroed `usage` block and an empty `model_usage`), or a transient
+  provider error. It is not a lost token count; verify model
+  access and retry.
+
+---
+
 ## [0.29.0] — 2026-06-02
 
 This release is entirely about cutting policy enforcement
@@ -1731,7 +1765,7 @@ flow top-to-bottom — input policy → model → output policy:
     │   Egis redacted regulated data before forwarding to the model    │
     │   Sanitized prompt (forwarded to model): SECURITY REPORT…        │
     └──────────────────────────────────────────────────────────────────┘
-    ┌── Model · claude-sonnet-4 ─── 47015 ms · 62 in / 2422 out ───────┐
+    ┌── Model · claude-opus-4-8 ─── 47015 ms · 62 in / 2422 out ───────┐
     │   Model called and returned — see output policy box below        │
     └──────────────────────────────────────────────────────────────────┘
     ┌── Output policy check ─── [block] [advisory] [Redact…] ──────────┐
