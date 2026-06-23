@@ -678,6 +678,7 @@ def resolve_identity(
             identity_key=f"hash:{digest}",
             identity_hash=digest,
             source="hash",
+            system_excerpt=system,
         )
         if agent_id is not None:
             return IdentityRecord(
@@ -780,18 +781,71 @@ def _try_app_fallback() -> IdentityRecord | None:
 # ── Backend round-trip ──────────────────────────────────────────────
 
 
+# Hard cap on the system-prompt excerpt shipped for descriptor
+# generation. 2 KB is plenty for an LLM to infer the agent's role
+# and keeps the ensure payload small. The backend re-caps
+# defensively at 4 KB.
+_SYSTEM_EXCERPT_MAX_CHARS = 2000
+
+
+def _sanitized_excerpt(system_text: str | None) -> str | None:
+    """PII-sanitize + truncate a system prompt for backend descriptor.
+
+    Returns ``None`` — meaning "don't ship anything" — when:
+
+    * ``auto_describe`` is disabled (operator opt-out),
+    * there's no system text to summarise, or
+    * sanitization fails for any reason (fail-open — registration
+      must never break because we couldn't scrub a prompt).
+
+    The returned string has been run through the SDK's PII engine so
+    no validated PII (SSN, email, API key, …) leaves the process, and
+    truncated to :data:`_SYSTEM_EXCERPT_MAX_CHARS`. The backend uses
+    it transiently for a single LLM call and never persists it.
+    """
+    if not system_text:
+        return None
+    try:
+        from egisai._config import get_config_optional
+
+        cfg = get_config_optional()
+        if cfg is None or not cfg.auto_describe:
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        from egisai.policy import pii
+
+        normalized = _normalize_text(system_text)
+        if not normalized:
+            return None
+        masked, _findings = pii.sanitize(normalized)
+        excerpt = (masked or "").strip()[:_SYSTEM_EXCERPT_MAX_CHARS]
+        return excerpt or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _ensure_agent_id(
     *,
     display_name: str,
     identity_key: str,
     identity_hash: str,
     source: str,
+    system_excerpt: str | None = None,
 ) -> str | None:
     """Get-or-fetch the backend agent_id for an identity.
 
     Caches by ``identity_key`` so repeated calls for the same agent
     are a dict lookup. The backend dedups by ``(org_id, identity_hash)``
     server-side so concurrent SDK processes converge on one row.
+
+    ``system_excerpt`` (optional) is the agent's raw system prompt.
+    When provided AND the agent is being seen for the first time this
+    process (cache miss), it's PII-sanitised + truncated locally and
+    shipped so the platform can generate a human description +
+    business function in the background. Tiers without a system
+    prompt (stack / class / app / OTEL / stored-id) pass ``None``.
 
     Returns ``None`` on any error — fail-open per
     ``sdk-design-philosophy.mdc`` rule 5: the user's call must not
@@ -826,6 +880,7 @@ def _ensure_agent_id(
                 runtime=runtime,
                 identity_hash=identity_hash,
                 identity_source=source,
+                system_prompt_excerpt=_sanitized_excerpt(system_excerpt),
             )
             agent_id = payload.get("id")
             if isinstance(agent_id, str) and agent_id:

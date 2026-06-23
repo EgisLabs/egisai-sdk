@@ -58,6 +58,7 @@ def init(
     enable_sse: bool = True,
     enable_http_fallback: bool = True,
     auto_stack_hints: str = "loose",
+    auto_describe: bool | None = None,
     quiet: bool = False,
 ) -> None:
     """Activate egisai for the current process.
@@ -117,6 +118,19 @@ def init(
 
         Has no effect on explicit ``egisai.set_context`` /
         ``with egisai.agent(...)`` calls (Tier 0) which always win.
+    auto_describe
+        Whether to let the platform auto-generate a human description
+        and business function for each newly-detected agent. When
+        enabled (the default), the SDK ships a PII-sanitised,
+        truncated excerpt of the agent's system prompt the *first*
+        time that agent is registered; the platform summarises it in
+        the background (no added latency on your call path) into the
+        identity card you see on the dashboard. When disabled, no
+        prompt text — even sanitised — leaves the process: the agent
+        keeps the local placeholder description and its business
+        function is inferred later from anonymised behavioural
+        telemetry instead. Defaults to ``True``; override with
+        ``auto_describe=False`` or ``EGISAI_AUTO_DESCRIBE=0``.
     quiet
         Suppress the one-line "egisai active" startup log.
     """
@@ -144,6 +158,20 @@ def init(
                 f"got {auto_stack_hints!r}"
             )
 
+        # ``auto_describe`` resolves explicit kwarg → env var → default
+        # True. The env var accepts the usual falsey spellings so an
+        # operator can flip it off per-deploy without code changes.
+        if auto_describe is None:
+            env_describe = os.getenv("EGISAI_AUTO_DESCRIBE")
+            if env_describe is None:
+                resolved_auto_describe = True
+            else:
+                resolved_auto_describe = env_describe.strip().lower() not in (
+                    "0", "false", "no", "off", "",
+                )
+        else:
+            resolved_auto_describe = bool(auto_describe)
+
         cfg = EgisaiConfig(
             api_key=api_key,
             app=app,
@@ -158,6 +186,7 @@ def init(
             enable_http_fallback=enable_http_fallback,
             sdk_version=__version__,
             auto_stack_hints=auto_stack_hints,  # type: ignore[arg-type]
+            auto_describe=resolved_auto_describe,
         )
         set_config(cfg)
 

@@ -96,6 +96,39 @@ If you find a way to exfiltrate raw PII, OR to bypass a policy
 that should have blocked or sanitised, that's a Critical-severity
 issue and we want to know within hours.
 
+## Agent descriptor (system-prompt excerpt)
+
+To replace the opaque `Auto-detected by SDK …` placeholder with a
+human-readable description and business function on the dashboard,
+the SDK ships a **single, transient excerpt of an agent's system
+prompt** the *first time* that agent is auto-registered. This is the
+one place an agent's instruction text (never end-user prompts /
+responses) leaves the process, and it is tightly bounded:
+
+1. **Sanitised before egress.** The excerpt is run through the SDK's
+   own PII engine (`egisai.policy.pii.sanitize`) before it leaves the
+   process, so validated PII (SSN, email, API key, IBAN, …) is masked
+   locally — the same Phase-1 engine that protects governed prompts.
+2. **Truncated.** Capped at 2 KB on the SDK side (the backend
+   re-caps at 4 KB). Enough for the model to infer a role; not a
+   full prompt dump.
+3. **Transient on the server.** The backend uses the excerpt for a
+   single background LLM call to generate the description + business
+   function, then discards it. It is **never persisted to a column
+   and never written to a log**.
+4. **First-sight only.** Sent once per agent identity per process
+   (on the cache-miss registration path), not on every call.
+5. **Opt-out.** `init(auto_describe=False)` or
+   `EGISAI_AUTO_DESCRIBE=0` disables it entirely — no excerpt ever
+   leaves the process; the placeholder description stays and the
+   business function is inferred from anonymised behavioural
+   telemetry instead.
+
+If you find the excerpt being transmitted **unsanitised**, exceeding
+the size cap, being persisted/logged server-side, or being sent when
+`auto_describe` is disabled, that's a Critical-severity issue and we
+want to know within hours.
+
 ## Tool / MCP enforcement guarantees
 
 `egisai` distinguishes two states on every audit row:

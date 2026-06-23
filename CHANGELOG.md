@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.30.0] — 2026-06-22
+
+### Added
+
+- **Auto-generated agent description + business function.** The
+  first time an agent is auto-registered, the SDK now ships a
+  PII-sanitised, truncated (≤ 2 KB) excerpt of its system prompt so
+  the platform can generate a human-readable description (e.g.
+  "Automates AML and sanctions investigations by screening
+  counterparties…") and a free-form business function ("Anti Money
+  Laundering (AML) And Financial Crime Compliance") in place of the
+  old `Auto-detected by SDK (framework:…) identity=…` placeholder.
+  Generation runs entirely in the background **on the server, after
+  the SDK has its response** — zero added latency on your agent's
+  call path, and no LLM dependency on the SDK side.
+- **`auto_describe` opt-out.** `init(auto_describe=False)` (or
+  `EGISAI_AUTO_DESCRIBE=0`) disables the excerpt entirely: no prompt
+  text, even sanitised, leaves the process. The agent keeps the local
+  placeholder description and its business function is inferred from
+  anonymised behavioural telemetry instead.
+
+### Security
+
+- The system-prompt excerpt is scrubbed by the SDK's own PII engine
+  **before** it leaves the process, capped at 2 KB, used transiently
+  for a single server-side LLM call, and never persisted or logged on
+  the backend. See `SECURITY.md` → "Agent descriptor".
+
+---
+
 ## [0.29.2] — 2026-06-21
 
 ### Fixed

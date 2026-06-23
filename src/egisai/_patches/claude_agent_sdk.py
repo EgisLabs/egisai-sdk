@@ -241,11 +241,12 @@ def _derive(self_or_first: Any, *args: Any, **kwargs: Any) -> IdentityRecord | N
     opts = _options_for(self_or_first, kwargs)
     if opts is None:
         return None
-    display_name, _, bundle = _bundle_from_options(opts)
+    display_name, system_prompt, bundle = _bundle_from_options(opts)
     return make_identity(
         source=FRAMEWORK_SOURCE,
         display_name=display_name,
         bundle=bundle,
+        system_excerpt=system_prompt or None,
     )
 
 

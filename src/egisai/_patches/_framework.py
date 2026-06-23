@@ -201,6 +201,7 @@ def make_identity(
     source: str,
     display_name: str,
     bundle: tuple[Any, ...],
+    system_excerpt: str | None = None,
 ) -> IdentityRecord | None:
     """Build an IdentityRecord from a framework patch's bundle.
 
@@ -210,6 +211,12 @@ def make_identity(
     we hash to produce the ``identity_hash`` — typically
     ``(framework_name, agent_name)`` for Tier 2A or
     ``(framework_name, system_prompt, sorted_tools, model)`` for 2B.
+
+    ``system_excerpt`` (optional) is the agent's raw system prompt /
+    instructions, when the framework exposes one. It's forwarded to
+    ``_ensure_agent_id`` which sanitises + ships it on first sight so
+    the platform can auto-generate a description + business function.
+    Patches without a system prompt simply omit it.
 
     Returns ``None`` when the backend can't be reached so the caller
     falls through to the next tier (the gate's resolver re-tries).
@@ -225,6 +232,7 @@ def make_identity(
         identity_key=identity_key,
         identity_hash=digest,
         source=source,
+        system_excerpt=system_excerpt,
     )
     if agent_id is None:
         return None

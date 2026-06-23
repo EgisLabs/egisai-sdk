@@ -45,6 +45,18 @@ class EgisaiConfig:
     # / string-typed ``agent`` locals; "strict" only honors the
     # explicit ``__egisai_agent__`` marker; "off" disables Tier 3.
     auto_stack_hints: StackHints = "loose"
+    # Agent descriptor opt-out. When True (default), the SDK ships a
+    # PII-sanitised, truncated excerpt of an agent's system prompt the
+    # first time that agent is auto-registered, so the platform can
+    # generate a human description + business function in the
+    # background. When False, no excerpt ever leaves the process — the
+    # agent keeps the local "Auto-detected by SDK …" placeholder and
+    # its business function is filled later by the behavioural class
+    # judge. Set via ``init(auto_describe=False)`` or the
+    # ``EGISAI_AUTO_DESCRIBE=0`` env var for privacy-sensitive
+    # deployments that don't want prompt text (even sanitised) to
+    # transit to the backend.
+    auto_describe: bool = True
 
 
 _CONFIG: EgisaiConfig | None = None
@@ -87,6 +99,7 @@ def update_config(**fields: object) -> EgisaiConfig:
         "agent_id": _CONFIG.agent_id,
         "semantic_on_outage": _CONFIG.semantic_on_outage,
         "auto_stack_hints": _CONFIG.auto_stack_hints,
+        "auto_describe": _CONFIG.auto_describe,
     }
     base.update(fields)
     new = EgisaiConfig(**base)  # type: ignore[arg-type]

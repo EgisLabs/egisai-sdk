@@ -176,6 +176,7 @@ def ensure_agent(
     runtime: dict[str, Any] | None = None,
     identity_hash: str | None = None,
     identity_source: str | None = None,
+    system_prompt_excerpt: str | None = None,
 ) -> dict[str, Any]:
     """Find-or-create an agent in the caller's org by name. Idempotent.
 
@@ -191,6 +192,14 @@ def ensure_agent(
     ``(org_id, identity_hash)`` first, then falls back to
     ``(org_id, name_normalized)`` for legacy SDKs. Backends < 0.36
     ignore both fields silently.
+
+    ``system_prompt_excerpt`` is a PII-sanitised, truncated excerpt of
+    the agent's system prompt (already scrubbed by the SDK's PII
+    engine — see :func:`egisai._auto_agent._sanitized_excerpt`). When
+    present, the backend uses it transiently to generate a human
+    description + business function in the background; it is never
+    persisted or logged server-side. Omitted when ``auto_describe`` is
+    off or the agent has no system prompt. Older backends ignore it.
     """
     payload: dict[str, Any] = {"name": name}
     if description:
@@ -201,6 +210,8 @@ def ensure_agent(
         payload["identity_hash"] = identity_hash
     if identity_source:
         payload["identity_source"] = identity_source
+    if system_prompt_excerpt:
+        payload["system_prompt_excerpt"] = system_prompt_excerpt
     # DEBUG breadcrumb so a developer staring at an empty Provenance
     # card on the dashboard can confirm "yes, the SDK actually shipped
     # the fingerprint" without reaching for tcpdump. Off by default;
