@@ -75,6 +75,14 @@ MATRIX: list[tuple[str, str, str, str]] = [
     ("claude_agent_sdk", "Claude Agent SDK", "3a", "enforced"),
     # Tier 3b — bedrock_agent (AWS-managed agent loop).
     ("bedrock_agent", "AWS Bedrock Agents", "3b", "advisory"),
+    # Inbound — MCP server add-on. Governs inbound ``tools/call``
+    # against a customer-hosted MCP server (fastmcp / official mcp).
+    # Dormant unless the org has the ``mcp_servers`` entitlement, but
+    # when active it gates the tool BEFORE the handler runs, so the
+    # claim is enforced. Distinct from every row above: those govern
+    # the customer's *outbound* LLM/agent calls, this governs calls
+    # *into* the customer's server.
+    ("mcp_server", "MCP Server (inbound)", "in", "enforced"),
 ]
 
 

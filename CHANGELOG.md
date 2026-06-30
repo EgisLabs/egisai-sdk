@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.31.0] — 2026-06-30
+
+### Added
+
+- **MCP Servers add-on (SDK side).** When the org has the
+  `mcp_servers` add-on enabled (reported on the `init()` handshake),
+  the SDK now auto-detects a hosted MCP server (FastMCP v2 or the
+  official `mcp` SDK's `FastMCP`), fingerprints it from its name +
+  tool schema + transport, auto-registers it via
+  `POST /v1/sdk/mcp-servers/ensure` (cached after first sight), and
+  reports its tool inventory — exactly mirroring how agents are
+  auto-detected and named, with no new user code.
+- **Inbound `tools/call` governance.** Each inbound tool call against
+  the server is evaluated with the existing policy engine
+  (`evaluate_output_policies`) scoped to that server: `block` raises a
+  tool error so the tool never runs, `sanitize` masks PII in the call
+  arguments in place, `allow` proceeds. Every outcome is reported as a
+  `source_kind="mcp_server"` audit event so it shows up on the
+  dashboard's Requests page and the server's profile.
+- **Policy scope for MCP servers.** `PolicyRule` now carries
+  `mcp_server_ids`; rules can be targeted at specific MCP servers (or
+  left org-wide) and the new MCP gate honours that scope.
+
+### Notes
+
+- **Zero impact when the add-on is off.** The MCP patch is fully
+  dormant unless the handshake reports the add-on is enabled — it
+  never wraps the customer's server, registers anything, or emits
+  events. Customers without the add-on get byte-for-byte the same
+  behaviour as 0.30.0.
+- **Fail-open.** Any unexpected error in the MCP gate falls through to
+  the original tool handler so a hosted MCP server keeps serving even
+  when egisai is unhappy.
+
 ## [0.30.0] — 2026-06-22
 
 ### Added

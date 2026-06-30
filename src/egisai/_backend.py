@@ -235,6 +235,51 @@ def ensure_agent(
     return r.json()
 
 
+def ensure_mcp_server(
+    *,
+    name: str,
+    description: str | None = None,
+    transport: str | None = None,
+    server_url: str | None = None,
+    identity_hash: str | None = None,
+    identity_source: str | None = None,
+    runtime: dict[str, Any] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Find-or-create an MCP server in the caller's org by name/identity.
+
+    Part of the MCP Servers add-on. Mirrors :func:`ensure_agent`: the
+    backend dedups by ``(org_id, identity_hash)`` first, then by
+    ``(org_id, name_normalized)``. ``tools`` is the inventory the SDK
+    discovered (each ``{name, description, schema_hash}``); the backend
+    upserts ``mcp_server_tools`` rows from it. Older/non-add-on
+    backends 404/400 this route — the caller treats any non-2xx as
+    "registration unavailable" and fails open.
+    """
+    payload: dict[str, Any] = {"name": name}
+    if description:
+        payload["description"] = description
+    if transport:
+        payload["transport"] = transport
+    if server_url:
+        payload["server_url"] = server_url
+    if identity_hash:
+        payload["identity_hash"] = identity_hash
+    if identity_source:
+        payload["identity_source"] = identity_source
+    if runtime:
+        payload["runtime"] = runtime
+    if tools:
+        payload["tools"] = tools
+    r = _retry_on_429(
+        "ensure_mcp_server",
+        lambda: get_client().post("/v1/sdk/mcp-servers/ensure", json=payload),
+    )
+    if r.status_code not in (200, 201):
+        raise _http_error(op="ensure_mcp_server", status=r.status_code)
+    return r.json()
+
+
 def post_events(events: list[dict[str, Any]]) -> None:
     if not events:
         return

@@ -260,7 +260,7 @@ def apply() -> bool:
     if not has_module("google.genai"):
         return False
     try:
-        from google.genai.models import (  # type: ignore[import-not-found]
+        from google.genai.models import (  # type: ignore[import-not-found, import-untyped]
             AsyncModels,
             Models,
         )

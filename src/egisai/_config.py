@@ -57,6 +57,14 @@ class EgisaiConfig:
     # deployments that don't want prompt text (even sanitised) to
     # transit to the backend.
     auto_describe: bool = True
+    # MCP Servers add-on. Set from the handshake response: ``True``
+    # only when the caller's org has the ``mcp_servers`` entitlement
+    # enabled by EgisAI staff. When ``False`` (the default for every
+    # org that hasn't bought the add-on) the ``mcp_server`` patch
+    # stays fully dormant — it never wraps the customer's MCP server,
+    # never registers anything, and never emits events. This keeps
+    # the add-on a true no-op for everyone who isn't entitled.
+    mcp_servers_enabled: bool = False
 
 
 _CONFIG: EgisaiConfig | None = None
@@ -100,6 +108,7 @@ def update_config(**fields: object) -> EgisaiConfig:
         "semantic_on_outage": _CONFIG.semantic_on_outage,
         "auto_stack_hints": _CONFIG.auto_stack_hints,
         "auto_describe": _CONFIG.auto_describe,
+        "mcp_servers_enabled": _CONFIG.mcp_servers_enabled,
     }
     base.update(fields)
     new = EgisaiConfig(**base)  # type: ignore[arg-type]

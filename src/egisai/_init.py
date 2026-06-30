@@ -30,6 +30,7 @@ from egisai._patches import http as patch_http
 from egisai._patches import langchain as patch_langchain
 from egisai._patches import langgraph as patch_langgraph
 from egisai._patches import llamaindex as patch_llamaindex
+from egisai._patches import mcp_server as patch_mcp_server
 from egisai._patches import openai as patch_openai
 from egisai._patches import openai_agents as patch_openai_agents
 from egisai._patches import pydantic_ai as patch_pydantic_ai
@@ -205,7 +206,20 @@ def init(
                 sdk_version=__version__,
                 runtime=rt_blob,
             )
-            cfg = update_config(org_id=hs.get("org_id"), agent_id=hs.get("agent_id"))
+            # The handshake response carries an org-level ``features``
+            # map (override-aware) so the SDK learns which paid add-ons
+            # are enabled. ``mcp_servers`` activates the MCP server
+            # patch; absent / older backends leave it ``False`` so the
+            # patch stays dormant.
+            raw_features = hs.get("features")
+            features: dict[str, Any] = (
+                raw_features if isinstance(raw_features, dict) else {}
+            )
+            cfg = update_config(
+                org_id=hs.get("org_id"),
+                agent_id=hs.get("agent_id"),
+                mcp_servers_enabled=bool(features.get("mcp_servers")),
+            )
             handshake_ok = True
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning(
@@ -275,6 +289,11 @@ def init(
             enabled.append("pydantic-ai")
         if enable_http_fallback and patch_http.apply():
             enabled.append("httpx/requests")
+        # MCP Servers add-on — dormant unless the handshake reported
+        # the org is entitled. Patches FastMCP / the official mcp SDK
+        # to govern inbound tools/call. No-op for every non-add-on org.
+        if patch_mcp_server.apply():
+            enabled.append("mcp-server")
 
         start_logger()
         start_refresher()

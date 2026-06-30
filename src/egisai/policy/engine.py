@@ -42,6 +42,12 @@ class PolicyRule:
     config: dict[str, Any]
     agent_ids: tuple[str, ...] = field(default=())
     phase: str = "both"
+    # MCP Servers add-on scope. Empty means "not targeted at any
+    # specific MCP server" — combined with an empty ``agent_ids`` it
+    # is an org-wide rule that applies to both agents and MCP servers.
+    # When non-empty, the MCP-server gate only applies this rule to
+    # the listed server UUIDs. Has no effect on agent-side evaluation.
+    mcp_server_ids: tuple[str, ...] = field(default=())
 
 
 @dataclass(frozen=True)

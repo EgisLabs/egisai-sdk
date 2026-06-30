@@ -52,6 +52,17 @@ def _to_rule(d: dict) -> PolicyRule:
         agent_ids = tuple(
             str(x).strip().lower() for x in raw_ids if x
         )
+    # MCP Servers add-on scope. ``None`` / missing ⇒ empty tuple
+    # ("not targeted at a specific MCP server"). Older backends that
+    # don't ship the field leave this empty, which is the safe
+    # default for every existing org.
+    raw_mcp_ids = d.get("mcp_server_ids")
+    if raw_mcp_ids is None:
+        mcp_server_ids: tuple[str, ...] = ()
+    else:
+        mcp_server_ids = tuple(
+            str(x).strip().lower() for x in raw_mcp_ids if x
+        )
     raw_id = d.get("id")
     rule_id: str | None = (
         None if raw_id is None or raw_id == "" else str(raw_id)
@@ -66,6 +77,7 @@ def _to_rule(d: dict) -> PolicyRule:
         config=dict(d.get("config") or {}),
         agent_ids=agent_ids,
         phase=phase,
+        mcp_server_ids=mcp_server_ids,
     )
 
 
