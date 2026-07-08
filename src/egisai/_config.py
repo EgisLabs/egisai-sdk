@@ -65,6 +65,15 @@ class EgisaiConfig:
     # never registers anything, and never emits events. This keeps
     # the add-on a true no-op for everyone who isn't entitled.
     mcp_servers_enabled: bool = False
+    # Gateway mode (``init(gateway=True)`` / ``EGISAI_GATEWAY=1``).
+    # When enabled, OpenAI chat-completions calls are rerouted through
+    # the platform's inline Gateway (``<base_url>/v1``) with the
+    # ``X-Egis-Api-Key`` / ``X-Egis-Agent`` headers injected
+    # automatically — enforcement and audit happen server-side, and
+    # the local gate is skipped for those calls to avoid double
+    # evaluation. Every other endpoint / provider keeps the normal
+    # in-process governance path. See ``egisai._gateway``.
+    gateway_mode: bool = False
 
 
 _CONFIG: EgisaiConfig | None = None
@@ -109,6 +118,7 @@ def update_config(**fields: object) -> EgisaiConfig:
         "auto_stack_hints": _CONFIG.auto_stack_hints,
         "auto_describe": _CONFIG.auto_describe,
         "mcp_servers_enabled": _CONFIG.mcp_servers_enabled,
+        "gateway_mode": _CONFIG.gateway_mode,
     }
     base.update(fields)
     new = EgisaiConfig(**base)  # type: ignore[arg-type]

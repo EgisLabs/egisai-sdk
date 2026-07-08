@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.34.1] — 2026-07-07
+
+### Fixed
+
+- Release CI: `mypy` failed on `egisai/_client.py` in environments
+  without the optional `openai` extra installed (the exact setup the
+  public release pipeline uses). The lazy `import openai` inside
+  `egisai.Client` now carries the same `import-not-found` ignore as
+  the openai patch. No runtime behavior change; 0.34.0 never
+  published because of this failure, so this release carries the
+  full 0.34.0 payload below.
+
+## [0.34.0] — 2026-07-07
+
+### Added
+
+- **`egisai.Client` / `egisai.AsyncClient` — the Gateway-first
+  client.** `import egisai` is now the only import needed to send
+  governed traffic: `egisai.Client(api_key="egis_live_…",
+  provider_key="sk-ant-…")` exposes the familiar
+  `.chat.completions.create(...)` surface (streaming included) and
+  always talks to the platform's Gateway, which evaluates policies,
+  sanitizes/blocks inline, routes to the right provider from the
+  model name, and writes the audit row server-side. No `base_url`,
+  no header wiring, no provider import in your code. `init()` is
+  optional — the client carries its own keys — but when `init()` is
+  active, per-call context (`egisai.set_context(agent=…)` /
+  `with egisai.agent(…)`) rides along as `X-Egis-Agent`
+  automatically. Requires the `egisai[openai]` extra (the Gateway's
+  wire format); a missing dependency raises a clear install hint.
+- The openai patch now recognises *any* client pointed at the
+  Gateway (`egisai.Client`, `init(gateway=True)` reroutes, or a
+  hand-configured `base_url`) and skips the local gate for those
+  calls — governance and audit happen exactly once, server-side —
+  while still injecting per-call context headers.
+
+---
+
+## [0.33.0] — 2026-07-07
+
+### Added
+
+- **Gateway mode — `egisai.init(gateway=True)`.** One flag routes
+  OpenAI chat-completions calls through the platform's inline
+  Gateway instead of evaluating policies in-process. The calling
+  convention is unchanged (`client.chat.completions.create(...)` on
+  your own client, your provider key untouched); the SDK injects
+  `X-Egis-Api-Key` automatically and translates an explicit
+  `egisai.set_context(agent=…)` / `with egisai.agent(...)` into the
+  `X-Egis-Agent` header, so identity context works identically in
+  both modes. Enforcement, sanitization, and the audit row happen
+  server-side; the local gate is skipped for rerouted calls so
+  nothing is governed twice. Also settable via `EGISAI_GATEWAY=1`.
+  Requires the org's `inline_gateway` feature.
+- Scope guardrails for the reroute: only `chat.completions.create`
+  is carried (the Gateway's surface). The Responses API, Anthropic /
+  Google / Bedrock SDKs, agent frameworks, and MCP keep the normal
+  in-process governance path, and Azure OpenAI clients are never
+  rerouted (deployment-based URLs). If the reroute can't be
+  constructed the call falls back to in-process governance — fail
+  open, never fail the customer's call.
+- `diagnostics()` now reports `gateway_mode`.
+
+---
+
 ## [0.32.0] — 2026-07-07
 
 ### Added

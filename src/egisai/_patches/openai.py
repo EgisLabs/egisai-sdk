@@ -46,6 +46,7 @@ from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 
+from egisai import _gateway
 from egisai._evaluator import extract_prompt_text
 from egisai._output_signals import extract_openai_chat, extract_openai_responses
 from egisai._patches import has_module
@@ -1094,6 +1095,26 @@ def _wrap_create_chat(orig: Callable[..., Any], is_async: bool) -> Callable[...,
 
     if is_async:
         async def aw(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            # Gateway path: either gateway mode is on
+            # (``init(gateway=True)``) or the client is already
+            # pointed at the Gateway (``egisai.Client`` / manual
+            # ``base_url``). The Gateway evaluates + audits
+            # server-side — the local gate is skipped to avoid double
+            # governance; per-call context (``set_context`` →
+            # ``X-Egis-Agent``) is injected on the way out. Falls
+            # back to the local path when the reroute can't be
+            # constructed (fail open).
+            if _gateway.should_carry(self):
+                try:
+                    return await _gateway.forward_chat_async(
+                        self, orig, args, kwargs
+                    )
+                except _gateway.RerouteUnavailable as exc:
+                    LOGGER.warning(
+                        "gateway reroute unavailable (%s) — falling back "
+                        "to in-process governance for this call",
+                        exc,
+                    )
             model = kwargs.get("model", "unknown")
             messages = kwargs.get("messages")
             stream = bool(kwargs.get("stream", False))
@@ -1178,6 +1199,16 @@ def _wrap_create_chat(orig: Callable[..., Any], is_async: bool) -> Callable[...,
         return aw
 
     def w(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        # Gateway path — see the async twin above.
+        if _gateway.should_carry(self):
+            try:
+                return _gateway.forward_chat(self, orig, args, kwargs)
+            except _gateway.RerouteUnavailable as exc:
+                LOGGER.warning(
+                    "gateway reroute unavailable (%s) — falling back "
+                    "to in-process governance for this call",
+                    exc,
+                )
         model = kwargs.get("model", "unknown")
         messages = kwargs.get("messages")
         stream = bool(kwargs.get("stream", False))
