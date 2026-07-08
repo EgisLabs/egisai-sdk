@@ -173,6 +173,7 @@ egisai.init(..., on_block="stub")
 | `enable_sse` | `True` | Subscribe to live policy and configuration updates when supported. |
 | `enable_http_fallback` | `True` | Optional patching of `httpx` / `requests` for broader HTTP visibility where enabled. |
 | `auto_stack_hints` | `"loose"` | Controls the stack-frame inspector used by the agent identity resolver. `"loose"` (default) honors common conventions; `"strict"` requires an explicit `__egisai_agent__` marker; `"off"` disables stack inspection. |
+| `gateway` | `False` | Route OpenAI chat-completions calls through the platform's inline Gateway instead of evaluating policies in-process — see "Gateway mode" below. |
 | `quiet` | `False` | Set `True` to suppress the one-line startup banner on stderr. |
 
 ### Environment variables
@@ -181,8 +182,54 @@ egisai.init(..., on_block="stub")
 |----------|---------|
 | `EGISAI_API_KEY` | SDK API key if not passed as `api_key=`. |
 | `EGISAI_BASE_URL` | Control plane base URL override when supplied by EgisAI. |
+| `EGISAI_GATEWAY` | Set `1` to enable Gateway mode without a code change. |
 
 Treat API keys as secrets—use environment variables or a secrets manager, never commit them to source control.
+
+---
+
+## Gateway mode (optional)
+
+If your organization uses the platform's inline Gateway, the SDK offers two ways to use it. The simplest is `egisai.Client` — one import, no provider SDK in your code, no URL or header wiring:
+
+```python
+import egisai
+
+client = egisai.Client(
+    api_key="egis_live_…",       # your Egis key
+    provider_key="sk-ant-…",     # forwarded to the provider untouched, never stored
+)
+
+response = client.chat.completions.create(
+    model="claude-sonnet-4-5",   # the model name picks the provider
+    messages=[{"role": "user", "content": "Hello"}],
+)
+```
+
+The client speaks the familiar chat-completions surface (streaming included) and always sends to the Gateway, which evaluates policies, sanitizes/blocks inline, routes to OpenAI / Anthropic / Google / Mistral / xAI / DeepSeek from the model name, and writes the audit row server-side. `egisai.AsyncClient` is the async sibling. `init()` is optional; when it's active, `egisai.set_context(agent=…)` rides along as `X-Egis-Agent` per call. Requires `pip install "egisai[openai]"` (the Gateway's wire format).
+
+For an existing codebase that already uses the OpenAI client everywhere, one flag reroutes it without touching call sites:
+
+```python
+import egisai
+egisai.init(api_key="egis_live_…", gateway=True)
+
+from openai import OpenAI
+client = OpenAI()  # your provider key, forwarded untouched
+egisai.set_context(agent="Support Copilot")  # still works — becomes X-Egis-Agent
+
+response = client.chat.completions.create(
+    model="gpt-4.1",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+```
+
+What changes and what doesn't:
+
+- **Same calling convention.** You keep your own OpenAI client and provider key. The SDK reroutes `chat.completions.create` to the Gateway and injects `X-Egis-Api-Key` (and `X-Egis-Agent` when you set an explicit identity) automatically.
+- **Same policies, evaluated server-side.** The Gateway runs the identical engine, sanitizes/blocks inline, and writes the audit row itself; the local gate is skipped for rerouted calls so nothing is governed twice.
+- **Everything else stays local.** The Responses API, Anthropic / Google / Bedrock SDKs, agent frameworks, and MCP keep the normal in-process governance path. Azure OpenAI clients are never rerouted.
+- **Fail open.** If the reroute can't be constructed, the call falls back to in-process governance from the locally cached policies — your call path never breaks because of the mode switch.
 
 ---
 

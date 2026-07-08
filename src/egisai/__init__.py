@@ -14,8 +14,9 @@ plus an httpx / requests fallback.
 
 from __future__ import annotations
 
-__version__ = "0.32.0"
+__version__ = "0.34.0"
 
+from egisai._client import AsyncClient, Client
 from egisai._context import agent, register_agent, set_context
 from egisai._init import diagnostics, init, shutdown
 from egisai.policy import (
@@ -28,6 +29,8 @@ from egisai.policy import (
 )
 
 __all__ = [
+    "AsyncClient",
+    "Client",
     "OutputPolicyContext",
     "PolicyContext",
     "PolicyDecision",

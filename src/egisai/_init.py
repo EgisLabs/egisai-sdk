@@ -60,6 +60,7 @@ def init(
     enable_http_fallback: bool = True,
     auto_stack_hints: str = "loose",
     auto_describe: bool | None = None,
+    gateway: bool | None = None,
     quiet: bool = False,
 ) -> None:
     """Activate egisai for the current process.
@@ -132,6 +133,20 @@ def init(
         function is inferred later from anonymised behavioural
         telemetry instead. Defaults to ``True``; override with
         ``auto_describe=False`` or ``EGISAI_AUTO_DESCRIBE=0``.
+    gateway
+        Route OpenAI chat-completions calls through the platform's
+        inline Gateway instead of evaluating policies in-process.
+        The SDK injects ``X-Egis-Api-Key`` (this ``api_key``) and —
+        when an explicit identity is active via ``set_context`` /
+        ``with egisai.agent(...)`` — ``X-Egis-Agent`` on every call,
+        so context works identically in both modes. Enforcement and
+        audit happen server-side; the local gate is skipped for
+        those calls to avoid double governance. Everything the
+        Gateway doesn't carry (Responses API, Anthropic / Google /
+        Bedrock SDKs, agent frameworks, MCP) keeps the normal
+        in-process path. Requires the org's ``inline_gateway``
+        feature. Defaults to ``False``; also settable via the
+        ``EGISAI_GATEWAY`` env var.
     quiet
         Suppress the one-line "egisai active" startup log.
     """
@@ -173,6 +188,17 @@ def init(
         else:
             resolved_auto_describe = bool(auto_describe)
 
+        # ``gateway`` resolves explicit kwarg → env var → default False,
+        # mirroring ``auto_describe``'s resolution shape.
+        if gateway is None:
+            env_gateway = os.getenv("EGISAI_GATEWAY")
+            resolved_gateway = (
+                env_gateway is not None
+                and env_gateway.strip().lower() in ("1", "true", "yes", "on")
+            )
+        else:
+            resolved_gateway = bool(gateway)
+
         cfg = EgisaiConfig(
             api_key=api_key,
             app=app,
@@ -188,6 +214,7 @@ def init(
             sdk_version=__version__,
             auto_stack_hints=auto_stack_hints,  # type: ignore[arg-type]
             auto_describe=resolved_auto_describe,
+            gateway_mode=resolved_gateway,
         )
         set_config(cfg)
 
@@ -310,9 +337,10 @@ def init(
 
         if not quiet:
             integrations = ", ".join(enabled) if enabled else "none"
+            mode = " mode=gateway" if cfg.gateway_mode else ""
             print(
                 f"✓ [egisai] active — app={cfg.app} env={cfg.env} "
-                f"on_block={cfg.on_block} integrations=[{integrations}] "
+                f"on_block={cfg.on_block}{mode} integrations=[{integrations}] "
                 f"policies={rules_count}",
                 flush=True,
             )
@@ -375,6 +403,7 @@ def diagnostics() -> dict[str, object]:
             "env": cfg.env,
             "base_url": cfg.base_url,
             "on_block": cfg.on_block,
+            "gateway_mode": cfg.gateway_mode,
             "semantic_on_outage": cfg.semantic_on_outage,
             "policy_etag": get_etag(),
             "policy_rule_count": len(get_rules()),
