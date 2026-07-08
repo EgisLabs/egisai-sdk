@@ -80,7 +80,10 @@ def _build_inner(
     openai_kwargs: dict[str, Any],
 ) -> Any:
     try:
-        import openai
+        # Optional extra (egisai[openai]) — absent in a base install, so
+        # mypy in a clean environment can't resolve it. Same ignore as
+        # the lazy import in _patches/openai.py.
+        import openai  # type: ignore[import-not-found]
     except ImportError as exc:  # pragma: no cover — exercised via CI matrix
         raise ImportError(_INSTALL_HINT) from exc
 

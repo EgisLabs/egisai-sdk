@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.34.1] — 2026-07-07
+
+### Fixed
+
+- Release CI: `mypy` failed on `egisai/_client.py` in environments
+  without the optional `openai` extra installed (the exact setup the
+  public release pipeline uses). The lazy `import openai` inside
+  `egisai.Client` now carries the same `import-not-found` ignore as
+  the openai patch. No runtime behavior change; 0.34.0 never
+  published because of this failure, so this release carries the
+  full 0.34.0 payload below.
+
 ## [0.34.0] — 2026-07-07
 
 ### Added
