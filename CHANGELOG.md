@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.34.2] — 2026-07-08
+
+### Changed
+
+- Documentation only, no code change. README: the "Transparent
+  integration" overview row now presents the inline Gateway as the
+  network-path alternative to in-process patching ("no mandatory
+  proxy") and cross-links the Gateway mode section. SECURITY.md: the
+  vulnerability-report scope now explicitly includes the inline
+  Gateway endpoint (`/v1/chat/completions`) that `egisai.Client`
+  and `init(gateway=True)` send traffic through.
+
 ## [0.34.1] — 2026-07-07
 
 ### Fixed
