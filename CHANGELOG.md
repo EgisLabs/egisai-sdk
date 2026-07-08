@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.32.0] — 2026-07-07
+
+### Added
+
+- **Call-relative phase vocabulary.** `PolicyRule.phase` now speaks
+  `request` / `response` / `both` — names that read correctly for
+  every governed surface (model calls, tool calls, MCP calls,
+  gateway traffic), replacing the model-centric `pre_model` /
+  `post_model`. The legacy spellings are still accepted on the wire
+  and normalized on parse, so the SDK works against both old and
+  new platform versions with identical behavior.
+- **`applies_to` surface scoping.** Rules can be scoped to specific
+  call surfaces (`model`, `tool`, `mcp`) via the new
+  `PolicyRule.applies_to` field. Empty (the default, and the shape
+  of every existing rule) means "all surfaces" — nothing changes
+  for existing policies. The engine's `evaluate_policies` /
+  `evaluate_output_policies` take a new optional `surfaces` keyword
+  naming what the evaluation covers; single-surface gates (the
+  `claude_agent_sdk` per-tool hooks, the MCP-server `tools/call`
+  gate) narrow it so a rule scoped to `tool` never fires on a plain
+  model prompt. Unknown surfaces from a future backend are dropped
+  on parse — the rule stays active on the surfaces this SDK
+  understands (over-application, the safe direction).
+
+### Notes
+
+- No behavioral change for existing policies: the default `surfaces`
+  on both evaluators covers everything the respective phase covered
+  before, and empty `applies_to` matches every surface.
+
+---
+
 ## [0.31.0] — 2026-06-30
 
 ### Added

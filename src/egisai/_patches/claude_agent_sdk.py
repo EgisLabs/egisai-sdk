@@ -484,6 +484,13 @@ def _build_pretooluse_callback(
                             ],
                             mcp_targets=mcp_target,
                             stream=True,
+                            # Single-surface gate: this hook governs
+                            # exactly one tool invocation, so rules
+                            # scoped via ``applies_to`` only fire when
+                            # they cover the matching surface.
+                            surfaces=(
+                                ("mcp",) if mcp_target else ("tool",)
+                            ),
                         ),
                     )
                 except Exception:  # noqa: BLE001
@@ -841,6 +848,14 @@ def _build_posttooluse_callback(
                             mcp_targets=[],
                             stream=True,
                             allow_sanitize=True,
+                            # Single-surface gate: a tool result.
+                            # MCP tools carry the ``mcp__<server>__``
+                            # namespace prefix on their name.
+                            surfaces=(
+                                ("mcp",)
+                                if tool_name.startswith("mcp__")
+                                else ("tool",)
+                            ),
                         ),
                     )
                 except Exception:  # noqa: BLE001
@@ -1502,6 +1517,8 @@ def _dispatch_tool_call_step(
                 tool_calls=[{"name": tool_name, "input": tool_input}],
                 mcp_targets=mcp_target,
                 stream=True,
+                # Single-surface advisory row for one tool call.
+                surfaces=(("mcp",) if mcp_target else ("tool",)),
             )
         )
     except Exception:  # noqa: BLE001

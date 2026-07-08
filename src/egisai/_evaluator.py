@@ -271,6 +271,10 @@ class InputCall:
     prompt_text: str
     stream: bool = False
     tenant: str | None = None
+    # Call surfaces this evaluation covers, matched against each
+    # rule's ``applies_to`` scope. The default is a model-call
+    # prompt; per-tool and MCP gates narrow it.
+    surfaces: tuple[str, ...] = ("model",)
 
 
 @dataclass(frozen=True)
@@ -294,6 +298,14 @@ class OutputCall:
     # rationale. Default ``False`` keeps every existing caller's
     # behavior identical.
     allow_sanitize: bool = False
+    # Call surfaces this evaluation covers, matched against each
+    # rule's ``applies_to`` scope. The default is deliberately wide:
+    # the output phase of a model call sees the completion text
+    # (model surface) AND the model's tool-call requests (tool +
+    # mcp surfaces). Single-surface gates narrow it — the
+    # claude_agent_sdk per-tool hooks pass ``("tool",)`` /
+    # ``("mcp",)`` and the MCP-server gate passes ``("mcp",)``.
+    surfaces: tuple[str, ...] = ("model", "tool", "mcp")
 
 
 # ── Phase 0: operator pause / resume gate ───────────────────────────
@@ -393,7 +405,9 @@ def evaluate(call: InputCall) -> PolicyDecision:
     )
     blocker = _get_semantic_blocker() if _has_semantic_rule(rules) else None
     try:
-        return evaluate_policies(rules, ctx, semantic_blocker=blocker)
+        return evaluate_policies(
+            rules, ctx, semantic_blocker=blocker, surfaces=call.surfaces
+        )
     except Exception:  # noqa: BLE001
         LOGGER.warning("policy evaluator errored, allowing by default", exc_info=True)
         return PolicyDecision.allow()
@@ -432,7 +446,9 @@ def evaluate_output(call: OutputCall) -> PolicyDecision:
     )
     blocker = _get_semantic_blocker() if _has_semantic_rule(rules) else None
     try:
-        return evaluate_output_policies(rules, ctx, semantic_blocker=blocker)
+        return evaluate_output_policies(
+            rules, ctx, semantic_blocker=blocker, surfaces=call.surfaces
+        )
     except Exception:  # noqa: BLE001
         LOGGER.warning("output evaluator errored, allowing by default", exc_info=True)
         return PolicyDecision.allow()

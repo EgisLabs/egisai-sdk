@@ -79,7 +79,7 @@ def _output_ctx(
 
 
 def test_pii_scan_prompt_side_blocks() -> None:
-    rule = _rule("pii_scan", phase="pre_model", config={"action": "block"})
+    rule = _rule("pii_scan", phase="request", config={"action": "block"})
     decision = evaluate_policies(
         [rule], _input_ctx("My SSN is 123-45-6789.")
     )
@@ -89,7 +89,7 @@ def test_pii_scan_prompt_side_blocks() -> None:
 
 def test_pii_scan_prompt_side_sanitize_honored() -> None:
     rule = _rule(
-        "pii_scan", phase="pre_model", config={"action": "sanitize"}
+        "pii_scan", phase="request", config={"action": "sanitize"}
     )
     decision = evaluate_policies(
         [rule], _input_ctx("My SSN is 123-45-6789.")
@@ -104,7 +104,7 @@ def test_pii_scan_prompt_side_sanitize_honored() -> None:
 def test_pii_scan_response_side_blocks_with_dedicated_reason_code() -> None:
     """Output-side ``pii_scan`` blocks with ``pii_in_output`` so the
     dashboard can render a response-aware narrative."""
-    rule = _rule("pii_scan", phase="post_model", config={"action": "block"})
+    rule = _rule("pii_scan", phase="response", config={"action": "block"})
     decision = evaluate_output_policies(
         [rule], _output_ctx(text="The user's SSN is 123-45-6789 by the way.")
     )
@@ -118,7 +118,7 @@ def test_pii_scan_response_side_sanitize_coerced_to_block() -> None:
     intent (catch leaked PII) is preserved by refusing the response.
     """
     rule = _rule(
-        "pii_scan", phase="post_model", config={"action": "sanitize"}
+        "pii_scan", phase="response", config={"action": "sanitize"}
     )
     decision = evaluate_output_policies(
         [rule], _output_ctx(text="Sure, the SSN is 123-45-6789.")
@@ -128,7 +128,7 @@ def test_pii_scan_response_side_sanitize_coerced_to_block() -> None:
 
 
 def test_pii_scan_response_clean_text_passes() -> None:
-    rule = _rule("pii_scan", phase="post_model", config={"action": "block"})
+    rule = _rule("pii_scan", phase="response", config={"action": "block"})
     decision = evaluate_output_policies(
         [rule], _output_ctx(text="No regulated content here.")
     )
@@ -252,7 +252,7 @@ def test_pii_scan_phase_both_action_block_refuses_on_both_sides() -> None:
 
 def test_deny_regex_prompt_side_blocks_with_prompt_reason() -> None:
     rule = _rule(
-        "deny_regex", phase="pre_model", config={"pattern": r"forbidden"}
+        "deny_regex", phase="request", config={"pattern": r"forbidden"}
     )
     decision = evaluate_policies(
         [rule], _input_ctx("This contains FORBIDDEN content.")
@@ -267,7 +267,7 @@ def test_deny_regex_response_side_blocks_with_output_reason() -> None:
     ``output_blocked`` reason code so the audit narrative reads
     correctly."""
     rule = _rule(
-        "deny_regex", phase="post_model", config={"pattern": r"secret"}
+        "deny_regex", phase="response", config={"pattern": r"secret"}
     )
     decision = evaluate_output_policies(
         [rule], _output_ctx(text="here is your secret token")
@@ -277,10 +277,10 @@ def test_deny_regex_response_side_blocks_with_output_reason() -> None:
 
 
 def test_deny_output_regex_on_prompt_side_blocks() -> None:
-    """The mirror image: ``deny_output_regex`` set to ``pre_model``
+    """The mirror image: ``deny_output_regex`` set to ``request``
     runs on prompt text just like ``deny_regex`` would."""
     rule = _rule(
-        "deny_output_regex", phase="pre_model", config={"pattern": r"badword"}
+        "deny_output_regex", phase="request", config={"pattern": r"badword"}
     )
     decision = evaluate_policies([rule], _input_ctx("contains badword now"))
     assert decision.verdict == "block"
@@ -292,7 +292,7 @@ def test_deny_output_regex_on_prompt_side_blocks() -> None:
 
 def test_max_chars_prompt_side_uses_prompt_reason() -> None:
     rule = _rule(
-        "max_prompt_chars", phase="pre_model", config={"max_chars": 5}
+        "max_prompt_chars", phase="request", config={"max_chars": 5}
     )
     decision = evaluate_policies([rule], _input_ctx("abcdefgh"))
     assert decision.verdict == "block"
@@ -301,7 +301,7 @@ def test_max_chars_prompt_side_uses_prompt_reason() -> None:
 
 def test_max_chars_response_side_uses_output_reason() -> None:
     rule = _rule(
-        "max_prompt_chars", phase="post_model", config={"max_chars": 5}
+        "max_prompt_chars", phase="response", config={"max_chars": 5}
     )
     decision = evaluate_output_policies(
         [rule], _output_ctx(text="this is a long response")
@@ -315,7 +315,7 @@ def test_max_chars_response_side_uses_output_reason() -> None:
 
 def test_allow_model_blocks_on_prompt_side() -> None:
     rule = _rule(
-        "allow_model", phase="pre_model", config={"models": ["gpt-3.5"]}
+        "allow_model", phase="request", config={"models": ["gpt-3.5"]}
     )
     decision = evaluate_policies([rule], _input_ctx())
     assert decision.verdict == "block"
@@ -326,7 +326,7 @@ def test_allow_model_blocks_on_response_side() -> None:
     """Same rule on the response side fires identically — the model
     name doesn't change between phases."""
     rule = _rule(
-        "allow_model", phase="post_model", config={"models": ["gpt-3.5"]}
+        "allow_model", phase="response", config={"models": ["gpt-3.5"]}
     )
     decision = evaluate_output_policies([rule], _output_ctx(model="gpt-4o"))
     assert decision.verdict == "block"
@@ -343,7 +343,7 @@ def test_deny_tool_call_on_prompt_side_silently_noops() -> None:
     cannot break the gate."""
     rule = _rule(
         "deny_tool_call",
-        phase="pre_model",
+        phase="request",
         config={"patterns": ["bash"]},
     )
     decision = evaluate_policies([rule], _input_ctx())
@@ -353,7 +353,7 @@ def test_deny_tool_call_on_prompt_side_silently_noops() -> None:
 def test_deny_bash_command_on_prompt_side_silently_noops() -> None:
     rule = _rule(
         "deny_bash_command",
-        phase="pre_model",
+        phase="request",
         config={"command_patterns": [r"rm\s+-rf"]},
     )
     decision = evaluate_policies([rule], _input_ctx())
@@ -363,7 +363,7 @@ def test_deny_bash_command_on_prompt_side_silently_noops() -> None:
 def test_deny_mcp_call_on_prompt_side_silently_noops() -> None:
     rule = _rule(
         "deny_mcp_call",
-        phase="pre_model",
+        phase="request",
         config={"patterns": [r"prod"]},
     )
     decision = evaluate_policies([rule], _input_ctx())
@@ -376,7 +376,7 @@ def test_deny_mcp_call_on_prompt_side_silently_noops() -> None:
 def test_deny_tool_call_response_side_still_fires() -> None:
     rule = _rule(
         "deny_tool_call",
-        phase="post_model",
+        phase="response",
         config={"patterns": ["bash"]},
     )
     decision = evaluate_output_policies(
@@ -389,7 +389,7 @@ def test_deny_tool_call_response_side_still_fires() -> None:
 def test_deny_bash_command_response_side_still_fires() -> None:
     rule = _rule(
         "deny_bash_command",
-        phase="post_model",
+        phase="response",
         config={"command_patterns": [r"rm\s+-rf"]},
     )
     decision = evaluate_output_policies(
@@ -405,7 +405,7 @@ def test_deny_bash_command_response_side_still_fires() -> None:
 def test_deny_mcp_call_response_side_still_fires() -> None:
     rule = _rule(
         "deny_mcp_call",
-        phase="post_model",
+        phase="response",
         config={"patterns": ["prod"]},
     )
     decision = evaluate_output_policies(

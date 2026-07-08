@@ -25,14 +25,30 @@ class PolicyRule:
     ``agent_ids`` scopes the rule to specific agents — empty means
     "applies to every agent".
 
-    ``phase`` selects which side of the call the rule runs on:
+    ``phase`` selects which side of the governed call the rule runs
+    on. The names are call-relative (not model-centric) so they read
+    correctly for every surface — model calls, tool calls, MCP
+    calls, gateway traffic:
 
-    - ``"pre_model"``  — evaluated against the user prompt before the
-      model is called (default for input-side detectors).
-    - ``"post_model"`` — evaluated against the model's response after
-      it returns (default for output-side detectors).
+    - ``"request"``  — evaluated against the inbound payload (the
+      user prompt, tool arguments) before the call is made
+      (default for input-side detectors).
+    - ``"response"`` — evaluated against the outbound payload (the
+      model's completion, a tool result) after the call returns
+      (default for output-side detectors).
     - ``"both"`` — runs on both sides; only meaningful for rule types
       that support it (e.g. ``semantic_guard``).
+
+    The legacy spellings ``pre_model`` / ``post_model`` are still
+    accepted on the wire (``_policy_cache._to_rule`` normalizes
+    them) but the engine only ever sees the canonical names.
+
+    ``applies_to`` scopes the rule to specific call surfaces
+    (``"model"``, ``"tool"``, ``"mcp"``). Empty means "all
+    surfaces" — the behavior every rule had before surface scoping
+    existed. Orthogonal to ``phase``: a rule can fire on the
+    request side of tool calls only, the response side of
+    everything, etc.
     """
 
     id: str | None
@@ -42,6 +58,8 @@ class PolicyRule:
     config: dict[str, Any]
     agent_ids: tuple[str, ...] = field(default=())
     phase: str = "both"
+    # Surface scoping. Empty tuple ⇒ every surface.
+    applies_to: tuple[str, ...] = field(default=())
     # MCP Servers add-on scope. Empty means "not targeted at any
     # specific MCP server" — combined with an empty ``agent_ids`` it
     # is an org-wide rule that applies to both agents and MCP servers.
@@ -332,20 +350,37 @@ _DEFAULT_AMOUNT_FIELD_NAMES: tuple[str, ...] = (
 )
 
 
-def _runs_pre_model(rule: PolicyRule) -> bool:
-    """Return True when this rule should fire on the prompt side."""
-    return rule.phase in ("pre_model", "both")
+def _runs_request_phase(rule: PolicyRule) -> bool:
+    """Return True when this rule should fire on the request side."""
+    return rule.phase in ("request", "both")
 
 
-def _runs_post_model(rule: PolicyRule) -> bool:
+def _runs_response_phase(rule: PolicyRule) -> bool:
     """Return True when this rule should fire on the response side."""
-    return rule.phase in ("post_model", "both")
+    return rule.phase in ("response", "both")
+
+
+def _covers_surface(rule: PolicyRule, surfaces: tuple[str, ...]) -> bool:
+    """Return True when the rule's ``applies_to`` scope intersects
+    the surfaces this evaluation covers.
+
+    Empty ``applies_to`` ⇒ every surface (legacy behavior). The
+    check is set-intersection rather than exact-match because one
+    evaluation pass can cover several surfaces at once — e.g. the
+    output phase of a model call sees the completion text (model
+    surface) AND the model's tool-call requests (tool surface).
+    """
+    if not rule.applies_to:
+        return True
+    return any(s in rule.applies_to for s in surfaces)
 
 
 def evaluate_policies(
     policies: list[PolicyRule],
     context: PolicyContext,
     semantic_blocker: SemanticBlocker | None = None,
+    *,
+    surfaces: tuple[str, ...] = ("model",),
 ) -> PolicyDecision:
     """Evaluate input-side policies in two phases.
 
@@ -359,16 +394,26 @@ def evaluate_policies(
     possibly-masked prompt. A Phase 2 block overrides a Phase 1
     sanitize, but both records are kept on the decision.
 
-    Rules whose ``phase`` is ``"post_model"`` are skipped entirely
+    Rules whose ``phase`` is ``"response"`` are skipped entirely
     on this side — they only run during ``evaluate_output_policies``.
+    Rules whose ``applies_to`` doesn't intersect ``surfaces`` are
+    skipped too (empty ``applies_to`` matches everything).
+
+    ``surfaces`` names the call surfaces this evaluation covers —
+    ``("model",)`` for a model-call prompt (the default),
+    ``("tool",)`` for tool arguments, ``("mcp",)`` for an inbound
+    MCP ``tools/call``.
 
     The verdict precedence across all matches is
     ``block > sanitize > allow``. ``semantic_blocker`` is optional;
     when ``None``, ``semantic_guard`` rules become no-ops.
     """
-    pre_model = [p for p in policies if _runs_pre_model(p)]
-    phase1 = [p for p in pre_model if p.type in _DETERMINISTIC_KINDS]
-    phase2 = [p for p in pre_model if p.type in _LLM_BACKED_KINDS]
+    request_side = [
+        p for p in policies
+        if _runs_request_phase(p) and _covers_surface(p, surfaces)
+    ]
+    phase1 = [p for p in request_side if p.type in _DETERMINISTIC_KINDS]
+    phase2 = [p for p in request_side if p.type in _LLM_BACKED_KINDS]
 
     phase1_matches = _collect_input_matches(phase1, context, semantic_blocker=None)
 
@@ -500,9 +545,9 @@ def _evaluate_one_input_policy(
     # Tool / bash / MCP rules need response-side signals
     # (tool_names, tool_calls, mcp_targets) that ``PolicyContext``
     # does not carry today. Operators may still target them on the
-    # pre-model phase via the open phase picker; the rule silently
+    # request phase via the open phase picker; the rule silently
     # no-ops here so the call isn't broken. They fire normally
-    # when ``phase`` includes ``post_model``.
+    # when ``phase`` includes ``response``.
     return None
 
 
@@ -962,24 +1007,38 @@ def evaluate_output_policies(
     policies: list[PolicyRule],
     context: OutputPolicyContext,
     semantic_blocker: SemanticBlocker | None = None,
+    *,
+    surfaces: tuple[str, ...] = ("model", "tool", "mcp"),
 ) -> PolicyDecision:
     """Evaluate output-side policies in two phases.
 
     Mirrors ``evaluate_policies`` exactly: deterministic local
     checks run first, LLM-backed checks (``semantic_guard``) run
     afterwards — and only when Phase 1 didn't already block. This
-    is the same security contract the prompt side honors
+    is the same security contract the request side honors
     (security-and-compliance.mdc §2): no LLM call, no token spend,
     no chance of forwarding sensitive content to a judge once a
     local rule has already refused the response.
 
-    Rules whose ``phase`` is ``"pre_model"`` are skipped — they
-    only fire during ``evaluate_policies``. Verdict precedence
-    across all matches is ``block > sanitize > allow``.
+    Rules whose ``phase`` is ``"request"`` are skipped — they
+    only fire during ``evaluate_policies``. Rules whose
+    ``applies_to`` doesn't intersect ``surfaces`` are skipped too.
+    The default covers everything, because the output phase of a
+    model call sees the completion text (model surface) *and* the
+    model's tool-call requests (tool + mcp surfaces) — narrowing
+    happens at call sites that evaluate a single surface, e.g. the
+    per-tool hooks pass ``("tool",)`` and the MCP-server gate
+    passes ``("mcp",)``.
+
+    Verdict precedence across all matches is
+    ``block > sanitize > allow``.
     """
-    post_model = [p for p in policies if _runs_post_model(p)]
-    phase1 = [p for p in post_model if p.type in _DETERMINISTIC_KINDS]
-    phase2 = [p for p in post_model if p.type in _LLM_BACKED_KINDS]
+    response_side = [
+        p for p in policies
+        if _runs_response_phase(p) and _covers_surface(p, surfaces)
+    ]
+    phase1 = [p for p in response_side if p.type in _DETERMINISTIC_KINDS]
+    phase2 = [p for p in response_side if p.type in _LLM_BACKED_KINDS]
 
     # Phase 1 — every match is deterministic and local. The judge
     # is intentionally not threaded in here so a misclassified type

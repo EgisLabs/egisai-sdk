@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "egisai"
-version = "0.31.0"
+version = "0.32.0"
 description = "Native runtime governance SDK for AI agents — import egisai; egisai.init() and you're protected."
 readme = "README.md"
 requires-python = ">=3.11"

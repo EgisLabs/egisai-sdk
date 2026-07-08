@@ -33,7 +33,25 @@ _rules: list[PolicyRule] = []
 _paused_agent_ids: frozenset[str] = frozenset()
 
 
-_VALID_PHASES = ("pre_model", "post_model", "both")
+# Canonical phase vocabulary (0.32.0): call-relative names that
+# read correctly for every governed surface — model calls, tool
+# calls, MCP calls, gateway traffic.
+_VALID_PHASES = ("request", "response", "both")
+
+# Wire compat: backends older than the vocabulary rename still ship
+# the model-centric spellings. Normalize on parse so the engine only
+# ever sees the canonical names.
+_PHASE_ALIASES = {
+    "pre_model": "request",
+    "post_model": "response",
+}
+
+# Surfaces a rule can be scoped to via ``applies_to``. Unknown
+# entries are dropped on parse (a future backend may ship surfaces
+# this SDK version doesn't know; ignoring them means the rule stays
+# active on the surfaces we DO understand — over-application, the
+# safe direction).
+_VALID_SURFACES = ("model", "tool", "mcp")
 
 
 def _to_rule(d: dict) -> PolicyRule:
@@ -42,7 +60,9 @@ def _to_rule(d: dict) -> PolicyRule:
     ``agent_ids`` defaults to an empty tuple ("applies to all").
     ``phase`` defaults to ``"both"`` so older platform responses
     (which don't carry the field) keep their previous Behavior:
-    each rule fires on whichever side its type supports.
+    each rule fires on whichever side its type supports. Legacy
+    phase spellings (``pre_model`` / ``post_model``) are accepted
+    and normalized to the call-relative vocabulary.
     Both ``"type"`` and the legacy ``"kind"`` field are accepted.
     """
     raw_ids = d.get("agent_ids")
@@ -67,8 +87,20 @@ def _to_rule(d: dict) -> PolicyRule:
     rule_id: str | None = (
         None if raw_id is None or raw_id == "" else str(raw_id)
     )
-    raw_phase = d.get("phase")
+    raw_phase = str(d.get("phase") or "")
+    raw_phase = _PHASE_ALIASES.get(raw_phase, raw_phase)
     phase = raw_phase if raw_phase in _VALID_PHASES else "both"
+    # Surface scoping. Missing / empty ⇒ empty tuple ("all
+    # surfaces") — the legacy behavior for every rule that predates
+    # ``applies_to``.
+    raw_surfaces = d.get("applies_to")
+    if raw_surfaces is None:
+        applies_to: tuple[str, ...] = ()
+    else:
+        applies_to = tuple(
+            s for s in (str(x).strip() for x in raw_surfaces)
+            if s in _VALID_SURFACES
+        )
     return PolicyRule(
         id=rule_id,
         name=d.get("name", ""),
@@ -77,6 +109,7 @@ def _to_rule(d: dict) -> PolicyRule:
         config=dict(d.get("config") or {}),
         agent_ids=agent_ids,
         phase=phase,
+        applies_to=applies_to,
         mcp_server_ids=mcp_server_ids,
     )
 
