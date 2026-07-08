@@ -36,6 +36,10 @@ In scope:
   repository).
 - The platform endpoints under `https://app.egisai.co/v1/sdk/*`
   that this SDK communicates with.
+- The inline Gateway endpoint
+  (`https://app.egisai.co/v1/chat/completions`) that
+  `egisai.Client` and Gateway mode (`init(gateway=True)`) send
+  traffic through.
 - The PyPI release artefacts (sdist + wheel) and their
   signatures.
 

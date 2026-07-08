@@ -15,7 +15,7 @@ This document is the canonical SDK guide for **[PyPI](https://pypi.org/project/e
 | Capability | What it means for you |
 |------------|------------------------|
 | **Central policies** | Operators configure rules in the [EgisAI dashboard](https://app.egisai.co). The SDK loads them at runtime and refreshes them continuously—no redeploy to tighten controls. |
-| **Transparent integration** | No proxy layer and no wrapper objects you must remember to use. `egisai.init()` patches every supported library that is importable in the current environment; calls through their normal API go through governance without further wiring. |
+| **Transparent integration** | No mandatory proxy and no wrapper objects you must remember to use. `egisai.init()` patches every supported library that is importable in the current environment; calls through their normal API go through governance without further wiring. Orgs that prefer network-path enforcement use the optional inline Gateway instead — see "Gateway mode" below. |
 | **Broad framework coverage** | Direct provider SDKs (OpenAI, Anthropic, Google Gemini, AWS Bedrock Converse) plus the major agent frameworks (LangChain, LangGraph, OpenAI Agents, CrewAI, AutoGen, Agno, Strands, smolagents, LlamaIndex, Pydantic AI, Google ADK, Claude Agent SDK) are governed transparently. |
 | **Audit trail** | Governed calls emit structured events to your org so teams can review verdicts, latency, tool calls, and usage in one place. |
 | **Local-first sensitive checks** | Pattern-based PII handling and other deterministic rules run entirely inside your process before traffic leaves your environment. |
