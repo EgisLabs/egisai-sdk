@@ -119,20 +119,24 @@ Open **[Dashboard → Requests](https://app.egisai.co/dashboard)** to see govern
 
 Each governed call is evaluated in two phases—once before the model runs and once after it returns—so policies can intervene on either side independently.
 
-1. **Pre-model evaluation** — Before the upstream model runs, the SDK applies your organization’s active policies (cached locally) to the prompt. Local deterministic rules — PII detection, regex denylists, model allowlists, prompt-size caps — run first; intent-oriented `semantic_guard` is consulted only if every local rule allowed the prompt.
-2. **Outcomes (pre-model)** — A call may be **allowed**, **sanitized** (payload adjusted per policy, then forwarded), or **blocked**. Blocked calls never reach the provider when enforcement raises or returns a stub, depending on configuration (see below).
-3. **Post-model evaluation** — When the model responds, output-side policies run against the assistant’s text, tool invocations, and connector targets, using **the same two-phase split**. Local rules run first; `semantic_guard` runs only if no local rule already blocked. A blocked response is suppressed before it reaches your code.
+1. **Request evaluation** — Before the upstream model runs, the SDK applies your organization’s active policies (cached locally) to the prompt. Local deterministic rules — PII detection, regex denylists, model allowlists, prompt-size caps — run first; intent-oriented `semantic_guard` is consulted only if every local rule allowed the prompt.
+2. **Outcomes (request)** — A call may be **allowed**, **sanitized** (payload adjusted per policy, then forwarded), or **blocked**. Blocked calls never reach the provider when enforcement raises or returns a stub, depending on configuration (see below).
+3. **Response evaluation** — When the model responds, output-side policies run against the assistant’s text, tool invocations, and connector targets, using **the same two-phase split**. Local rules run first; `semantic_guard` runs only if no local rule already blocked. A blocked response is suppressed before it reaches your code.
 4. **Telemetry** — The audit event records each phase’s decision independently (`prompt_decision`, `response_decision`) so your dashboard can show exactly which side fired and which rules matched. Delivery is non-blocking.
 
 Each policy carries a **phase** that selects which side it runs on:
 
 | Phase | When the rule fires |
 |-------|--------------------|
-| `pre_model`  | Only on the prompt, before the model is called. |
-| `post_model` | Only on the response, after the model returns. |
-| `both`       | On both sides where the rule type has signals to evaluate. |
+| `request`  | Only on the inbound payload, before the call is made. |
+| `response` | Only on the outbound payload, after the call returns. |
+| `both`     | On both sides where the rule type has signals to evaluate. |
 
-Operators choose the phase in the dashboard when they create or edit a rule, and every rule type accepts every phase. The engine evaluates each rule on whichever side it has meaningful signals for: text-content rules (PII detection, regex deny-lists, prompt-size caps, semantic guard) fire symmetrically on prompt and response; tool / shell / connector rules need response-side signals and silently no-op when an operator targets them on `pre_model` only. Older platform deployments that haven’t shipped the field yet behave as if every rule were `both`, preserving previous semantics.
+The phase names are call-relative on purpose — they read correctly for every governed surface: model calls, tool calls, MCP calls. The legacy wire spellings `pre_model` / `post_model` are still accepted and normalize to `request` / `response`.
+
+Operators choose the phase in the dashboard when they create or edit a rule, and every rule type accepts every phase. The engine evaluates each rule on whichever side it has meaningful signals for: text-content rules (PII detection, regex deny-lists, prompt-size caps, semantic guard) fire symmetrically on prompt and response; tool / shell / connector rules need response-side signals and silently no-op when an operator targets them on `request` only. Older platform deployments that haven’t shipped the field yet behave as if every rule were `both`, preserving previous semantics.
+
+A policy can also carry an **`applies_to`** list that scopes it to specific call surfaces (`model`, `tool`, `mcp`); empty means every surface, which is the behavior all rules had before surface scoping existed.
 
 Sensitive pattern detection intended to catch regulated data is performed locally so raw values are not sent to third-party models as part of governance — on **both** the prompt and the response. Intent-oriented policies (`semantic_guard`) are consulted only after the applicable local checks have run on the text that will be judged, and never run at all when a local rule has already refused the call. The same ordering applies to whichever side the operator scoped the rule to.
 

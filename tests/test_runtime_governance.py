@@ -42,7 +42,7 @@ def _rule(
     config: dict[str, Any],
     *,
     name: str | None = None,
-    phase: str = "post_model",
+    phase: str = "response",
 ) -> PolicyRule:
     return PolicyRule(
         id=None,
@@ -633,7 +633,7 @@ def test_new_types_short_circuit_semantic_guard() -> None:
         type="semantic_guard",
         tenant="tenant-x",
         config={"intents": ["destructive database operation"]},
-        phase="post_model",
+        phase="response",
     )
     decision = evaluate_output_policies(
         [db_block, sem],
@@ -653,7 +653,7 @@ def test_input_side_runtime_governance_silent_no_op() -> None:
     when targeted there — they need response signals to fire."""
     from egisai.policy.engine import PolicyContext, evaluate_policies
 
-    rule = _rule("deny_db_query", {}, phase="pre_model")
+    rule = _rule("deny_db_query", {}, phase="request")
     decision = evaluate_policies(
         [rule],
         PolicyContext(

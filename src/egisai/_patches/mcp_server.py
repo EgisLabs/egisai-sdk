@@ -364,7 +364,9 @@ def _prepare_gate(instance: Any, tool_name: str, arguments: Any) -> _Gate:
         allow_sanitize=True,
     )
     try:
-        decision = evaluate_output_policies(rules, ctx)
+        # Single-surface gate: an inbound MCP ``tools/call``. Rules
+        # scoped via ``applies_to`` only fire when they cover "mcp".
+        decision = evaluate_output_policies(rules, ctx, surfaces=("mcp",))
     except Exception as exc:  # noqa: BLE001
         # Fail open on availability (NOT on PII — the deterministic PII
         # checks already ran and any block among them would have been

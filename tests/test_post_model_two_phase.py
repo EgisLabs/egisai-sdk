@@ -57,7 +57,7 @@ def _rule(
     *,
     name: str,
     config: dict | None = None,
-    phase: str = "post_model",
+    phase: str = "response",
 ) -> PolicyRule:
     return PolicyRule(
         id="r",
