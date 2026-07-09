@@ -206,7 +206,7 @@ response = client.chat.completions.create(
 )
 ```
 
-The client speaks the familiar chat-completions surface (streaming included) and always sends to the Gateway, which evaluates policies, sanitizes/blocks inline, routes to OpenAI / Anthropic / Google / Mistral / xAI / DeepSeek from the model name, and writes the audit row server-side. `egisai.AsyncClient` is the async sibling. `init()` is optional; when it's active, `egisai.set_context(agent=…)` rides along as `X-Egis-Agent` per call. Requires `pip install "egisai[openai]"` (the Gateway's wire format).
+The client speaks the familiar chat-completions surface (streaming included) and always sends to the Gateway, which evaluates policies, sanitizes/blocks inline, routes to OpenAI / Anthropic / Google / Mistral / xAI / DeepSeek from the model name, and writes the audit row server-side. `egisai.AsyncClient` is the async sibling. `init()` is optional; when it's active, `egisai.set_context(agent=…)` rides along as `X-Egis-Agent` per call, and the other `set_context` fields (`user_id`, `user_role`, `session_id`, `workflow_id`, `end_user_id`) travel as `X-Egis-*` context headers onto the run's audit row — the end-user id is hashed on intake, never stored raw. Requires `pip install "egisai[openai]"` (the Gateway's wire format).
 
 For an existing codebase that already uses the OpenAI client everywhere, one flag reroutes it without touching call sites:
 
@@ -226,7 +226,7 @@ response = client.chat.completions.create(
 
 What changes and what doesn't:
 
-- **Same calling convention.** You keep your own OpenAI client and provider key. The SDK reroutes `chat.completions.create` to the Gateway and injects `X-Egis-Api-Key` (and `X-Egis-Agent` when you set an explicit identity) automatically.
+- **Same calling convention.** You keep your own OpenAI client and provider key. The SDK reroutes `chat.completions.create` to the Gateway and injects `X-Egis-Api-Key` (plus `X-Egis-Agent` when you set an explicit identity, and the other `set_context` fields as `X-Egis-*` context headers) automatically.
 - **Same policies, evaluated server-side.** The Gateway runs the identical engine, sanitizes/blocks inline, and writes the audit row itself; the local gate is skipped for rerouted calls so nothing is governed twice.
 - **Everything else stays local.** The Responses API, Anthropic / Google / Bedrock SDKs, agent frameworks, and MCP keep the normal in-process governance path. Azure OpenAI clients are never rerouted.
 - **Fail open.** If the reroute can't be constructed, the call falls back to in-process governance from the locally cached policies — your call path never breaks because of the mode switch.

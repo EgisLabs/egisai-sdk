@@ -107,6 +107,96 @@ def test_caller_supplied_headers_win() -> None:
     assert kwargs["extra_headers"]["X-Egis-Api-Key"] == "egis_test_key"
 
 
+def test_inject_headers_carries_context_fields() -> None:
+    """Every ``set_context`` field ships as its ``X-Egis-*`` header so
+    gateway-audited runs get the same Context section as SDK-audited
+    runs."""
+    _config.set_config(_cfg())
+    _context._ctx.set(
+        _context.EgisaiContext(
+            user_id="support-ops-1042",
+            user_role="support_engineer",
+            session_id="sess-abc123",
+            workflow_id="wf-refund-1",
+            end_user_id="a" * 64,  # pre-hashed per the docs
+        )
+    )
+    kwargs: dict[str, Any] = {}
+    _gateway.inject_headers(kwargs)
+    headers = kwargs["extra_headers"]
+    assert headers["X-Egis-User"] == "support-ops-1042"
+    assert headers["X-Egis-User-Role"] == "support_engineer"
+    assert headers["X-Egis-Session"] == "sess-abc123"
+    assert headers["X-Egis-Workflow"] == "wf-refund-1"
+    assert headers["X-Egis-End-User"] == "a" * 64
+
+
+def test_unset_context_fields_send_no_headers() -> None:
+    """No context ⇒ no headers — the Gateway must be able to tell
+    "never set" apart from "set to empty"."""
+    _config.set_config(_cfg())
+    _context._ctx.set(_context.EgisaiContext())
+    kwargs: dict[str, Any] = {}
+    _gateway.inject_headers(kwargs)
+    for header in (
+        "X-Egis-User",
+        "X-Egis-User-Role",
+        "X-Egis-Session",
+        "X-Egis-Workflow",
+        "X-Egis-End-User",
+    ):
+        assert header not in kwargs["extra_headers"]
+
+
+def test_context_values_are_percent_encoded_header_safe() -> None:
+    """Unicode / control chars / literal ``%`` must reach the wire as
+    pure printable ASCII — a non-latin-1 header value raises inside
+    the customer's call in httpx, which would violate fail-open."""
+    _config.set_config(_cfg())
+    _context._ctx.set(
+        _context.EgisaiContext(
+            user_id="maría@empresa.es",
+            session_id="sess 100%\nready",
+        )
+    )
+    kwargs: dict[str, Any] = {}
+    _gateway.inject_headers(kwargs)
+    headers = kwargs["extra_headers"]
+    # Lossless round-trip via percent-decoding.
+    from urllib.parse import unquote
+
+    assert unquote(headers["X-Egis-User"]) == "maría@empresa.es"
+    assert unquote(headers["X-Egis-Session"]) == "sess 100%\nready"
+    # Wire-safety: printable ASCII only, no CR/LF smuggling.
+    for value in (headers["X-Egis-User"], headers["X-Egis-Session"]):
+        value.encode("ascii")  # raises if any non-ASCII survived
+        assert "\n" not in value and "\r" not in value
+
+
+def test_context_values_are_capped_before_encoding() -> None:
+    """Caps mirror the backend's column widths (user_role → 64)."""
+    _config.set_config(_cfg())
+    _context._ctx.set(
+        _context.EgisaiContext(user_role="r" * 500, session_id="s" * 500)
+    )
+    kwargs: dict[str, Any] = {}
+    _gateway.inject_headers(kwargs)
+    assert kwargs["extra_headers"]["X-Egis-User-Role"] == "r" * 64
+    assert kwargs["extra_headers"]["X-Egis-Session"] == "s" * 255
+
+
+def test_caller_supplied_context_headers_win() -> None:
+    """Same conflict rule as ``X-Egis-Agent`` — a customer-set header
+    is intentional and must not be clobbered by ``set_context``."""
+    _config.set_config(_cfg())
+    _context._ctx.set(_context.EgisaiContext(session_id="from-context"))
+    kwargs: dict[str, Any] = {
+        "extra_headers": {"X-Egis-Session": "hand-set"}
+    }
+    _gateway.inject_headers(kwargs)
+    assert kwargs["extra_headers"]["X-Egis-Session"] == "hand-set"
+
+
 def test_pushed_agent_block_wins_over_set_context() -> None:
     """Tier-0 precedence carries over: ``with egisai.agent(...)``
     (the pushed identity stack) beats ``set_context``."""
@@ -140,6 +230,8 @@ def _mock_client(seen: dict[str, Any]) -> openai.OpenAI:
         seen["egis_key"] = request.headers.get("X-Egis-Api-Key")
         seen["agent"] = request.headers.get("X-Egis-Agent")
         seen["auth"] = request.headers.get("Authorization")
+        seen["session"] = request.headers.get("X-Egis-Session")
+        seen["end_user"] = request.headers.get("X-Egis-End-User")
         return httpx.Response(200, json=_completion_json())
 
     return openai.OpenAI(
@@ -151,7 +243,13 @@ def _mock_client(seen: dict[str, Any]) -> openai.OpenAI:
 def test_call_is_rerouted_to_the_gateway() -> None:
     assert patch_openai.apply()
     _config.set_config(_cfg())
-    _context._ctx.set(_context.EgisaiContext(agent_name="Triage"))
+    _context._ctx.set(
+        _context.EgisaiContext(
+            agent_name="Triage",
+            session_id="sess-wire-1",
+            end_user_id="b" * 64,
+        )
+    )
     seen: dict[str, Any] = {}
     client = _mock_client(seen)
 
@@ -163,10 +261,13 @@ def test_call_is_rerouted_to_the_gateway() -> None:
     assert resp.choices[0].message.content == "hi"
     # The request went to <base_url>/v1/…, not api.openai.com.
     assert seen["url"] == "https://app.egisai.co/v1/chat/completions"
-    # Egis key + explicit identity on the wire; the provider key is
-    # untouched in Authorization for the gateway to forward.
+    # Egis key + explicit identity + request context on the wire; the
+    # provider key is untouched in Authorization for the gateway to
+    # forward.
     assert seen["egis_key"] == "egis_test_key"
     assert seen["agent"] == "Triage"
+    assert seen["session"] == "sess-wire-1"
+    assert seen["end_user"] == "b" * 64
     assert seen["auth"] == "Bearer sk-provider-key"
 
 
