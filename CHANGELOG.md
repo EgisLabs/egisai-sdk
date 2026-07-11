@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.35.0] — 2026-07-09
+
+### Added
+
+- **Gateway calls now carry the full `set_context` request context.**
+  Previously only the explicit agent identity crossed the Gateway wire
+  (`X-Egis-Agent`); the other context fields applied to in-process
+  governance only, so gateway-audited runs showed an empty Context
+  section on the dashboard. `inject_headers` now ships `user_id` /
+  `user_role` / `session_id` / `workflow_id` / `end_user_id` as
+  `X-Egis-User` / `X-Egis-User-Role` / `X-Egis-Session` /
+  `X-Egis-Workflow` / `X-Egis-End-User`. Values are percent-encoded
+  UTF-8 on the wire (HTTP header values must be latin-1-safe or the
+  transport would raise inside the customer's call, violating
+  fail-open) and are capped to the platform's column widths before
+  encoding. The platform decodes on intake, re-hashes the end-user id
+  (the raw value is never persisted or logged), stamps the run's
+  Context section, and folds the observation into the per-end-user
+  roll-up — identical to SDK-audited traffic. Caller-supplied
+  `X-Egis-*` headers still win on conflict, and context collection
+  fails open: a header that can't be built degrades the audit row's
+  metadata, never the call.
+
 ## [0.34.2] — 2026-07-08
 
 ### Changed

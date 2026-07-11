@@ -15,6 +15,18 @@ itself. The SDK's job shrinks to what only it can do:
   auto-detection" precedence. Without an explicit identity no header
   is sent and the Gateway fingerprints the system prompt server-side
   with the same algorithm the SDK uses locally.
+* carry the rest of the request context the same way — the
+  ``set_context`` fields ``user_id`` / ``user_role`` / ``session_id``
+  / ``workflow_id`` / ``end_user_id`` ship as ``X-Egis-User`` /
+  ``X-Egis-User-Role`` / ``X-Egis-Session`` / ``X-Egis-Workflow`` /
+  ``X-Egis-End-User`` so gateway-audited runs show the same Context
+  section as SDK-audited runs. Values are percent-encoded (RFC 3986,
+  UTF-8) before hitting the wire: HTTP header values must be
+  latin-1-safe or the transport raises *inside the customer's call*,
+  which would violate fail-open. The Gateway decodes on intake.
+  ``end_user_id`` follows the documented convention of being a hash
+  already; the backend re-hashes on intake regardless, so the raw
+  value never persists.
 
 Scope (v1):
 
@@ -35,6 +47,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import quote
 
 from egisai._config import get_config_optional
 
@@ -42,6 +55,39 @@ LOGGER = logging.getLogger("egisai.gateway")
 
 _API_KEY_HEADER = "X-Egis-Api-Key"
 _AGENT_HEADER = "X-Egis-Agent"
+
+# ``set_context`` fields carried over the gateway wire, with the raw
+# character budget each one gets before encoding. The caps mirror the
+# backend's ``runs`` column widths (``_RUN_CONTEXT_LIMITS`` in
+# ``routers/sdk.py``) so the gateway and SDK ingest paths truncate
+# identically.
+_CONTEXT_HEADER_FIELDS: tuple[tuple[str, str, int], ...] = (
+    ("user_id", "X-Egis-User", 255),
+    ("user_role", "X-Egis-User-Role", 64),
+    ("session_id", "X-Egis-Session", 255),
+    ("workflow_id", "X-Egis-Workflow", 255),
+    ("end_user_id", "X-Egis-End-User", 255),
+)
+
+# Characters left un-escaped on top of RFC 3986 unreserved
+# (letters, digits, ``-._~``). Chosen so common id shapes — emails,
+# UUIDs, ``sess-…``/``wf_…`` slugs, ISO timestamps, paths — cross the
+# wire byte-identical and stay human-readable in server logs. ``%``
+# is always escaped, which is what makes the encoding lossless.
+_HEADER_VALUE_SAFE = "@:/+=,"
+
+
+def _encode_context_value(raw: str, max_chars: int) -> str | None:
+    """Trim, cap, and percent-encode one context value for a header.
+
+    Returns ``None`` for blank input so the header is simply omitted.
+    Truncation happens BEFORE encoding — the cap is a data budget
+    (matching the backend column), not a wire-bytes budget.
+    """
+    trimmed = raw.strip()[:max_chars]
+    if not trimmed:
+        return None
+    return quote(trimmed, safe=_HEADER_VALUE_SAFE)
 
 
 class RerouteUnavailable(Exception):
@@ -124,8 +170,36 @@ def _explicit_agent_name() -> str | None:
         return None
 
 
+def _context_headers() -> dict[str, str]:
+    """The ``set_context`` fields as wire-ready headers.
+
+    Fail-open like every hook on the hot path: any surprise in the
+    context read or encoding returns what was collected so far — a
+    missing context header degrades the audit row's metadata, never
+    the customer's call.
+    """
+    headers: dict[str, str] = {}
+    try:
+        from egisai._context import get_context
+
+        ctx = get_context()
+        for field, header, max_chars in _CONTEXT_HEADER_FIELDS:
+            raw = getattr(ctx, field, None)
+            if isinstance(raw, str):
+                encoded = _encode_context_value(raw, max_chars)
+                if encoded:
+                    headers[header] = encoded
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("could not collect context headers", exc_info=True)
+    return headers
+
+
 def inject_headers(kwargs: dict[str, Any], *, include_api_key: bool = True) -> None:
     """Merge the Egis headers into the call's ``extra_headers``.
+
+    Carries the API key (optional), the explicit agent identity, and
+    the ``set_context`` request-context fields (percent-encoded; see
+    the module docstring for the wire contract).
 
     Caller-provided headers win on conflict — if the customer set
     their own ``X-Egis-Agent`` we assume they meant it.
@@ -142,6 +216,7 @@ def inject_headers(kwargs: dict[str, Any], *, include_api_key: bool = True) -> N
     agent_name = _explicit_agent_name()
     if agent_name:
         headers[_AGENT_HEADER] = agent_name
+    headers.update(_context_headers())
     existing = kwargs.get("extra_headers")
     if isinstance(existing, dict):
         headers.update({str(k): v for k, v in existing.items()})

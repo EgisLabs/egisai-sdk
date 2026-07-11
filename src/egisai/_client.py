@@ -28,8 +28,10 @@ clear install hint.
 ``egisai.init()`` is NOT required — the Client carries its own keys.
 When ``init()`` *has* run, the openai patch recognises gateway-bound
 clients and adds per-call context (``egisai.set_context(agent=…)`` /
-``with egisai.agent(…):`` → ``X-Egis-Agent``) without ever running
-the local gate, so nothing is governed twice.
+``with egisai.agent(…):`` → ``X-Egis-Agent``, plus the other
+``set_context`` fields as ``X-Egis-User`` / ``X-Egis-User-Role`` /
+``X-Egis-Session`` / ``X-Egis-Workflow`` / ``X-Egis-End-User``)
+without ever running the local gate, so nothing is governed twice.
 """
 
 from __future__ import annotations
