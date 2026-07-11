@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.35.1] — 2026-07-11
+
+### Fixed
+
+- Release only, no code change. The 0.35.0 release never reached
+  PyPI: the release tag was mis-named (`0.35.0.0.0`, which the
+  ``v*``-triggered workflow ignores) and the corrected tag name then
+  collided with a stale local ref in the mirror checkout. This
+  version carries the full 0.35.0 payload below.
+
 ## [0.35.0] — 2026-07-09
 
 ### Added

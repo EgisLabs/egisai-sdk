@@ -14,7 +14,7 @@ plus an httpx / requests fallback.
 
 from __future__ import annotations
 
-__version__ = "0.35.0"
+__version__ = "0.35.1"
 
 from egisai._client import AsyncClient, Client
 from egisai._context import agent, register_agent, set_context
