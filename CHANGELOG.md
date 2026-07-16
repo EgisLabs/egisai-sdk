@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.36.0] — 2026-07-15
+
+### Added
+
+- **Per-agent governance opt-out ("monitor only" mode).** Operators
+  can now turn policy enforcement off for a specific agent from the
+  dashboard without stopping its traffic. Calls attributed to an
+  ungoverned agent skip every policy phase — no deterministic
+  checks, no semantic-guard LLM judge, no sanitization — and flow
+  to the model untouched, while event logging stays on so the
+  Requests page keeps full visibility. The SDK learns the set via
+  a new `ungoverned_agent_ids` field on the `/v1/sdk/policies`
+  snapshot (ETag-versioned in lockstep with the rule list; flips
+  take effect within ~50 ms via the existing `agent.changed` SSE
+  ping). The operator pause kill switch takes precedence: a paused
+  agent is refused even if it is also ungoverned. Older backends
+  that don't ship the field behave exactly as before — every agent
+  stays governed, the safe (enforcing) direction.
+
 ## [0.35.1] — 2026-07-11
 
 ### Fixed

@@ -18,7 +18,11 @@ from typing import Any
 
 from egisai._config import get_config_optional
 from egisai._context import get_context
-from egisai._policy_cache import get_paused_agent_ids, get_rules
+from egisai._policy_cache import (
+    get_paused_agent_ids,
+    get_rules,
+    get_ungoverned_agent_ids,
+)
 from egisai.policy import (
     OutputPolicyContext,
     PolicyContext,
@@ -374,6 +378,39 @@ def _is_agent_paused(agent_id: str) -> bool:
     return agent_id in get_paused_agent_ids()
 
 
+# ── Phase 0.5: governance opt-out gate ──────────────────────────────
+#
+# An *ungoverned* agent is the inverse of a paused one: instead of
+# refusing its traffic, we let it flow COMPLETELY untouched — no
+# Phase 1 deterministic checks, no Phase 2 LLM judge, no
+# sanitization. The operator has explicitly opted this agent out of
+# policy enforcement from the dashboard ("monitor only"). Event
+# logging is unaffected: the framework patches build + ship their
+# audit events regardless of the decision, so the Requests page
+# keeps full visibility over the agent's traffic.
+#
+# Ordering: the pause gate wins. A paused agent is refused even if
+# it is also ungoverned — the kill switch is the emergency control
+# and must never be maskable by the (softer) governance opt-out.
+#
+# Same fail-safe posture as the pause gate for missing identities:
+# an empty agent_id can't be matched against the set, so the call
+# falls through to the regular policy phases (the enforcing
+# direction — we never skip governance for traffic we can't
+# attribute).
+
+
+def _is_agent_ungoverned(agent_id: str) -> bool:
+    """Quick lookup against the cached ungoverned-agent set.
+
+    Returns ``False`` whenever ``agent_id`` is empty so unknown
+    traffic stays fully governed.
+    """
+    if not agent_id:
+        return False
+    return agent_id in get_ungoverned_agent_ids()
+
+
 def evaluate(call: InputCall) -> PolicyDecision:
     """Run the cached input rules against an in-flight call.
 
@@ -385,6 +422,12 @@ def evaluate(call: InputCall) -> PolicyDecision:
     agent_id = _active_agent_id()
     if _is_agent_paused(agent_id):
         return _agent_paused_decision()
+    if _is_agent_ungoverned(agent_id):
+        # Governance opt-out: skip every policy phase. The plain
+        # allow keeps the audit event's verdict "allowed" so the
+        # Requests page shows the traffic exactly like a call no
+        # policy matched — full visibility, zero enforcement.
+        return PolicyDecision.allow()
     rules = get_rules()
     if not rules:
         return PolicyDecision.allow()
@@ -424,6 +467,10 @@ def evaluate_output(call: OutputCall) -> PolicyDecision:
     agent_id = _active_agent_id()
     if _is_agent_paused(agent_id):
         return _agent_paused_decision()
+    if _is_agent_ungoverned(agent_id):
+        # Mirror of the input side: the operator opted this agent
+        # out of enforcement, so its responses pass untouched too.
+        return PolicyDecision.allow()
     rules = get_rules()
     if not rules:
         return PolicyDecision.allow()

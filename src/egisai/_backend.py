@@ -129,26 +129,30 @@ def handshake(
 
 def fetch_policies(
     etag: str | None = None,
-) -> tuple[str | None, list[dict] | None, list[str] | None]:
-    """Pull the per-org policy + paused-agent snapshot.
+) -> tuple[str | None, list[dict] | None, list[str] | None, list[str] | None]:
+    """Pull the per-org policy + paused/ungoverned-agent snapshot.
 
-    Returns ``(new_etag, rules, paused_agent_ids)``.
+    Returns ``(new_etag, rules, paused_agent_ids, ungoverned_agent_ids)``.
 
     * ``rules`` is ``None`` on a 304 (cache still fresh — the
       caller leaves its current rule list AND its current
-      ``paused_agent_ids`` cache untouched).
-    * On 200 ``rules`` is the freshly-fetched rule list and
+      paused / ungoverned agent-set caches untouched).
+    * On 200 ``rules`` is the freshly-fetched rule list,
       ``paused_agent_ids`` is the freshly-fetched set of paused
-      agent UUIDs (lower-case canonical 8-4-4-4-12 form).
-      Older backends that don't ship the field return an empty
-      list — the SDK then treats the org as having no paused
-      agents, which matches their pre-rollout Behavior.
+      agent UUIDs, and ``ungoverned_agent_ids`` is the set of
+      agents whose policy enforcement an operator turned off
+      (monitor-only mode). All UUIDs are lower-case canonical
+      8-4-4-4-12 form. Older backends that don't ship a field
+      return an empty list — the SDK then treats the org as
+      having no paused / no ungoverned agents, which matches
+      their pre-rollout Behavior (and is the safe, enforcing
+      direction for the ungoverned set).
 
-    The triple-return wire shape is intentional: callers (the
-    in-process ``_policy_cache``) want both pieces of state to
+    The tuple-return wire shape is intentional: callers (the
+    in-process ``_policy_cache``) want every piece of state to
     update atomically, in lockstep with the same ETag, so a
-    well-timed pause never lands inconsistently against a
-    just-fetched rule set.
+    well-timed pause / ungovern never lands inconsistently
+    against a just-fetched rule set.
     """
     headers: dict[str, str] = {}
     if etag:
@@ -158,7 +162,7 @@ def fetch_policies(
         lambda: get_client().get("/v1/sdk/policies", headers=headers),
     )
     if r.status_code == 304:
-        return etag, None, None
+        return etag, None, None, None
     if r.status_code != 200:
         raise _http_error(op="fetch_policies", status=r.status_code)
     body = r.json()
@@ -166,7 +170,11 @@ def fetch_policies(
     paused: list[str] = [
         str(a).strip().lower() for a in raw_paused if a
     ]
-    return body.get("etag"), body.get("rules", []), paused
+    raw_ungoverned = body.get("ungoverned_agent_ids") or []
+    ungoverned: list[str] = [
+        str(a).strip().lower() for a in raw_ungoverned if a
+    ]
+    return body.get("etag"), body.get("rules", []), paused, ungoverned
 
 
 def ensure_agent(

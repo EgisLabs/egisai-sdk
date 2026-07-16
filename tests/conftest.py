@@ -105,6 +105,10 @@ class FakeBackend:
     def __init__(self) -> None:
         self.events_received: list[dict[str, Any]] = []
         self.rules: list[dict[str, Any]] = []
+        # Per-agent state sets riding on the same /v1/sdk/policies
+        # snapshot as the rules. Tests set these via ``set_rules``.
+        self.paused_agent_ids: list[str] = []
+        self.ungoverned_agent_ids: list[str] = []
         self.etag: str = '"empty"'
         self.handshake_calls = 0
         self.ensured_agents: list[dict[str, Any]] = []
@@ -120,9 +124,19 @@ class FakeBackend:
         self.startup_warnings: list[dict[str, Any]] = []
         self._next_agent_serial = 100
 
-    def set_rules(self, rules: list[dict[str, Any]], etag: str = '"new"') -> None:
+    def set_rules(
+        self,
+        rules: list[dict[str, Any]],
+        etag: str = '"new"',
+        paused_agent_ids: list[str] | None = None,
+        ungoverned_agent_ids: list[str] | None = None,
+    ) -> None:
         self.rules = rules
         self.etag = etag
+        if paused_agent_ids is not None:
+            self.paused_agent_ids = paused_agent_ids
+        if ungoverned_agent_ids is not None:
+            self.ungoverned_agent_ids = ungoverned_agent_ids
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -151,7 +165,15 @@ class FakeBackend:
         if path.endswith("/v1/sdk/policies"):
             if request.headers.get("if-none-match") == self.etag:
                 return httpx.Response(304)
-            return httpx.Response(200, json={"etag": self.etag, "rules": self.rules})
+            return httpx.Response(
+                200,
+                json={
+                    "etag": self.etag,
+                    "rules": self.rules,
+                    "paused_agent_ids": self.paused_agent_ids,
+                    "ungoverned_agent_ids": self.ungoverned_agent_ids,
+                },
+            )
         if path.endswith("/v1/sdk/agents/ensure"):
             import json
 

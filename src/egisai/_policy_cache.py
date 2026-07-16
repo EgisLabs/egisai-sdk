@@ -1,19 +1,24 @@
-"""Thread-safe in-process cache of policy rules + paused-agent set.
+"""Thread-safe in-process cache of policy rules + per-agent state sets.
 
 Every governed call reads from this cache. The refresher worker
 updates it when the platform signals a change.
 
-The cache holds two pieces of state in lockstep:
+The cache holds three pieces of state in lockstep:
 
-* ``_rules``             — the org's active policy rules.
-* ``_paused_agent_ids`` — UUIDs (lower-case) of agents an
-                            operator has flipped into the paused
-                            state from the dashboard.
+* ``_rules``                 — the org's active policy rules.
+* ``_paused_agent_ids``     — UUIDs (lower-case) of agents an
+                                operator has flipped into the
+                                paused state from the dashboard.
+* ``_ungoverned_agent_ids`` — UUIDs (lower-case) of agents whose
+                                policy enforcement an operator
+                                turned off (monitor-only mode):
+                                their calls skip every policy
+                                phase but keep being logged.
 
-Both are ETag-versioned by the same backend response so a single
+All are ETag-versioned by the same backend response so a single
 ``replace_*`` write is atomic from the gate's point of view: a
-newly-paused agent never lands inconsistently against an
-out-of-date rule list, and vice versa.
+newly-paused (or newly-ungoverned) agent never lands
+inconsistently against an out-of-date rule list, and vice versa.
 """
 
 from __future__ import annotations
@@ -31,6 +36,10 @@ _rules: list[PolicyRule] = []
 # the read snapshot is safely shareable across threads without
 # defensive copying.
 _paused_agent_ids: frozenset[str] = frozenset()
+# Lower-case canonical UUID strings of ungoverned agents (operator
+# turned policy enforcement off; monitoring stays on). Same
+# frozenset rationale as the paused set.
+_ungoverned_agent_ids: frozenset[str] = frozenset()
 
 
 # Canonical phase vocabulary (0.32.0): call-relative names that
@@ -138,30 +147,49 @@ def get_paused_agent_ids() -> frozenset[str]:
         return _paused_agent_ids
 
 
+def get_ungoverned_agent_ids() -> frozenset[str]:
+    """Snapshot of the operator-ungoverned agent ID set.
+
+    Agents in this set have policy enforcement turned off from
+    the dashboard: the gate skips every policy phase for their
+    calls (traffic flows to the model untouched) while event
+    logging stays on. Same frozenset contract as
+    :func:`get_paused_agent_ids`.
+    """
+    with _lock:
+        return _ungoverned_agent_ids
+
+
 def replace_rules(
     new_etag: str | None,
     raw_rules: list[dict],
     paused_agent_ids: list[str] | None = None,
+    ungoverned_agent_ids: list[str] | None = None,
 ) -> int:
     """Replace the cache atomically. Returns the new rule count.
 
-    ``paused_agent_ids`` lands in lockstep with the new rule
-    list. ``None`` (the default) preserves the existing
-    paused-agent set — the wire-side contract is "if the
-    backend didn't ship the field, leave the cache alone" so
-    older backends that pre-date the rollout never accidentally
-    clear an active pause.
+    ``paused_agent_ids`` / ``ungoverned_agent_ids`` land in
+    lockstep with the new rule list. ``None`` (the default)
+    preserves the existing set — the wire-side contract is "if
+    the backend didn't ship the field, leave the cache alone" so
+    older backends that pre-date each rollout never accidentally
+    clear an active pause (or re-govern an opted-out agent
+    mid-session in a surprising way).
 
-    An empty list explicitly clears the set (the backend said
-    "no agents are paused" — believe it).
+    An empty list explicitly clears the corresponding set (the
+    backend said "no agents are in this state" — believe it).
     """
     with _lock:
-        global _etag, _rules, _paused_agent_ids
+        global _etag, _rules, _paused_agent_ids, _ungoverned_agent_ids
         _etag = new_etag
         _rules = [_to_rule(r) for r in raw_rules]
         if paused_agent_ids is not None:
             _paused_agent_ids = frozenset(
                 str(a).strip().lower() for a in paused_agent_ids if a
+            )
+        if ungoverned_agent_ids is not None:
+            _ungoverned_agent_ids = frozenset(
+                str(a).strip().lower() for a in ungoverned_agent_ids if a
             )
         return len(_rules)
 
@@ -169,19 +197,25 @@ def replace_rules(
 def refresh_now() -> bool:
     """Hit the platform once. Returns ``True`` iff the cache was updated."""
     current_etag = get_etag()
-    new_etag, rules, paused = fetch_policies(etag=current_etag)
+    new_etag, rules, paused, ungoverned = fetch_policies(etag=current_etag)
     if rules is None:
-        # 304 — nothing changed since ``current_etag``. Both the
-        # rule list AND the paused-agent set stay as-is, in
-        # lockstep with the same ETag.
+        # 304 — nothing changed since ``current_etag``. The rule
+        # list AND both agent-state sets stay as-is, in lockstep
+        # with the same ETag.
         return False
-    replace_rules(new_etag, rules, paused_agent_ids=paused)
+    replace_rules(
+        new_etag,
+        rules,
+        paused_agent_ids=paused,
+        ungoverned_agent_ids=ungoverned,
+    )
     return True
 
 
 def clear() -> None:
     with _lock:
-        global _etag, _rules, _paused_agent_ids
+        global _etag, _rules, _paused_agent_ids, _ungoverned_agent_ids
         _etag = None
         _rules = []
         _paused_agent_ids = frozenset()
+        _ungoverned_agent_ids = frozenset()
