@@ -110,6 +110,30 @@ def test_client_without_any_key_raises() -> None:
         egisai.Client(provider_key="sk-test")
 
 
+def test_client_vault_mode_sends_sentinel_not_provider_key(monkeypatch) -> None:
+    """No provider_key + no OPENAI_API_KEY → BYOK vault mode.
+
+    The Client still authenticates with the Egis key, but Authorization
+    carries an Egis-namespaced placeholder the Gateway resolves against
+    the org's stored provider keys — never a real provider credential.
+    """
+    from egisai._client import _VAULT_SENTINEL
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(_config, "_CONFIG", None)
+    seen: dict[str, Any] = {}
+    client = egisai.Client(
+        api_key="egis_live_key",
+        http_client=httpx.Client(transport=_transport(seen)),
+    )
+    client.chat.completions.create(
+        model="claude-sonnet-4-5",
+        messages=[{"role": "user", "content": "Hello!"}],
+    )
+    assert seen["egis_key"] == "egis_live_key"
+    assert seen["auth"] == f"Bearer {_VAULT_SENTINEL}"
+
+
 def test_set_context_rides_along_when_init_is_active() -> None:
     """With the openai patch applied and config present, per-call
     context becomes ``X-Egis-Agent`` — even though ``gateway_mode``

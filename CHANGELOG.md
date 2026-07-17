@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.37.0] — 2026-07-16
+
+### Added
+
+- **BYOK vault mode for `egisai.Client` — `provider_key` is now
+  optional.** Store your provider keys once on the dashboard's
+  Gateway page (encrypted at rest) and construct the client with just
+  your Egis key: `egisai.Client(api_key="egis_live_…")`. The Gateway
+  resolves the right provider key for each request from the model
+  name and forwards it upstream — no provider key in your code, no
+  custom headers. This is the same server-side vault that lets
+  header-less platforms (Cursor, n8n, low-code tools) connect to the
+  Gateway with only their Egis key in the `Authorization` bearer.
+  When `provider_key` is supplied it is forwarded untouched exactly
+  as before (passthrough); `OPENAI_API_KEY` still works as the legacy
+  default-provider fallback. Fully backward compatible — existing
+  code that passes `provider_key` is unaffected.
+
 ## [0.36.0] — 2026-07-15
 
 ### Added

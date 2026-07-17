@@ -206,6 +206,8 @@ response = client.chat.completions.create(
 )
 ```
 
+`provider_key` is optional. Omit it to use **BYOK vault mode**: store your provider keys once on the dashboard's Gateway page (encrypted at rest) and construct the client with just your Egis key — `egisai.Client(api_key="egis_live_…")`. The Gateway then forwards the stored key for the request's provider. This is the same server-side vault that lets header-less platforms (Cursor, n8n, low-code tools) connect using only their Egis key in the `Authorization` bearer, with no custom headers.
+
 The client speaks the familiar chat-completions surface (streaming included) and always sends to the Gateway, which evaluates policies, sanitizes/blocks inline, routes to OpenAI / Anthropic / Google / Mistral / xAI / DeepSeek from the model name, and writes the audit row server-side. `egisai.AsyncClient` is the async sibling. `init()` is optional; when it's active, `egisai.set_context(agent=…)` rides along as `X-Egis-Agent` per call, and the other `set_context` fields (`user_id`, `user_role`, `session_id`, `workflow_id`, `end_user_id`) travel as `X-Egis-*` context headers onto the run's audit row — the end-user id is hashed on intake, never stored raw. Requires `pip install "egisai[openai]"` (the Gateway's wire format).
 
 For an existing codebase that already uses the OpenAI client everywhere, one flag reroutes it without touching call sites:
