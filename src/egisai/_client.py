@@ -13,6 +13,14 @@ The user-facing contract puts Egis first::
         messages=[{"role": "user", "content": "Hello!"}],
     )
 
+``provider_key`` is optional. Omit it to use **BYOK vault mode**:
+store your provider keys once on the dashboard's Gateway page and the
+Client sends only your Egis key — the Gateway forwards the stored key
+for the request's provider. This is the same capability that lets
+header-less platforms (Cursor, n8n) connect with just the Egis key::
+
+    client = egisai.Client(api_key="egis_live_…")   # keys from the vault
+
 No provider import, no ``base_url`` wiring, no header plumbing — the
 client always talks to the platform's Gateway, which evaluates
 policies, sanitizes/blocks inline, routes to the right provider from
@@ -45,6 +53,16 @@ _INSTALL_HINT = (
     "egisai.Client requires the 'openai' package (the Gateway's wire "
     "format). Install it with: pip install 'egisai[openai]'"
 )
+
+#: BYOK vault sentinel. When no provider key is configured anywhere,
+#: the OpenAI transport still needs *some* ``api_key`` to construct —
+#: it always emits it as ``Authorization: Bearer <key>``. This
+#: Egis-namespaced placeholder is recognised by the Gateway as "not a
+#: provider key" (it starts with ``egis_``), so the Gateway resolves
+#: the real provider key from the org's stored BYOK vault, keyed by
+#: the request model's provider. It is never a real credential and is
+#: never sent to a provider.
+_VAULT_SENTINEL = "egis_vault_no_provider_key"
 
 
 def _resolve_egis_key(api_key: str | None) -> str:
@@ -98,9 +116,13 @@ def _build_inner(
 
     if provider_key is not None:
         openai_kwargs["api_key"] = provider_key
-    # Without a provider_key the underlying transport falls back to
-    # OPENAI_API_KEY per its own convention — correct for the default
-    # provider; other providers need an explicit key.
+    elif "api_key" not in openai_kwargs and not os.getenv("OPENAI_API_KEY"):
+        # BYOK vault mode: no provider key configured anywhere. Hand
+        # the transport a placeholder the Gateway resolves against the
+        # org's stored provider keys. (If OPENAI_API_KEY *is* set, the
+        # transport uses it — legacy passthrough for the default
+        # provider — so we don't override that here.)
+        openai_kwargs["api_key"] = _VAULT_SENTINEL
 
     cls = openai.AsyncOpenAI if is_async else openai.OpenAI
     return cls(
@@ -121,7 +143,11 @@ class Client:
     provider_key
         The upstream provider's key (``sk-…`` / ``sk-ant-…`` / …),
         forwarded untouched in ``Authorization``; never stored or
-        logged by the platform.
+        logged by the platform. **Optional** — omit it to use BYOK
+        vault mode, where the Gateway supplies the provider key from
+        the org's stored, encrypted keys (configured on the Gateway
+        page). Falls back to ``OPENAI_API_KEY`` when set, for legacy
+        default-provider passthrough.
     agent
         Optional explicit agent name for every call from this client
         (the ``X-Egis-Agent`` header). Per-call context set via
