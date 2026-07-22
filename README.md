@@ -115,6 +115,27 @@ Open **[Dashboard → Requests](https://app.egisai.co/dashboard)** to see govern
 
 ---
 
+## Access inventory
+
+Every agent's modal on the dashboard includes an **Access** tab that lists what the agent can reach — tools, MCP servers and their tools — with per-item usage counters and actionable governance insights (including one-click policy creation). The SDK feeds it automatically; there is nothing to configure.
+
+On the platform side, each capability's governance is assessed in context rather than blanket-flagged: a covered capability shows the policy names enforcing it, and ungoverned capabilities receive a per-item verdict — *policy recommended* (with a precise, prefilled policy), *monitoring* (no policy needed at this time; re-assessed as traffic accumulates), or *no policy needed*. The assessment runs entirely server-side against the metadata below — nothing additional leaves the SDK.
+
+Two capture layers keep the inventory both precise and complete:
+
+- **Declared access** — when a governed call carries a tool inventory (the `tools` array on OpenAI / Anthropic / Gemini requests, or `ClaudeAgentOptions.mcp_servers` + `allowed_tools` for the Claude Agent SDK), the SDK reports it. Reports are deduplicated per process: a change in the tool bundle triggers one background round-trip; steady state is a hash comparison.
+- **Observed access** — any tool the agent *actually invokes* that was never declared is added to the inventory by the platform from the audit stream, labeled "observed on live traffic". Usage is evidence of access, so nothing an agent does stays invisible.
+
+For the Claude Agent SDK specifically, `allowed_tools` is treated as the grant boundary: CLI built-ins that load into the session but sit outside a configured `allowed_tools` list are permission-gated, not reachable, and are not declared. If the model invokes one anyway, the observed layer records it. With no `allowed_tools` configured, the full loaded toolset is declared.
+
+What ships is **metadata only**, and it obeys the same privacy contract as every other egress:
+
+- Tool **names**, **parameter names**, and a **SHA-256 schema hash** — never the full JSON schema, never parameter values.
+- Tool **descriptions** are run through the local PII engine before leaving the process, so validated PII in a description is masked on your side of the boundary.
+- MCP servers report their name and transport kind (stdio / http / sse / in-process) plus configured tool names — never commands, URLs, or credentials.
+
+---
+
 ## How governance fits your call path
 
 Each governed call is evaluated in two phases—once before the model runs and once after it returns—so policies can intervene on either side independently.
@@ -313,6 +334,7 @@ A short summary suitable for architecture reviews:
 
 - Governance evaluates prompts with respect to your organization’s policies before upstream invocation where applicable.
 - Sensitive-content handling is architected so that raw regulated values are not sent to third-party LLMs as part of policy enforcement workflows described here.
+- Access-inventory reporting ships tool metadata only (names, parameter names, schema hashes, PII-sanitized descriptions) — never full schemas, parameter values, server commands/URLs, or credentials. See "Access inventory" above and [SECURITY.md](https://github.com/EgisLabs/egisai-sdk/blob/main/SECURITY.md).
 
 <!-- LEGAL:certification-status:BEGIN -->
 <p><strong>Certification status.</strong> The platform is being built with SOC&nbsp;2, ISO&nbsp;27001, GDPR, HIPAA, and enterprise security expectations in mind. EgisAI is <strong>not currently</strong> SOC&nbsp;2, ISO&nbsp;27001, HIPAA, FedRAMP, PCI&nbsp;DSS, or other formally certified or attested unless expressly stated on the <a class="inline" href="https://docs.egisai.co/security">Security page</a> with current supporting evidence. Customers must complete their own compliance assessment before relying on the Service for regulated workloads.</p>
