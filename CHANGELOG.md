@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.38.0] — 2026-07-21
+
+### Added
+
+- **Agent access-inventory reporting** for the dashboard's new
+  per-agent **Access** tab. The SDK now derives a metadata-only
+  inventory of what each agent can reach from the tool bundle it
+  already sees on every call — tool names, PII-sanitized
+  descriptions, a SHA-256 hash of each declared input schema, and
+  parameter *names* (never schemas, never call arguments) — and
+  reports it to `POST /v1/sdk/agents/access` the first time an
+  agent's bundle hash is seen. Steady-state cost is one dict lookup
+  per call; the report runs on a daemon thread and fails open, so a
+  backend outage never touches the customer's call path. Covers
+  OpenAI (v1 + legacy), Anthropic, Google, Bedrock Converse
+  (`toolConfig`), and MCP-tagged tool definitions.
+
+---
+
 ## [0.37.0] — 2026-07-16
 
 ### Added

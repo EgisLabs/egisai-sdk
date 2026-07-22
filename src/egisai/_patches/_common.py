@@ -20,6 +20,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from egisai._access import maybe_report_access
 from egisai._auto_agent import (
     current_identity,
     resolve_identity,
@@ -488,6 +489,14 @@ def _build_input_event(
         source=source, target=target, payload=payload, model=model, stream=stream
     )
     _attribute_event(ev, payload)
+    # Access-inventory reporting for the dashboard's "Access" tab.
+    # Steady state is a dict lookup; the actual report (only when the
+    # agent's declared tool bundle changes) runs on a daemon thread
+    # and fails open. See ``egisai._access``.
+    try:
+        maybe_report_access(ev.get("agent_id"), payload)
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("access report hook failed", exc_info=True)
     ev["prompt_chars"] = len(prompt_text or "")
     ev["prompt_preview"] = _safe_text_preview(prompt_text)
     ev["_prompt_text_original"] = prompt_text
