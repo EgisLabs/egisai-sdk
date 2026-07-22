@@ -133,6 +133,39 @@ the size cap, being persisted/logged server-side, or being sent when
 `auto_describe` is disabled, that's a Critical-severity issue and we
 want to know within hours.
 
+## Access inventory (tool metadata)
+
+To power the dashboard's per-agent **Access** tab, the SDK reports
+the tools and MCP servers an agent has access to. This egress is
+**metadata only** and bounded:
+
+1. **Names, not schemas.** Tool names, parameter *names*, and a
+   SHA-256 digest of the tool's JSON schema. The full schema —
+   types, enums, defaults, examples — never leaves the process,
+   and parameter *values* are never part of this path at all.
+2. **Descriptions are sanitised before egress.** Tool descriptions
+   are run through the SDK's own PII engine
+   (`egisai.policy.pii.sanitize`) and truncated before they leave
+   the process — the same Phase-1 engine that protects governed
+   prompts.
+3. **No connection material.** MCP server entries carry the server
+   name and a transport label (`stdio` / `http` / `sse` / `sdk`)
+   only — never the command line, URL, headers, or credentials
+   from the server configuration.
+4. **Deduplicated.** A report is sent only when the declared tool
+   bundle changes (hash comparison per process), off the hot path,
+   on a background thread.
+5. **Permission-aware.** For the Claude Agent SDK, tools outside a
+   configured `allowed_tools` grant are permission-gated and are
+   NOT reported as declared access. (A gated tool the model
+   nevertheless invokes is recorded server-side from the audit
+   stream as *observed* access — usage is evidence of access.)
+
+If you find this path transmitting a full tool schema, a parameter
+value, an unsanitised description, or MCP connection material
+(command / URL / credentials), that's a Critical-severity issue and
+we want to know within hours.
+
 ## Tool / MCP enforcement guarantees
 
 `egisai` distinguishes two states on every audit row:

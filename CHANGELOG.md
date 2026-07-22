@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.41.0] — 2026-07-22
+
+### Changed
+
+- Platform release: the Access tab's governance column is now
+  assessed per capability by the access judge (policy recommended /
+  monitoring / no policy needed) instead of blanket-flagging every
+  ungoverned item, with precise one-click policy recommendations and
+  recommended-policy count badges across the dashboard. The
+  assessment runs entirely server-side against the metadata the SDK
+  already reports — no SDK behavior change, nothing additional
+  leaves the process. `README.md`'s "Access inventory" section
+  documents the new verdicts.
+
+## [0.40.1] — 2026-07-21
+
+### Added
+
+- Documented the access-inventory feature: new "Access inventory"
+  section in `README.md` and a bounded-egress contract
+  ("Access inventory (tool metadata)") in `SECURITY.md` covering the
+  metadata-only guarantee (names / parameter names / schema hash /
+  PII-sanitized descriptions; never full schemas, parameter values,
+  or MCP connection material).
+
+---
+
 ## [0.40.0] — 2026-07-21
 
 ### Changed
