@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.39.0] — 2026-07-21
+
+### Added
+
+- Access-inventory capture for the Claude Agent SDK. Tools declared
+  via `ClaudeAgentOptions` (`mcp_servers` in-process SDK servers with
+  full metadata, `allowed_tools` built-ins) and the CLI's `init`
+  system message runtime toolset now report to the dashboard's
+  per-agent Access tab. MCP-served tools ship under their runtime
+  invocation name (`mcp__<server>__<tool>`) plus a `server_name`
+  field so declared inventory joins observed usage. Previously,
+  agents governed through `claude_agent_sdk` showed an empty Access
+  tab because this framework never declares tools in the request
+  payload.
+- `server_name` on payload-extracted MCP-tagged tool items.
+- Multi-source declarations merge monotonically per agent (options +
+  init message union) so the bundle hash converges instead of
+  re-reporting every turn.
+
+---
+
 ## [0.38.0] — 2026-07-21
 
 ### Added
