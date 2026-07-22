@@ -639,3 +639,94 @@ def test_init_system_message_reports_runtime_toolset(
     _report_init_message_tools("agent-i", SystemMessage())
     _drain_threads()
     assert len(calls) == 1
+
+
+def test_init_tools_filtered_by_allowed_tools_grant(
+    monkeypatch: Any,
+) -> None:
+    """When the operator set ``allowed_tools``, the init message's
+    ungated built-ins (CronDelete, TaskStop, …) are NOT declared —
+    only the granted set is. This is the dentsu-demo shape: 4 MCP
+    tools granted, ~25 CLI built-ins loaded but permission-gated."""
+    reset_access_cache()
+    calls: list[dict[str, Any]] = []
+
+    def _capture(**kwargs: Any) -> None:
+        calls.append(kwargs)
+
+    import egisai._backend as backend
+
+    monkeypatch.setattr(backend, "report_agent_access", _capture)
+
+    from types import SimpleNamespace
+
+    from egisai._patches.claude_agent_sdk import _report_init_message_tools
+
+    options = SimpleNamespace(
+        allowed_tools=[
+            "mcp__audience__build_audience_segment",
+            "mcp__audience__estimate_media_reach",
+        ],
+    )
+
+    class SystemMessage:
+        subtype = "init"
+        data = {
+            "tools": [
+                "Bash",
+                "CronDelete",
+                "TaskStop",
+                "ToolSearch",
+                "mcp__audience__build_audience_segment",
+                "mcp__audience__estimate_media_reach",
+            ]
+        }
+
+    _report_init_message_tools("agent-g", SystemMessage(), options)
+    _drain_threads()
+    assert len(calls) == 1
+    names = {it["name"] for it in calls[0]["items"]}
+    # Only the granted MCP tools + their derived server.
+    assert names == {
+        "mcp__audience__build_audience_segment",
+        "mcp__audience__estimate_media_reach",
+        "audience",
+    }
+
+    # All-gated init list → no report at all.
+    reset_access_cache()
+    calls.clear()
+
+    class SystemMessage2:
+        subtype = "init"
+        data = {"tools": ["Bash", "TaskStop"]}
+
+    SystemMessage2.__name__ = "SystemMessage"
+    _report_init_message_tools("agent-g2", SystemMessage2(), options)
+    _drain_threads()
+    assert calls == []
+
+
+def test_allowed_tools_grant_semantics() -> None:
+    from types import SimpleNamespace
+
+    from egisai._patches.claude_agent_sdk import (
+        _allowed_tool_names,
+        _init_tool_is_granted,
+    )
+
+    # No options / empty list → no restriction (None).
+    assert _allowed_tool_names(None) is None
+    assert _allowed_tool_names(SimpleNamespace(allowed_tools=[])) is None
+
+    # Permission specifiers keep only the tool-name part.
+    allowed = _allowed_tool_names(
+        SimpleNamespace(allowed_tools=["Bash(git:*)", "mcp__audience"])
+    )
+    assert allowed == {"Bash", "mcp__audience"}
+    assert _init_tool_is_granted("Bash", allowed)
+    # Server-level allow grants every tool on that server…
+    assert _init_tool_is_granted("mcp__audience__build_audience_segment", allowed)
+    # …but not other servers or ungranted built-ins.
+    assert not _init_tool_is_granted("mcp__other__tool", allowed)
+    assert not _init_tool_is_granted("TaskStop", allowed)

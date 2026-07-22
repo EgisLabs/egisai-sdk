@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.40.0] — 2026-07-21
+
+### Changed
+
+- Claude Agent SDK access capture now treats `allowed_tools` as the
+  grant boundary: when it is set, CLI built-ins loaded into the
+  session but outside the grant (`CronDelete`, `TaskStop`, …) are no
+  longer declared on the Access tab — they are permission-gated, not
+  reachable. A gated tool the model nevertheless invokes still
+  surfaces through the backend's observed-usage capture. With no
+  `allowed_tools` configured, the full loaded toolset is declared as
+  before. `allowed_tools` permission specifiers (`Bash(git:*)`) and
+  server-level grants (`mcp__<server>`) are honoured.
+
+---
+
 ## [0.39.0] — 2026-07-21
 
 ### Added
