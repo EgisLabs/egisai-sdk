@@ -79,6 +79,12 @@ from contextlib import nullcontext
 from contextvars import copy_context
 from typing import Any
 
+from egisai._access import (
+    extract_access_items_from_agent_options,
+    extract_access_items_from_tool_names,
+    maybe_report_access_items,
+    register_sdk_mcp_server_tools,
+)
 from egisai._auto_agent import (
     IdentityRecord,
     _derive_identity_from_system,
@@ -234,6 +240,88 @@ def _options_for(self_or_first: Any, kwargs: dict[str, Any]) -> Any:
             self_or_first, "_options", None
         )
     return opts
+
+
+# ── Access-inventory capture (dashboard "Access" tab) ────────────────
+#
+# The Claude Agent SDK never declares tools in the gate payload — they
+# live in ``ClaudeAgentOptions`` (``mcp_servers`` + ``allowed_tools``)
+# and in the CLI's ``init`` system message. Both are captured here,
+# merged monotonically per agent (``merge=True``) so the bundle hash
+# converges across the two sources instead of flip-flopping. All of
+# it fails open and stays metadata-only (see ``egisai._access``).
+
+
+def _report_declared_access(agent_id: Any, options: Any) -> None:
+    """Report the options-declared inventory (MCP servers + tools)."""
+    if not agent_id or options is None:
+        return
+    try:
+        items = extract_access_items_from_agent_options(options)
+        maybe_report_access_items(str(agent_id), items, merge=True)
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("access options report failed", exc_info=True)
+
+
+def _report_init_message_tools(agent_id: Any, message: Any) -> None:
+    """Report the runtime toolset from the CLI's ``init`` system message.
+
+    The init message's ``tools`` list is the authoritative record of
+    what actually loaded into the session — including built-ins the
+    user never spelled out in ``allowed_tools`` (``ToolSearch``,
+    ``TodoWrite``, …). Name-only entries; the merge in
+    ``maybe_report_access_items`` never lets them downgrade the rich
+    options-derived entries.
+    """
+    if not agent_id:
+        return
+    try:
+        if type(message).__name__ != "SystemMessage":
+            return
+        if getattr(message, "subtype", None) != "init":
+            return
+        data = getattr(message, "data", None)
+        tools = data.get("tools") if isinstance(data, dict) else None
+        if not tools:
+            return
+        items = extract_access_items_from_tool_names(tools)
+        maybe_report_access_items(str(agent_id), items, merge=True)
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("access init-message report failed", exc_info=True)
+
+
+def _wrap_create_sdk_mcp_server(orig: Any) -> Any:
+    """Record tool metadata for in-process SDK MCP servers.
+
+    ``create_sdk_mcp_server(name=…, tools=[…])`` is the only moment
+    the tool objects (name / description / input_schema) are visible
+    — the returned config only carries an opaque ``instance``. We
+    stash the metadata in a weak registry keyed on that instance so
+    ``extract_access_items_from_agent_options`` can enumerate the
+    server's tools later. Pure observation: the return value is
+    passed through untouched.
+    """
+
+    @functools.wraps(orig)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        config = orig(*args, **kwargs)
+        try:
+            tools = kwargs.get("tools")
+            if tools is None and len(args) >= 3:
+                tools = args[2]
+            instance = (
+                config.get("instance")
+                if isinstance(config, dict)
+                else getattr(config, "instance", None)
+            )
+            if instance is not None and tools:
+                register_sdk_mcp_server_tools(instance, tools)
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("sdk mcp server registration failed", exc_info=True)
+        return config
+
+    wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]
+    return wrapped
 
 
 def _derive(self_or_first: Any, *args: Any, **kwargs: Any) -> IdentityRecord | None:
@@ -2114,6 +2202,12 @@ def _wrap_client_query(orig: Any) -> Any:
                     stream=True,
                     payload=payload,
                 )
+                # Access tab: this framework declares tools in
+                # ``options`` (never in the gate payload) — report
+                # them here where the agent identity is resolved.
+                _report_declared_access(
+                    ev.get("agent_id"), _options_for(self, kwargs)
+                )
 
                 set_policy_checked(True)
                 reset_policy_usage()
@@ -2288,6 +2382,15 @@ def _wrap_client_receive_messages(orig: Any) -> Any:
                         setattr(self, INFLIGHT_SIGNALS_ATTR, signals)
 
                     _accumulate_response_signals(message, signals)
+                    # Access tab: the CLI's ``init`` system message
+                    # carries the authoritative runtime toolset
+                    # (built-ins included) — merge it into the
+                    # agent's declared inventory. No-op for every
+                    # other message type.
+                    if ev is not None:
+                        _report_init_message_tools(
+                            ev.get("agent_id"), message
+                        )
 
                     # Emit one ``tool_call`` step per ``ToolUseBlock`` only
                     # when PreToolUse hooks are *off* (older SDK or no
@@ -2489,6 +2592,9 @@ def _wrap_module_query(orig: Any) -> Any:
                     stream=True,
                     payload=payload,
                 )
+                # Access tab: tools are declared in ``options``,
+                # never in the gate payload — report them here.
+                _report_declared_access(ev.get("agent_id"), options)
 
                 set_policy_checked(True)
                 reset_policy_usage()
@@ -2585,6 +2691,11 @@ def _wrap_module_query(orig: Any) -> Any:
                             except StopAsyncIteration:
                                 break
                             _accumulate_response_signals(message, signals)
+                            # Access tab: merge the init message's
+                            # runtime toolset (see client path).
+                            _report_init_message_tools(
+                                ev.get("agent_id"), message
+                            )
                             module_hooks_injected = (
                                 _hooks_supported() and options is not None
                             )
@@ -2700,6 +2811,20 @@ def apply() -> bool:
         if not getattr(orig_q, "__egisai_wrapped__", False):
             _sdk.query = _wrap_module_query(orig_q)
             any_patched = True
+
+    # ``create_sdk_mcp_server`` — observation-only wrap that records
+    # each in-process MCP server's tool metadata for the Access tab.
+    # Callers who ``from claude_agent_sdk import create_sdk_mcp_server``
+    # BEFORE ``egisai.init()`` keep the unwrapped original; their
+    # tools still surface through the init-message and observed-usage
+    # layers, just without descriptions/schema hashes.
+    orig_create = getattr(_sdk, "create_sdk_mcp_server", None)
+    if (
+        orig_create is not None
+        and callable(orig_create)
+        and not getattr(orig_create, "__egisai_wrapped__", False)
+    ):
+        _sdk.create_sdk_mcp_server = _wrap_create_sdk_mcp_server(orig_create)
 
     # ``ClaudeSDKClient`` — persistent client across multi-turn convos.
     client_cls = getattr(_sdk, "ClaudeSDKClient", None)
