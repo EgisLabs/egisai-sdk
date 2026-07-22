@@ -288,6 +288,37 @@ def ensure_mcp_server(
     return r.json()
 
 
+def report_agent_access(
+    *,
+    agent_id: str,
+    items: list[dict[str, Any]],
+    bundle_hash: str,
+) -> None:
+    """Ship an agent's declared access inventory. Fire-and-forget.
+
+    Backs the dashboard's per-agent "Access" tab. ``items`` is the
+    metadata-only bundle built by :func:`egisai._access.extract_access_items`
+    (tool names, PII-sanitized descriptions, schema hashes, parameter
+    names — never schemas or arguments). ``bundle_hash`` lets the
+    backend skip a no-op sync cheaply. Older backends 404 this route;
+    the caller treats any non-2xx as "reporting unavailable" and
+    fails open.
+    """
+    r = _retry_on_429(
+        "report_agent_access",
+        lambda: get_client().post(
+            "/v1/sdk/agents/access",
+            json={
+                "agent_id": agent_id,
+                "bundle_hash": bundle_hash,
+                "items": items,
+            },
+        ),
+    )
+    if r.status_code not in (200, 201):
+        raise _http_error(op="report_agent_access", status=r.status_code)
+
+
 def post_events(events: list[dict[str, Any]]) -> None:
     if not events:
         return
