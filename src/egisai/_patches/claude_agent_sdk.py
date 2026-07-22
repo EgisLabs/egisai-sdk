@@ -84,6 +84,7 @@ from egisai._access import (
     extract_access_items_from_tool_names,
     maybe_report_access_items,
     register_sdk_mcp_server_tools,
+    split_mcp_tool_name,
 )
 from egisai._auto_agent import (
     IdentityRecord,
@@ -263,15 +264,61 @@ def _report_declared_access(agent_id: Any, options: Any) -> None:
         LOGGER.debug("access options report failed", exc_info=True)
 
 
-def _report_init_message_tools(agent_id: Any, message: Any) -> None:
+def _allowed_tool_names(options: Any) -> set[str] | None:
+    """The operator's ``allowed_tools`` grant set, or ``None``.
+
+    ``None`` means *no restriction configured* — every tool the CLI
+    loads is genuinely reachable. Entries may carry permission
+    specifiers (``Bash(git:*)``); only the tool-name part is kept.
+    """
+    if options is None:
+        return None
+    raw = getattr(options, "allowed_tools", None) or (
+        options.get("allowed_tools") if isinstance(options, dict) else None
+    )
+    if not raw:
+        return None
+    out: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, str) or not entry:
+            continue
+        name = entry.split("(", 1)[0].strip()
+        if name:
+            out.add(name)
+    return out or None
+
+
+def _init_tool_is_granted(name: str, allowed: set[str]) -> bool:
+    """Is this init-message tool inside the ``allowed_tools`` grant?"""
+    if name in allowed:
+        return True
+    split = split_mcp_tool_name(name)
+    # Server-level allow (``mcp__<server>``) grants every tool on it.
+    return split is not None and f"mcp__{split[0]}" in allowed
+
+
+def _report_init_message_tools(
+    agent_id: Any, message: Any, options: Any = None
+) -> None:
     """Report the runtime toolset from the CLI's ``init`` system message.
 
-    The init message's ``tools`` list is the authoritative record of
-    what actually loaded into the session — including built-ins the
-    user never spelled out in ``allowed_tools`` (``ToolSearch``,
-    ``TodoWrite``, …). Name-only entries; the merge in
-    ``maybe_report_access_items`` never lets them downgrade the rich
-    options-derived entries.
+    The init message's ``tools`` list is what the CLI *loaded* into
+    the session — but loaded is not reachable: when the operator set
+    ``allowed_tools``, everything outside that grant is
+    permission-gated, and listing it as a live capability would
+    overstate the agent's access (20+ platform built-ins drowning the
+    real tools). So:
+
+    * ``allowed_tools`` set → only granted tools are declared here.
+      A gated built-in the model nevertheless manages to invoke still
+      surfaces through the backend's Layer-2 observed capture — usage
+      is evidence of access, declarations are not.
+    * no ``allowed_tools`` → everything the CLI loaded is reachable
+      and everything is declared (that includes built-ins the user
+      never spelled out, like ``ToolSearch``).
+
+    Name-only entries; the merge in ``maybe_report_access_items``
+    never lets them downgrade the rich options-derived entries.
     """
     if not agent_id:
         return
@@ -284,6 +331,15 @@ def _report_init_message_tools(agent_id: Any, message: Any) -> None:
         tools = data.get("tools") if isinstance(data, dict) else None
         if not tools:
             return
+        allowed = _allowed_tool_names(options)
+        if allowed is not None:
+            tools = [
+                t
+                for t in tools
+                if isinstance(t, str) and _init_tool_is_granted(t, allowed)
+            ]
+            if not tools:
+                return
         items = extract_access_items_from_tool_names(tools)
         maybe_report_access_items(str(agent_id), items, merge=True)
     except Exception:  # noqa: BLE001
@@ -2383,13 +2439,15 @@ def _wrap_client_receive_messages(orig: Any) -> Any:
 
                     _accumulate_response_signals(message, signals)
                     # Access tab: the CLI's ``init`` system message
-                    # carries the authoritative runtime toolset
-                    # (built-ins included) — merge it into the
+                    # carries the runtime toolset — merge the
+                    # ``allowed_tools``-granted subset into the
                     # agent's declared inventory. No-op for every
                     # other message type.
                     if ev is not None:
                         _report_init_message_tools(
-                            ev.get("agent_id"), message
+                            ev.get("agent_id"),
+                            message,
+                            _options_for(self, {}),
                         )
 
                     # Emit one ``tool_call`` step per ``ToolUseBlock`` only
@@ -2692,9 +2750,10 @@ def _wrap_module_query(orig: Any) -> Any:
                                 break
                             _accumulate_response_signals(message, signals)
                             # Access tab: merge the init message's
-                            # runtime toolset (see client path).
+                            # granted runtime toolset (see client
+                            # path for the allowed_tools semantics).
                             _report_init_message_tools(
-                                ev.get("agent_id"), message
+                                ev.get("agent_id"), message, options
                             )
                             module_hooks_injected = (
                                 _hooks_supported() and options is not None
