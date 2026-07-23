@@ -697,6 +697,55 @@ def test_tool_call_step_stamped_enforced_when_hook_active(
     assert step["tool_name"] == "run_shell"
 
 
+def test_hook_tool_step_books_no_execution_latency(
+    fake_claude_with_hooks: tuple[Any, type, types.ModuleType],
+) -> None:
+    """PreToolUse ``tool_call`` rows MUST stamp ``latency_ms=0``.
+
+    The hook fires BEFORE the tool executes (blocked tools never
+    execute at all), so there is no execution wall clock to book.
+    Pre-0.41.1 the row stamped hook-entry→now — i.e. the policy
+    evaluation time that ``policy_latency_ms`` already carries — so
+    blocked tools showed phantom execution latency and the run's
+    latency total double-counted governance time.
+    """
+    fake_backend, client_cls, mod = fake_claude_with_hooks
+    _load_rules(_deny_tool_rule(r"^run_shell$"))
+    mod.__script__ = [
+        AssistantMessage(
+            [
+                ToolUseBlock("read_file", {"path": "a.txt"}, id_="tu_L1"),
+                ToolUseBlock("run_shell", {"cmd": "rm"}, id_="tu_L2"),
+            ]
+        ),
+        ResultMessage(),
+    ]
+
+    async def run() -> None:
+        opts = _ClaudeAgentOptions()
+        async with client_cls(options=opts) as client:
+            await client.query("Do it.")
+            try:
+                async for _ in client.receive_response():
+                    pass
+            except PermissionError:
+                pass
+
+    asyncio.run(run())
+    _flush()
+
+    tool_steps = _step_events(fake_backend.events_received, kind="tool_call")
+    assert len(tool_steps) == 2
+    for step in tool_steps:
+        assert step["latency_ms"] == 0, (
+            f"tool_call step for {step.get('tool_name')} must not book "
+            f"execution latency (got {step['latency_ms']} ms); policy "
+            "time belongs on policy_latency_ms"
+        )
+        assert isinstance(step.get("policy_latency_ms"), int)
+        assert step["policy_latency_ms"] >= 0
+
+
 def test_tool_call_step_carries_input_under_prompt_preview_key(
     fake_claude_with_hooks: tuple[Any, type, types.ModuleType],
 ) -> None:

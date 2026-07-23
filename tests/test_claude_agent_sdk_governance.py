@@ -368,6 +368,24 @@ def test_input_policy_block_raises_and_emits_event(
     # received the prompt — the block fired pre-forward.
     # ``client._sent`` is internal but a useful invariant to pin.
 
+    # The model was never called, so no model latency may appear
+    # anywhere — neither on the step row nor on the run.end totals.
+    # Regression for 0.41.1: the run.step emitter used to clobber the
+    # stamped 0 with gate wall clock, and run.end shipped the run's
+    # whole wall clock (pure policy time here), so blocked requests
+    # showed phantom "Model" latency on the dashboard.
+    assert ev["latency_ms"] == 0
+    run_ends = [
+        e
+        for e in fake_backend.events_received
+        if e.get("kind") == "run.end"
+    ]
+    assert run_ends, "an input-side block still closes the Run"
+    assert run_ends[-1]["latency_ms"] == 0, (
+        "run.end.latency_ms must be the sum of step model latencies "
+        f"(0 for a blocked run), got {run_ends[-1]['latency_ms']}"
+    )
+
 
 def test_input_policy_sanitize_mutates_forwarded_prompt(
     fake_claude: tuple[Any, type, types.ModuleType],

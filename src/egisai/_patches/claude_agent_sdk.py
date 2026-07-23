@@ -691,9 +691,14 @@ def _build_pretooluse_callback(
                     "policy_latency_ms": elapsed_policy_ms,
                     "policy_tokens_in": max(0, cur_pol_in - prev_pol_in),
                     "policy_tokens_out": max(0, cur_pol_out - prev_pol_out),
-                    "latency_ms": int(
-                        max(0, (time.monotonic() - started) * 1000)
-                    ),
+                    # PreToolUse fires BEFORE the tool executes, so no
+                    # tool wall-clock exists to book here. Pre-0.41.1
+                    # this stamped hook-entry→now — i.e. the policy
+                    # evaluation time again, which ``policy_latency_ms``
+                    # above already carries — so blocked tools showed
+                    # phantom execution latency and run totals
+                    # double-counted governance time.
+                    "latency_ms": 0,
                 }
                 if hook_init_ms > 0:
                     ev["init_latency_ms"] = hook_init_ms
@@ -1087,9 +1092,14 @@ def _build_posttooluse_callback(
                     "policy_latency_ms": elapsed_policy_ms,
                     "policy_tokens_in": max(0, cur_pol_in - prev_pol_in),
                     "policy_tokens_out": max(0, cur_pol_out - prev_pol_out),
-                    "latency_ms": int(
-                        max(0, (time.monotonic() - started) * 1000)
-                    ),
+                    # The tool executed inside the CLI subprocess —
+                    # its wall clock is invisible to this hook. What
+                    # hook-entry→now measures is OUR policy evaluation,
+                    # which ``policy_latency_ms`` above already books;
+                    # stamping it here too (as pre-0.41.1 code did)
+                    # double-counted governance time as execution
+                    # latency on the row and in the run totals.
+                    "latency_ms": 0,
                     "response_decision": _decision_block(decision),
                 }
                 if hook_init_ms > 0:

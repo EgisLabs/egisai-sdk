@@ -180,6 +180,126 @@ def test_aggregates_sum_across_steps() -> None:
     assert end_ev["step_count"] == 4
 
 
+def test_run_end_latency_is_sum_of_step_latencies() -> None:
+    """``run.end.latency_ms`` = SUM of per-step model latencies.
+
+    Regression — pre-0.41.1 the run.end event shipped the run's whole
+    wall clock (open→close), which the backend trusted over its own
+    step sums. Since the wall clock includes policy-evaluation time,
+    a run blocked at the input policy showed nonzero "Model" latency
+    on the dashboard for a model that was never called.
+    """
+    _run.open_run(framework="test", identity=_make_record())
+    for _ in range(4):
+        _run.append_step(
+            event={
+                "model": "gpt-4o",
+                "verdict": "allow",
+                "latency_ms": 100,
+            },
+            kind="model_call",
+        )
+    _run.close_run()
+
+    events = _drain_queue()
+    step_events = [e for e in events if e.get("kind") == "run.step"]
+    assert [e["latency_ms"] for e in step_events] == [100, 100, 100, 100]
+    assert events[-1]["latency_ms"] == 400
+
+
+def test_step_latency_prestamped_zero_survives_emission() -> None:
+    """A patch-stamped ``latency_ms`` (here the explicit 0 of an
+    input-side block) MUST survive the run.step emission untouched.
+
+    Regression — pre-0.41.1 ``_safe_emit_run_step`` recomputed
+    ``latency_ms`` from the step's timestamps, which span the whole
+    gate (input policy + model + output policy). For blocked calls
+    that stamped 0 (the model was never contacted) the recomputation
+    replaced the 0 with the policy-evaluation wall clock, so the
+    dashboard showed phantom "model latency" on blocked requests.
+    """
+    import time
+
+    _run.open_run(framework="test", identity=_make_record())
+    # ``started_at`` far in the past simulates a slow policy phase
+    # (e.g. a semantic_guard judge round-trip) before the block.
+    _run.append_step(
+        event={
+            "model": "gpt-4o",
+            "verdict": "block",
+            "latency_ms": 0,
+            "policy_latency_ms": 5000,
+        },
+        kind="model_call",
+        started_at=time.monotonic() - 5.0,
+    )
+    _run.close_run(error="input policy block")
+
+    events = _drain_queue()
+    step_ev = next(e for e in events if e.get("kind") == "run.step")
+    assert step_ev["latency_ms"] == 0, (
+        "blocked step stamped latency_ms=0; emission must not clobber "
+        f"it with gate wall clock (got {step_ev['latency_ms']})"
+    )
+    end_ev = events[-1]
+    assert end_ev["kind"] == "run.end"
+    assert end_ev["latency_ms"] == 0, (
+        "run.end must sum step latencies (0), not ship the run's "
+        f"wall clock (got {end_ev['latency_ms']})"
+    )
+
+
+def test_step_latency_falls_back_to_timestamps_when_unstamped() -> None:
+    """Events that never stamped ``latency_ms`` keep the legacy
+    behavior: latency derives from the step's own timestamps."""
+    import time
+
+    _run.open_run(framework="test", identity=_make_record())
+    _run.append_step(
+        event={"model": "gpt-4o", "verdict": "allow"},
+        kind="model_call",
+        started_at=time.monotonic() - 0.25,
+    )
+    _run.close_run()
+
+    events = _drain_queue()
+    step_ev = next(e for e in events if e.get("kind") == "run.step")
+    # ~250 ms span; generous bounds for CI jitter.
+    assert 200 <= step_ev["latency_ms"] < 5000
+    assert events[-1]["latency_ms"] == step_ev["latency_ms"]
+
+
+def test_finalize_in_place_respects_stamped_latency() -> None:
+    """The claude_agent_sdk path: placeholder seq 0 ``model_call`` is
+    finalized in place with the terminal event — the stamped
+    ``latency_ms`` (model turn only) wins over the placeholder's
+    timestamp span."""
+    import time
+
+    _run.open_run(framework="test", identity=_make_record())
+    _run.append_initial_model_call_step(
+        event={"model": "claude-3-5-sonnet", "verdict": "allow"},
+        started_at=time.monotonic() - 5.0,
+    )
+    _run.finalize_or_append_model_call_step(
+        event={
+            "model": "claude-3-5-sonnet",
+            "verdict": "allow",
+            "latency_ms": 123,
+            "tokens_in": 10,
+            "tokens_out": 20,
+        },
+    )
+    _run.close_run()
+
+    events = _drain_queue()
+    step_events = [e for e in events if e.get("kind") == "run.step"]
+    # Placeholder emission + in-place finalization, same seq.
+    assert {e["seq"] for e in step_events} == {0}
+    assert step_events[-1]["latency_ms"] == 123
+    assert events[-1]["latency_ms"] == 123
+
+
 def test_worst_verdict_propagates() -> None:
     """A single ``block`` step makes the run's verdict ``block``."""
     _run.open_run(framework="test", identity=_make_record())

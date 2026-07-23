@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.41.1] — 2026-07-23
+
+### Fixed
+
+- Blocked requests no longer show phantom model latency. The
+  `run.step` emitter used to recompute `latency_ms` from the step's
+  timestamps — which span the whole gate (input policy + model +
+  output policy) — clobbering the patch-stamped value. Input-side
+  blocks that stamped an explicit `0` (the provider was never
+  contacted) therefore surfaced the policy-evaluation wall clock as
+  "Model" latency on the dashboard, and allowed calls carried
+  governance time double-counted into their model latency. The
+  stamped value now wins; the timestamp fallback only applies to
+  events that never stamped one.
+- `run.end` now ships `latency_ms` as the SUM of per-step model/tool
+  latencies instead of the run's whole wall clock (open→close),
+  matching the contract the backend's step reconciliation and the
+  dashboard's "Model" latency row already assume. Run wall clock
+  remains derivable from the run's `started_at` / `ended_at`.
+- Claude Agent SDK `PreToolUse` / `PostToolUse` hook rows stamp
+  `latency_ms=0` instead of the hook's own policy-evaluation time,
+  which `policy_latency_ms` already carries — tool rows no longer
+  double-book governance time as execution latency.
+
 ## [0.41.0] — 2026-07-22
 
 ### Changed

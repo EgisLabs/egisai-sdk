@@ -73,6 +73,18 @@ class RunStep:
     kind: StepKind
     started_at: float            # ``time.monotonic()`` at step entry
     ended_at: float | None = None
+    # Model/tool execution wall-clock for this step, in ms. Sourced
+    # from the event's own ``latency_ms`` when the patch stamped one
+    # (patches measure the forward() call only, and stamp an explicit
+    # ``0`` for input-side blocks where the model was never called).
+    # Falls back to ``ended_at - started_at`` for events that never
+    # stamped a value. NEVER recomputed from the step timestamps when
+    # the event carries a value — the timestamps span the whole gate
+    # (input policy + model + output policy), so recomputing would
+    # double-book governance time that ``policy_latency_ms`` already
+    # accounts for, and would show phantom "model latency" on blocked
+    # calls that never reached the provider.
+    latency_ms: int = 0
     tokens_in: int = 0
     tokens_out: int = 0
     policy_tokens_in: int = 0
@@ -261,6 +273,9 @@ def _make_run_step(
         kind=kind,
         started_at=started_at,
         ended_at=ended_at,
+        latency_ms=_step_latency_ms(
+            event, started_at=started_at, ended_at=ended_at,
+        ),
         tokens_in=int(event.get("tokens_in") or 0),
         tokens_out=int(event.get("tokens_out") or 0),
         policy_tokens_in=int(event.get("policy_tokens_in") or 0),
@@ -273,6 +288,32 @@ def _make_run_step(
         event=_stamp_step_event(ctx, event, seq=seq, kind=kind),
     )
     return step
+
+
+def _step_latency_ms(
+    event: dict[str, Any],
+    *,
+    started_at: float,
+    ended_at: float | None,
+) -> int:
+    """Resolve a step's model/tool latency from its audit event.
+
+    The event's own ``latency_ms`` is authoritative when present:
+    patches stamp it from the ``forward()`` call alone (and stamp
+    an explicit ``0`` when an input-side block means the provider
+    was never contacted). Only when the event carries no value do
+    we fall back to the step's own timestamps — that fallback spans
+    the whole gate (policy + model), which is the best available
+    signal for legacy callers that never stamped a latency.
+    """
+    raw = event.get("latency_ms")
+    if raw is not None:
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            pass
+    end = ended_at if ended_at is not None else time.monotonic()
+    return max(0, int((end - started_at) * 1000))
 
 
 def _run_worst_verdict_from_steps(ctx: RunContext) -> str:
@@ -385,6 +426,9 @@ def finalize_or_append_model_call_step(
             end = ended_at if ended_at is not None else time.monotonic()
             step.started_at = sta
             step.ended_at = end
+            step.latency_ms = _step_latency_ms(
+                event, started_at=sta, ended_at=end,
+            )
             step.tokens_in = int(event.get("tokens_in") or 0)
             step.tokens_out = int(event.get("tokens_out") or 0)
             step.policy_tokens_in = int(event.get("policy_tokens_in") or 0)
@@ -486,11 +530,16 @@ def _build_run_end_event(ctx: RunContext) -> dict[str, Any]:
     policy_tokens_in = sum(s.policy_tokens_in for s in ctx.steps)
     policy_tokens_out = sum(s.policy_tokens_out for s in ctx.steps)
     cost_usd = sum(s.cost_usd for s in ctx.steps)
-    latency_ms = (
-        int(((ctx.ended_at or time.monotonic()) - ctx.started_at) * 1000)
-        if ctx.started_at
-        else 0
-    )
+    # Run latency = SUM of per-step model/tool latencies — the same
+    # contract the backend's step-reconciliation path and the
+    # dashboard's "Model" latency row assume. Pre-0.41.1 this shipped
+    # the run's whole wall clock (open→close), which the backend then
+    # trusted over its own step sums; for a run blocked at the input
+    # policy that wall clock is pure governance time, so the dashboard
+    # showed nonzero "Model" latency for a model that was never
+    # called. Wall clock is still derivable server-side from the
+    # run's ``started_at`` / ``ended_at`` timestamps.
+    latency_ms = sum(s.latency_ms for s in ctx.steps)
     # Primary model = most frequent model across model_call steps.
     model_counts: dict[str, int] = {}
     for s in ctx.steps:
@@ -573,9 +622,15 @@ def _safe_emit_run_step(ctx: RunContext, step: RunStep) -> None:
         ev["seq"] = step.seq
         ev["parent_run_id"] = ctx.parent_run_id
         ev["framework"] = ctx.framework
-        ev["latency_ms"] = int(
-            ((step.ended_at or time.monotonic()) - step.started_at) * 1000
-        )
+        # ``step.latency_ms`` already honours the patch-stamped value
+        # (model-call time only; explicit 0 for input-side blocks) and
+        # only falls back to the step timestamps when no value was
+        # stamped. Recomputing from timestamps here — as pre-0.41.1
+        # code did — clobbered the patch's number with the whole gate's
+        # wall clock, so blocked calls that never reached the provider
+        # showed the policy-evaluation time as "model latency" on the
+        # dashboard.
+        ev["latency_ms"] = step.latency_ms
         enqueue(ev)
     except Exception:  # noqa: BLE001
         LOGGER.debug("run.step emit failed", exc_info=True)
