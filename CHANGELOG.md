@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.43.0] — 2026-07-24
+
+### Added
+
+- **Smart Model Routing for `ClaudeSDKClient` sessions — per turn.**
+  Persistent Claude Agent SDK sessions now get a fresh routing
+  decision on every `query()` turn. The CLI subprocess boots at
+  `connect()` with its model frozen, so the wrapper pins the routed
+  model on the *live* session via the SDK's `set_model` control
+  request right before the turn's prompt goes over stdio — and
+  restores the configured model on a later turn when the engine stops
+  routing. Same-provider only (the CLI speaks Anthropic), fully
+  fail-open (`set_model` missing on older SDKs, raising, or the
+  decision service being unreachable all leave the session on the
+  model it was already running), and fully audited: the turn's row
+  carries the requested→served pair and every tool step attributes to
+  the model actually serving the session.
+- **Smart Model Routing for `google.genai`.** Gemini calls
+  (`generate_content` / `generate_content_stream`, sync and async)
+  now participate in same-provider routing — a swap rewrites the
+  model on your own configured client, so auth, base URL, and retries
+  are untouched. Cross-provider stays off for Gemini payloads until a
+  faithful translation exists.
+
+---
+
 ## [0.42.0] — 2026-07-23
 
 ### Added
