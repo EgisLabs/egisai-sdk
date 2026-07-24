@@ -209,11 +209,13 @@ def test_openai_agents_async_run_is_awaitable(
     assert result == "ok"
 
 
-def test_openai_agents_two_agents_distinct_identity_hash(
+def test_openai_agents_identity_v2_name_anchor(
     fake_backend: Any, cleanup_modules: list[str]
 ) -> None:
-    """Two agents with the same name but different instructions get
-    different identity_hashes."""
+    """Identity v2 anchor-dominance: the declared ``name`` IS the
+    identity. Editing a named agent's instructions (prompt
+    optimization) keeps the SAME identity_hash — a revision, not a
+    fork. Distinct names stay distinct agents."""
     _init_sdk(fake_backend)
     mod = _make_fake_module("agents")
     cleanup_modules.append("agents")
@@ -241,8 +243,12 @@ def test_openai_agents_two_agents_distinct_identity_hash(
     openai_agents.apply()
     Runner.run_sync(_Agent("Triage", "version A"))
     Runner.run_sync(_Agent("Triage", "version B"))
-    assert len(hashes) == 2
-    assert hashes[0] != hashes[1]
+    Runner.run_sync(_Agent("Billing", "version A"))
+    assert len(hashes) == 3
+    # Same name, edited instructions → same agent (prompt revision).
+    assert hashes[0] == hashes[1]
+    # Different name → different agent.
+    assert hashes[2] != hashes[0]
 
 
 # ── claude_agent_sdk ───────────────────────────────────────────────

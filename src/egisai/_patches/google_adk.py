@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from egisai._auto_agent import IdentityRecord
+from egisai._auto_agent import IdentityRecord, canonicalize_identity_text
 from egisai._patches import has_module
 from egisai._patches._framework import make_identity, patch_method
 
@@ -22,7 +22,8 @@ def _derive(self_or_runner: Any, *args: Any, **kwargs: Any) -> IdentityRecord | 
     agent = getattr(self_or_runner, "agent", None) or kwargs.get("agent")
     if agent is None:
         return None
-    name = str(getattr(agent, "name", "") or "ADK Agent")
+    explicit_name = str(getattr(agent, "name", "") or "")
+    name = explicit_name or "ADK Agent"
     instruction = str(getattr(agent, "instruction", "") or "")
     tools = getattr(agent, "tools", []) or []
     tool_names: list[str] = []
@@ -32,10 +33,25 @@ def _derive(self_or_runner: Any, *args: Any, **kwargs: Any) -> IdentityRecord | 
         )
         if isinstance(tn, str):
             tool_names.append(tn)
+    # Identity v2 — anchor-dominant: ADK's explicit ``name`` is the
+    # identity; instruction/tool edits are revisions of the same
+    # agent. Nameless agents key on the canonical instruction +
+    # tools. The v1 bundle ships as the legacy hash.
+    if explicit_name:
+        bundle: tuple = ("adk", explicit_name)
+    else:
+        bundle = (
+            "adk",
+            canonicalize_identity_text(instruction),
+            tuple(sorted(tool_names)),
+        )
     return make_identity(
         source=FRAMEWORK_SOURCE,
         display_name=name,
-        bundle=("adk", name, instruction, tuple(sorted(tool_names))),
+        bundle=bundle,
+        legacy_bundle=("adk", name, instruction, tuple(sorted(tool_names))),
+        prompt_text=instruction or None,
+        tool_names=tool_names,
     )
 
 

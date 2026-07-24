@@ -185,6 +185,11 @@ def ensure_agent(
     identity_hash: str | None = None,
     identity_source: str | None = None,
     system_prompt_excerpt: str | None = None,
+    identity_version: str | None = None,
+    identity_hash_legacy: str | None = None,
+    identity_simhash: str | None = None,
+    tool_bundle_hash: str | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Find-or-create an agent in the caller's org by name. Idempotent.
 
@@ -208,6 +213,21 @@ def ensure_agent(
     description + business function in the background; it is never
     persisted or logged server-side. Omitted when ``auto_describe`` is
     off or the agent has no system prompt. Older backends ignore it.
+
+    Identity v2 fields (added in 0.44.0; older backends ignore them):
+
+    * ``identity_version`` — hash-recipe version ("2") so the backend
+      knows how ``identity_hash`` was computed.
+    * ``identity_hash_legacy`` — the v1 hash for the same identity;
+      lets the backend re-stamp a pre-v2 agent row in place instead
+      of forking a duplicate on SDK upgrade.
+    * ``identity_simhash`` — 16-hex 64-bit SimHash of the canonical
+      prompt (non-reversible; privacy contract unchanged).
+    * ``tool_bundle_hash`` — SHA-256 of the sorted tool-name set;
+      corroborates prompt-evolution reconciliation server-side.
+    * ``model`` — the model id observed on the registering call.
+      Observed *metadata* only (models_seen histogram) — never part
+      of any identity hash.
     """
     payload: dict[str, Any] = {"name": name}
     if description:
@@ -220,6 +240,16 @@ def ensure_agent(
         payload["identity_source"] = identity_source
     if system_prompt_excerpt:
         payload["system_prompt_excerpt"] = system_prompt_excerpt
+    if identity_version:
+        payload["identity_version"] = identity_version
+    if identity_hash_legacy:
+        payload["identity_hash_legacy"] = identity_hash_legacy
+    if identity_simhash:
+        payload["identity_simhash"] = identity_simhash
+    if tool_bundle_hash:
+        payload["tool_bundle_hash"] = tool_bundle_hash
+    if model:
+        payload["model"] = model
     # DEBUG breadcrumb so a developer staring at an empty Provenance
     # card on the dashboard can confirm "yes, the SDK actually shipped
     # the fingerprint" without reaching for tcpdump. Off by default;

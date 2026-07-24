@@ -17,9 +17,8 @@ FRAMEWORK_SOURCE = "framework:smolagents"
 
 def _derive(self_or_agent: Any, *args: Any, **kwargs: Any) -> IdentityRecord | None:
     agent = self_or_agent
-    name = str(
-        getattr(agent, "name", "") or type(agent).__name__ or "smolagents Agent"
-    )
+    explicit_name = str(getattr(agent, "name", "") or "")
+    name = explicit_name or type(agent).__name__ or "smolagents Agent"
     model_id = ""
     model = getattr(agent, "model", None)
     if model is not None:
@@ -36,10 +35,21 @@ def _derive(self_or_agent: Any, *args: Any, **kwargs: Any) -> IdentityRecord | N
             if isinstance(tn, str):
                 tool_names.append(tn)
         tool_names.sort()
+    # Identity v2 — anchor-dominant: a user-set ``name`` IS the
+    # identity. Unnamed agents key on (class, tools). Either way the
+    # model id is out of the bundle — switching the planning model
+    # keeps the same agent. The v1 bundle ships as the legacy hash.
+    if explicit_name:
+        bundle: tuple = ("smolagents", explicit_name)
+    else:
+        bundle = ("smolagents", name, tuple(tool_names))
     return make_identity(
         source=FRAMEWORK_SOURCE,
         display_name=name,
-        bundle=("smolagents", name, model_id, tuple(tool_names)),
+        bundle=bundle,
+        legacy_bundle=("smolagents", name, model_id, tuple(tool_names)),
+        tool_names=tool_names,
+        model=model_id or None,
     )
 
 

@@ -23,7 +23,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from egisai._auto_agent import _derive_identity_from_system, _hash_bundle
+from egisai._auto_agent import (
+    _derive_identity_from_system,
+    _hash_bundle,
+    canonicalize_identity_text,
+)
 from egisai._evaluator import extract_anthropic_prompt
 from egisai._output_signals import extract_bedrock_converse
 from egisai._patches import has_module
@@ -81,8 +85,15 @@ def _make_call(orig: Any, model_id: str, kwargs: dict) -> Any:
     # We don't directly push it here; the gate's resolver does the
     # push when it walks the tiers. Computing the digest upfront
     # would only help if we wanted to short-circuit Tier 5 — for
-    # the Converse API, Tier 5 IS the right path.
-    bundle = ("bedrock_runtime", system_text, tuple(tools), model_id)
+    # the Converse API, Tier 5 IS the right path (and since Identity
+    # v2 it hashes the model-masked canonical prompt, so switching
+    # ``modelId`` never forks the agent). ``model_id`` is therefore
+    # deliberately NOT in this bundle any more.
+    bundle = (
+        "bedrock_runtime",
+        canonicalize_identity_text(system_text) if system_text else "",
+        tuple(tools),
+    )
     digest = _hash_bundle(bundle)
 
     if system_text:

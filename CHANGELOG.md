@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.44.0] — 2026-07-24
+
+### Changed
+
+- **Agent Identity v2 — model-invariant identity.** An agent's
+  identity is now its *role* (declared name, persona, tools) —
+  never the model engine it happens to run on. Switching models
+  (your own choice or Smart Model Routing) no longer forks a new
+  agent on the dashboard:
+  - Framework identity bundles no longer include the model id
+    (Claude Agent SDK — which also drops `permission_mode` —
+    Bedrock Converse, PydanticAI, smolagents).
+  - Prompt-hash identities (Tier 5 and the gateway) hash a
+    *canonical* form of the system prompt with model-name tokens
+    masked, so a tool prompt that embeds the model ("powered by
+    GPT-5", à la Cursor) keeps one identity across model switches.
+  - The models an agent actually runs on are now recorded as
+    observed metadata (`models_seen` histogram) instead.
+- **Anchor-dominant identity for named framework agents.** A
+  framework-declared name (OpenAI Agents `name`, CrewAI `role`,
+  AutoGen / ADK / Agno / Strands / smolagents / LangGraph names)
+  is now the whole identity. Editing a named agent's instructions,
+  goal, backstory, or tool set is a *revision* of the same agent —
+  recorded in the backend's `prompt_versions` trail — not a fork.
+  Two deployments that reuse one name intentionally coalesce;
+  give agents distinct names when you want distinct dashboard rows.
+- **No fork on upgrade.** Every changed recipe ships the exact v1
+  hash alongside the v2 hash (`identity_hash_legacy`); the backend
+  re-stamps existing agent rows in place on first contact, and
+  older SDK processes still resolve to the same row during a
+  mixed-version rollout.
+
+### Added
+
+- **Prompt-evolution reconciliation.** Anonymous (prompt-hash)
+  identities whose prompt is *incrementally* edited now reconcile
+  to the existing agent instead of forking: the SDK ships a
+  non-reversible 64-bit SimHash of the canonical prompt plus a
+  tool-bundle hash, and the backend merges only when org, identity
+  source, and tool bundle all agree and the SimHash Hamming
+  distance is ≤ 14/64. Heavy rewrites intentionally do not
+  auto-merge — use the new explicit restamp API.
+- **Explicit identity restamp API** —
+  `POST /v1/agents/{agent_id}/identity/restamp` moves an agent
+  onto a new identity hash after an intentional prompt overhaul
+  (e.g. platform-driven prompt optimization), preserving the row,
+  its history, and an audited `prompt_versions` entry.
+- `egisai.derive_prompt_identity`, `canonicalize_identity_text`,
+  `simhash64_hex`, and `tool_bundle_hash_from_names` are available
+  for advanced callers that need to compute v2 identities
+  themselves.
+
+---
+
 ## [0.43.0] — 2026-07-24
 
 ### Added
