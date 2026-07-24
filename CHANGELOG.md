@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.42.0] — 2026-07-23
+
+### Added
+
+- **Smart Model Routing.** When the org's plan carries the
+  `smart_model_routing` entitlement and the Model Center master
+  switch is on, every governed call asks the platform for a best-fit
+  model decision: route *down* to a cheaper model when the request
+  doesn't need flagship intelligence, route *up* when it exceeds the
+  requested model's tier, or keep the requested model. Same-provider
+  swaps rewrite the pending call in place; cross-provider swaps
+  (OpenAI ⇄ Anthropic ⇄ Google, non-streaming tool-free chat only)
+  execute directly against the target provider when the process holds
+  its API key. Decisions are cached in-process, invalidated live by
+  the `routing.changed` SSE event, and the audit event carries the
+  requested→served pair so the dashboard can show the exact swap and
+  its signed cost delta. `claude_agent_sdk` sessions route once per
+  `query()` (same-provider only) before the subprocess boots.
+- Fully fail-open by design: no entitlement, no decision, a `/route`
+  timeout, or a failed routed call all leave the request on the model
+  it asked for — a routed call that errors is retried on the
+  requested model automatically.
+- Privacy: the decision service only ever receives the
+  post-sanitization, label-redacted audit preview — raw prompt text
+  never rides on `/v1/sdk/route`.
+
 ## [0.41.1] — 2026-07-23
 
 ### Fixed

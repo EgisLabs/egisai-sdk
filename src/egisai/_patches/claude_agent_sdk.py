@@ -2698,6 +2698,52 @@ def _wrap_module_query(orig: Any) -> Any:
                         )
                         prompt = payload["input"]
 
+                    # Smart Model Routing — session-scoped. Decide once
+                    # from the (redacted) prompt preview and rewrite
+                    # ``options.model`` BEFORE the Node subprocess
+                    # boots; every turn of this session then runs on
+                    # the routed model. claude_agent_sdk is
+                    # Anthropic-only, so decisions are same-provider
+                    # by construction (``allow_cross=False``). Fully
+                    # fail-open; the decision round-trip is parked on
+                    # a worker thread to keep the loop free.
+                    if options is not None:
+                        try:
+                            from egisai import _routing as _routing_mod
+
+                            _route = await asyncio.to_thread(
+                                lambda: _routing_mod.maybe_route(
+                                    model=model,
+                                    prompt_preview=ev.get("prompt_preview")
+                                    or "",
+                                    prompt_chars=int(
+                                        ev.get("prompt_chars") or 0
+                                    ),
+                                    has_tools=False,
+                                    agent_id=ev.get("agent_id"),
+                                    allow_cross=False,
+                                )
+                            )
+                        except Exception:  # noqa: BLE001
+                            _route = None
+                        if _route and _route.get("provider") == "anthropic":
+                            try:
+                                options.model = str(_route["model"])
+                                ev["requested_model"] = model
+                                ev["requested_provider"] = "anthropic"
+                                ev["routing_applied"] = True
+                                ev["routing_direction"] = _route.get(
+                                    "direction"
+                                )
+                                ev["routing_reason"] = _route.get("reason")
+                                model = options.model
+                                ev["model"] = model
+                            except Exception:  # noqa: BLE001
+                                LOGGER.debug(
+                                    "session routing rewrite failed",
+                                    exc_info=True,
+                                )
+
                     # Open Run for the module-level query() — the
                     # Run spans the iterator's lifetime and closes
                     # when the result arrives (or the generator is

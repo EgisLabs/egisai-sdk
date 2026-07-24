@@ -86,6 +86,98 @@ def _stub_message(decision: PolicyDecision, trace_id: str, model: str):
     )
 
 
+# ── Smart Model Routing ──────────────────────────────────────────────
+
+
+def _message_from_canonical(result: dict[str, Any]) -> Any:
+    """Wrap a canonical cross-provider result into a Message shape.
+
+    Used when the routing engine served an Anthropic-originated call
+    on a different provider. Mirrors :func:`_stub_message`'s field
+    surface (every documented ``Message`` / ``Usage`` attribute
+    present) so frameworks reading the response never hit an
+    ``AttributeError``; carries real content + token usage plus an
+    additive ``egis.routing`` marker.
+    """
+    import uuid as _uuid
+    from types import SimpleNamespace
+
+    text = str(result.get("text") or "")
+    served_model = str(result.get("model") or "")
+    return SimpleNamespace(
+        id=f"egis-routed-{_uuid.uuid4().hex[:12]}",
+        type="message",
+        role="assistant",
+        model=served_model,
+        content=[SimpleNamespace(type="text", text=text)],
+        stop_reason="end_turn",
+        stop_sequence=None,
+        container=None,
+        usage=SimpleNamespace(
+            input_tokens=int(result.get("tokens_in") or 0),
+            output_tokens=int(result.get("tokens_out") or 0),
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+            server_tool_use=None,
+            service_tier=None,
+        ),
+        egis={"routing": {"applied": True, "served_model": served_model}},
+    )
+
+
+def _routing_adapter_messages(kwargs: dict[str, Any]) -> Any:
+    """Routing adapter for ``messages.create`` — see the openai twin.
+
+    Same-provider swaps rewrite ``kwargs["model"]`` (the forward
+    lambda reads kwargs at call time). Cross-provider swaps translate
+    the Anthropic ``messages`` + ``system`` payload to the canonical
+    form, execute against the target provider directly, and come back
+    ``Message``-shaped. The gate restricts cross swaps to plain-text,
+    non-streaming, tool-free calls; ``canonicalize_anthropic_messages``
+    additionally bails on any content block it can't represent
+    faithfully.
+    """
+    try:
+        from egisai._routing import (
+            RoutingAdapter,
+            canonicalize_anthropic_messages,
+            execute_cross_call,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+    def _apply(new_model: str) -> bool:
+        kwargs["model"] = new_model
+        return True
+
+    def _cross(decision: dict[str, Any]):  # noqa: ANN202
+        messages = canonicalize_anthropic_messages(
+            kwargs.get("messages"), kwargs.get("system")
+        )
+        if messages is None:
+            return None
+        params = {
+            "temperature": kwargs.get("temperature"),
+            "max_tokens": kwargs.get("max_tokens"),
+        }
+
+        def _forward() -> Any:
+            return _message_from_canonical(
+                execute_cross_call(
+                    provider=str(decision.get("provider") or ""),
+                    model=str(decision.get("model") or ""),
+                    messages=messages,
+                    params=params,
+                )
+            )
+
+        return _forward
+
+    return RoutingAdapter(
+        apply_same_provider=_apply, build_cross_forward=_cross
+    )
+
+
 def _wrap_messages_create(orig: Callable[..., Any], is_async: bool) -> Callable[..., Any]:
     target = "anthropic.messages.create"
 
@@ -117,6 +209,7 @@ def _wrap_messages_create(orig: Callable[..., Any], is_async: bool) -> Callable[
                 # from the agentic-subprocess case where execution
                 # happened ahead of observation).
                 emit_tool_call_steps=True,
+                routing_adapter=_routing_adapter_messages(kwargs),
                 forward=lambda: orig(self, *args, **kwargs),
             )
 
@@ -139,6 +232,7 @@ def _wrap_messages_create(orig: Callable[..., Any], is_async: bool) -> Callable[
             extract_usage=_extract_message_usage,
             extract_output_signals=extract_anthropic,
             emit_tool_call_steps=True,
+            routing_adapter=_routing_adapter_messages(kwargs),
             forward=lambda: orig(self, *args, **kwargs),
         )
 

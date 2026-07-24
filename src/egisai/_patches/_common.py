@@ -758,6 +758,156 @@ def _stamp_output_block(
     ev["enforcement_status"] = enforcement_status
 
 
+# ── Smart Model Routing (gate integration) ──────────────────────────
+
+
+def _prepare_route(
+    *,
+    ev: dict[str, Any],
+    model: str,
+    stream: bool,
+    payload: Any,
+    routing_adapter: Any,
+) -> dict[str, Any] | None:
+    """Decide + apply a routing swap for this call. Never raises.
+
+    Runs AFTER the input phase (so the preview shipped to the decision
+    service is the post-sanitization, label-redacted audit preview)
+    and BEFORE the forward. Returns a small state dict when a swap was
+    actually applied, else ``None``:
+
+    * ``decision`` — the platform's routing decision.
+    * ``cross_forward`` — non-None when the swap crosses providers;
+      the gate runs it instead of ``forward()``.
+    * ``revert`` — undoes a same-provider ``kwargs`` rewrite so the
+      fail-open retry can re-run on the requested model.
+    """
+    if routing_adapter is None:
+        return None
+    try:
+        from egisai import _routing
+
+        has_tools = bool(payload.get("tools")) if isinstance(payload, dict) else False
+        # Cross-provider swaps require a faithful payload translation;
+        # streams and tool-carrying calls stay same-provider.
+        allow_cross = (
+            routing_adapter.supports_cross and not stream and not has_tools
+        )
+        decision = _routing.maybe_route(
+            model=model,
+            prompt_preview=ev.get("prompt_preview") or "",
+            prompt_chars=int(ev.get("prompt_chars") or 0),
+            has_tools=has_tools,
+            agent_id=ev.get("agent_id"),
+            allow_cross=allow_cross,
+        )
+        if not decision:
+            return None
+
+        state: dict[str, Any] = {
+            "decision": decision,
+            "requested_model": model,
+            "requested_provider": _routing.provider_for_model(model),
+            "cross_forward": None,
+            "revert": None,
+            "applied": False,
+        }
+        if decision.get("provider") == state["requested_provider"]:
+            if routing_adapter.apply_same_provider(str(decision["model"])):
+                state["applied"] = True
+                state["revert"] = (
+                    lambda: routing_adapter.apply_same_provider(model)
+                )
+        elif allow_cross and routing_adapter.build_cross_forward is not None:
+            cross = routing_adapter.build_cross_forward(decision)
+            if cross is not None:
+                state["applied"] = True
+                state["cross_forward"] = cross
+        return state if state["applied"] else None
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("routing prepare failed — keeping requested model", exc_info=True)
+        return None
+
+
+def _routed_forward_sync(
+    state: dict[str, Any], forward: Callable[[], Any]
+) -> Any:
+    """Run the routed call; fall back to the requested model on failure.
+
+    Fail-open contract: a routing swap must never make a call fail
+    that would otherwise have succeeded. Any ``Exception`` from the
+    routed attempt reverts the swap and re-runs the original forward —
+    exactly what would have happened with routing off. Non-Exception
+    ``BaseException``s (KeyboardInterrupt, …) propagate untouched.
+    """
+    cross = state["cross_forward"]
+    try:
+        if cross is not None:
+            return cross()
+        return forward()
+    except Exception:  # noqa: BLE001
+        LOGGER.warning(
+            "routed call on %s failed — retrying on the requested model %s",
+            state["decision"].get("model"),
+            state["requested_model"],
+        )
+        _unroute(state)
+        return forward()
+
+
+async def _routed_forward_async(
+    state: dict[str, Any], forward: Callable[[], Any]
+) -> Any:
+    """Async sibling of :func:`_routed_forward_sync`.
+
+    The cross-provider executor is synchronous httpx; parking it on a
+    worker thread keeps the caller's event loop free (same rationale
+    as the judge round-trips above).
+    """
+    cross = state["cross_forward"]
+    try:
+        if cross is not None:
+            return await asyncio.to_thread(cross)
+        return await forward()
+    except Exception:  # noqa: BLE001
+        LOGGER.warning(
+            "routed call on %s failed — retrying on the requested model %s",
+            state["decision"].get("model"),
+            state["requested_model"],
+        )
+        _unroute(state)
+        return await forward()
+
+
+def _unroute(state: dict[str, Any]) -> None:
+    """Revert an applied swap so the retry runs on the requested model."""
+    state["applied"] = False
+    revert = state.get("revert")
+    if revert is not None:
+        try:
+            revert()
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("routing revert failed", exc_info=True)
+
+
+def _stamp_route(ev: dict[str, Any], state: dict[str, Any]) -> None:
+    """Record the applied swap on the audit event.
+
+    ``ev["model"]`` flips to the SERVED model (cost math, per-model
+    rollups, and provider attribution all read it); the requested side
+    lands on the additive routing fields. The signed cost delta is
+    computed at ingest from real token usage — the SDK never claims a
+    savings figure the backend can't verify.
+    """
+    decision = state["decision"]
+    ev["model"] = decision.get("model")
+    ev["requested_model"] = state["requested_model"]
+    ev["requested_provider"] = state["requested_provider"]
+    ev["routing_applied"] = True
+    ev["routing_direction"] = decision.get("direction")
+    ev["routing_reason"] = decision.get("reason")
+
+
 def _resolve_and_scope_identity(payload: Any) -> Any:
     """Resolve the agent identity and (if non-stack) push it.
 
@@ -799,6 +949,7 @@ def gate_call(
     extract_usage: ExtractUsage | None = None,
     extract_output_signals: ExtractOutputSignals | None = None,
     emit_tool_call_steps: bool = False,
+    routing_adapter: Any = None,
     forward: Callable[[], Any],
 ) -> Any:
     """Run the gate around a single synchronous model call.
@@ -852,6 +1003,7 @@ def gate_call(
                 extract_usage=extract_usage,
                 extract_output_signals=extract_output_signals,
                 emit_tool_call_steps=emit_tool_call_steps,
+                routing_adapter=routing_adapter,
                 forward=forward,
             )
     finally:
@@ -871,6 +1023,7 @@ def _gate_call_inner(
     extract_output_signals: ExtractOutputSignals | None,
     emit_tool_call_steps: bool,
     forward: Callable[[], Any],
+    routing_adapter: Any = None,
 ) -> Any:
     """Body of ``gate_call`` after identity has been resolved + pushed.
 
@@ -913,15 +1066,33 @@ def _gate_call_inner(
         if decision.verdict == "sanitize":
             _apply_sanitization(decision=decision, payload=payload, ev=ev)
 
+        # Smart Model Routing — after sanitization (the decision
+        # service only ever sees the redacted preview), before the
+        # forward. Fully fail-open; see ``_prepare_route``.
+        route_state = _prepare_route(
+            ev=ev,
+            model=model,
+            stream=stream,
+            payload=payload,
+            routing_adapter=routing_adapter,
+        )
+
         model_started = time.monotonic()
         try:
-            response = forward()
+            if route_state is not None:
+                response = _routed_forward_sync(route_state, forward)
+            else:
+                response = forward()
         except BaseException:
             ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
             ev["error"] = "call failed"
             _dispatch_step(ev, started_at=step_started, kind="model_call")
             raise
         ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
+        served_model = model
+        if route_state is not None and route_state["applied"]:
+            _stamp_route(ev, route_state)
+            served_model = str(route_state["decision"].get("model") or model)
         _stamp_usage(ev, response, extract_usage)
 
         output_decision = _run_output_phase(
@@ -929,7 +1100,7 @@ def _gate_call_inner(
             payload=payload,
             source=source,
             target=target,
-            model=model,
+            model=served_model,
             stream=stream,
             extract_output_signals=extract_output_signals,
             ev=ev,
@@ -939,7 +1110,7 @@ def _gate_call_inner(
             return _block_response(
                 decision=output_decision,
                 ev=ev,
-                model=model,
+                model=served_model,
                 stub_factory=stub_factory,
                 step_started=step_started,
             )
@@ -968,7 +1139,7 @@ def _gate_call_inner(
                 payload=payload,
                 source=source,
                 target=target,
-                model=model,
+                model=served_model,
                 stream=stream,
                 extract_output_signals=extract_output_signals,
                 ev_template=ev,
@@ -993,6 +1164,7 @@ async def async_gate_call(
     extract_usage: ExtractUsage | None = None,
     extract_output_signals: ExtractOutputSignals | None = None,
     emit_tool_call_steps: bool = False,
+    routing_adapter: Any = None,
     forward: Callable[[], Any],
 ) -> Any:
     """Async sibling of ``gate_call`` — same semantics, awaits ``forward()``."""
@@ -1019,6 +1191,7 @@ async def async_gate_call(
                 extract_usage=extract_usage,
                 extract_output_signals=extract_output_signals,
                 emit_tool_call_steps=emit_tool_call_steps,
+                routing_adapter=routing_adapter,
                 forward=forward,
             )
     finally:
@@ -1038,6 +1211,7 @@ async def _async_gate_call_inner(
     extract_output_signals: ExtractOutputSignals | None,
     emit_tool_call_steps: bool,
     forward: Callable[[], Any],
+    routing_adapter: Any = None,
 ) -> Any:
     """Body of ``async_gate_call`` after identity has been resolved + pushed."""
     ev = _build_input_event(
@@ -1093,15 +1267,37 @@ async def _async_gate_call_inner(
         if decision.verdict == "sanitize":
             _apply_sanitization(decision=decision, payload=payload, ev=ev)
 
+        # Smart Model Routing — see the sync sibling. The decision
+        # round-trip is a blocking httpx call, so it's parked on a
+        # worker thread to keep the event loop free (same posture as
+        # the judge calls above).
+        route_state: dict[str, Any] | None = None
+        if routing_adapter is not None:
+            route_state = await asyncio.to_thread(
+                _prepare_route,
+                ev=ev,
+                model=model,
+                stream=stream,
+                payload=payload,
+                routing_adapter=routing_adapter,
+            )
+
         model_started = time.monotonic()
         try:
-            response = await forward()
+            if route_state is not None:
+                response = await _routed_forward_async(route_state, forward)
+            else:
+                response = await forward()
         except BaseException:
             ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
             ev["error"] = "call failed"
             _dispatch_step(ev, started_at=step_started, kind="model_call")
             raise
         ev["latency_ms"] = int((time.monotonic() - model_started) * 1000)
+        served_model = model
+        if route_state is not None and route_state["applied"]:
+            _stamp_route(ev, route_state)
+            served_model = str(route_state["decision"].get("model") or model)
         _stamp_usage(ev, response, extract_usage)
 
         # Same to_thread wrap as the input phase — output-side
@@ -1113,7 +1309,7 @@ async def _async_gate_call_inner(
             payload=payload,
             source=source,
             target=target,
-            model=model,
+            model=served_model,
             stream=stream,
             extract_output_signals=extract_output_signals,
             ev=ev,
@@ -1123,7 +1319,7 @@ async def _async_gate_call_inner(
             return _block_response(
                 decision=output_decision,
                 ev=ev,
-                model=model,
+                model=served_model,
                 stub_factory=stub_factory,
                 step_started=step_started,
             )
@@ -1141,7 +1337,7 @@ async def _async_gate_call_inner(
                 payload=payload,
                 source=source,
                 target=target,
-                model=model,
+                model=served_model,
                 stream=stream,
                 extract_output_signals=extract_output_signals,
                 ev_template=ev,

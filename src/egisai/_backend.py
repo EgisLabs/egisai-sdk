@@ -319,6 +319,44 @@ def report_agent_access(
         raise _http_error(op="report_agent_access", status=r.status_code)
 
 
+def route(
+    *,
+    model: str,
+    prompt_preview: str,
+    prompt_chars: int,
+    has_tools: bool,
+    available_providers: list[str],
+    agent_id: str | None,
+    timeout_s: float = 3.0,
+) -> dict[str, Any] | None:
+    """Ask the platform for a Smart Model Routing decision. Never raises.
+
+    Hot-path call — no 429 retry loop (a rate-limited decision is just
+    skipped), short explicit timeout, and every failure mode returns
+    ``None`` so the caller keeps the requested model (fail-open).
+    ``prompt_preview`` MUST be the post-sanitization, label-redacted
+    audit preview — never raw text.
+    """
+    payload: dict[str, Any] = {
+        "model": model,
+        "prompt_preview": prompt_preview,
+        "prompt_chars": prompt_chars,
+        "has_tools": has_tools,
+        "available_providers": available_providers,
+    }
+    if agent_id:
+        payload["agent_id"] = agent_id
+    try:
+        r = get_client().post("/v1/sdk/route", json=payload, timeout=timeout_s)
+        if r.status_code != 200:
+            return None
+        body = r.json()
+        return body if isinstance(body, dict) else None
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("route decision request failed", exc_info=True)
+        return None
+
+
 def post_events(events: list[dict[str, Any]]) -> None:
     if not events:
         return

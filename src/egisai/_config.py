@@ -65,6 +65,13 @@ class EgisaiConfig:
     # never registers anything, and never emits events. This keeps
     # the add-on a true no-op for everyone who isn't entitled.
     mcp_servers_enabled: bool = False
+    # Smart Model Routing. Set from the handshake response's
+    # ``features.smart_model_routing`` flag — TRUE only when the org's
+    # plan carries the entitlement AND the Model Center master switch
+    # is on. When FALSE the routing client stays fully dormant (zero
+    # ``/v1/sdk/route`` calls). Live flips are picked up via the
+    # ``routing.changed`` SSE event without a process restart.
+    smart_routing_enabled: bool = False
     # Gateway mode (``init(gateway=True)`` / ``EGISAI_GATEWAY=1``).
     # When enabled, OpenAI chat-completions calls are rerouted through
     # the platform's inline Gateway (``<base_url>/v1``) with the
@@ -118,6 +125,7 @@ def update_config(**fields: object) -> EgisaiConfig:
         "auto_stack_hints": _CONFIG.auto_stack_hints,
         "auto_describe": _CONFIG.auto_describe,
         "mcp_servers_enabled": _CONFIG.mcp_servers_enabled,
+        "smart_routing_enabled": _CONFIG.smart_routing_enabled,
         "gateway_mode": _CONFIG.gateway_mode,
     }
     base.update(fields)
