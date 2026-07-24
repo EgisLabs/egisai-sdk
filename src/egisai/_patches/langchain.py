@@ -42,6 +42,7 @@ from typing import Any
 from egisai._auto_agent import (
     IdentityRecord,
     _derive_identity_from_system,
+    canonicalize_identity_text,
 )
 from egisai._patches import has_module
 from egisai._patches._framework import make_identity, patch_method
@@ -77,14 +78,30 @@ def _derive(self_or_executor: Any, *args: Any, **kwargs: Any) -> IdentityRecord 
         if isinstance(tn, str):
             tool_names.append(tn)
     tool_names.sort()
+    explicit_name = name
     if not name and prompt:
         _, name = _derive_identity_from_system(prompt)
     if not name:
         name = "LangChain Agent"
+    # Identity v2 — anchor-dominant: an explicit executor ``name`` is
+    # the identity; otherwise key on the model-masked canonical
+    # prompt + tools so a model mention inside the template can't
+    # fork the agent. The v1 bundle ships as the legacy hash.
+    if explicit_name:
+        bundle: tuple = ("langchain", explicit_name)
+    else:
+        bundle = (
+            "langchain",
+            canonicalize_identity_text(prompt),
+            tuple(tool_names),
+        )
     return make_identity(
         source=FRAMEWORK_SOURCE,
         display_name=name,
-        bundle=("langchain", prompt, tuple(tool_names)),
+        bundle=bundle,
+        legacy_bundle=("langchain", prompt, tuple(tool_names)),
+        prompt_text=prompt or None,
+        tool_names=tool_names,
     )
 
 

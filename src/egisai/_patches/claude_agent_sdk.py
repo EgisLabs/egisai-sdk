@@ -52,9 +52,12 @@ A few subtleties that are *not* obvious:
    stream rather than preventing the call. This is the strongest
    guarantee Python can give from outside the subprocess; pre-
    execution gating would require us to fork the MCP transport.
-2. Identity resolution is Tier-2B (hash bundle of system_prompt
-   + allowed_tools + permission_mode + model + mcp_server_names).
-   This is unchanged from 0.17.5.
+2. Identity resolution is Tier-2B (hash bundle of the model-masked
+   canonical system_prompt + allowed_tools + mcp_server_names).
+   Identity v2 (0.44.0): ``model`` and ``permission_mode`` are no
+   longer part of the bundle — switching models (user choice or
+   Smart Model Routing) keeps the same agent. The pre-v2 bundle
+   hash ships as ``identity_hash_legacy`` for in-place migration.
 3. The inflight event is held on the *client instance*; concurrent
    ``ClaudeSDKClient``s in the same task each carry their own
    handle. Multi-turn (``await client.query(t1); async for …;
@@ -89,6 +92,7 @@ from egisai._access import (
 from egisai._auto_agent import (
     IdentityRecord,
     _derive_identity_from_system,
+    canonicalize_identity_text,
     identity_scope,
 )
 from egisai._config import get_config
@@ -185,10 +189,32 @@ SESSION_ROUTED_MODEL_ATTR = "__egisai_session_routed_model__"
 # ── Identity helpers (unchanged shape from 0.17.5) ──────────────────
 
 
-def _bundle_from_options(options: Any) -> tuple[str, str, tuple[Any, ...]]:
-    """Extract ``(display_name, system_prompt, bundle_tuple)`` from options."""
+def _bundle_from_options(
+    options: Any,
+) -> tuple[str, str, tuple[Any, ...], tuple[Any, ...], list[str], str]:
+    """Extract identity material from ``ClaudeAgentOptions``.
+
+    Returns ``(display_name, system_prompt, bundle, legacy_bundle,
+    tool_names, model)``.
+
+    Identity v2: the bundle is the agent's *role* — the model-masked
+    canonical prompt + tools + MCP servers. ``model`` and
+    ``permission_mode`` are deliberately NOT in the bundle any more:
+    switching the model (user choice or Smart Model Routing) or
+    toggling a permission mode is a configuration change on the SAME
+    agent, not a new agent. The v1 bundle (which did include both) is
+    returned as ``legacy_bundle`` so the backend re-stamps existing
+    agents in place instead of forking on SDK upgrade.
+    """
     if options is None:
-        return ("Claude Agent", "", ("claude_agent_sdk",))
+        return (
+            "Claude Agent",
+            "",
+            ("claude_agent_sdk",),
+            ("claude_agent_sdk",),
+            [],
+            "",
+        )
     sp_raw = getattr(options, "system_prompt", None) or (
         options.get("system_prompt") if isinstance(options, dict) else None
     )
@@ -232,13 +258,21 @@ def _bundle_from_options(options: Any) -> tuple[str, str, tuple[Any, ...]]:
         display_name = "Claude Agent"
     bundle = (
         "claude_agent_sdk",
+        canonicalize_identity_text(system_prompt) if system_prompt else "",
+        tuple(tool_names),
+        tuple(mcp_names),
+    )
+    # Exact pre-v2 shape — hashed into ``identity_hash_legacy`` so
+    # the backend maps existing rows onto the new hash in place.
+    legacy_bundle = (
+        "claude_agent_sdk",
         system_prompt,
         tuple(tool_names),
         permission_mode,
         model,
         tuple(mcp_names),
     )
-    return display_name, system_prompt, bundle
+    return display_name, system_prompt, bundle, legacy_bundle, tool_names, model
 
 
 def _options_for(self_or_first: Any, kwargs: dict[str, Any]) -> Any:
@@ -393,12 +427,18 @@ def _derive(self_or_first: Any, *args: Any, **kwargs: Any) -> IdentityRecord | N
     opts = _options_for(self_or_first, kwargs)
     if opts is None:
         return None
-    display_name, system_prompt, bundle = _bundle_from_options(opts)
+    display_name, system_prompt, bundle, legacy_bundle, tool_names, model = (
+        _bundle_from_options(opts)
+    )
     return make_identity(
         source=FRAMEWORK_SOURCE,
         display_name=display_name,
         bundle=bundle,
         system_excerpt=system_prompt or None,
+        legacy_bundle=legacy_bundle,
+        prompt_text=system_prompt or None,
+        tool_names=tool_names,
+        model=model or None,
     )
 
 

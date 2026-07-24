@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from egisai._auto_agent import IdentityRecord
+from egisai._auto_agent import IdentityRecord, canonicalize_identity_text
 from egisai._patches import has_module
 from egisai._patches._framework import make_identity, patch_method
 
@@ -17,7 +17,8 @@ FRAMEWORK_SOURCE = "framework:strands"
 
 def _derive(self_or_agent: Any, *args: Any, **kwargs: Any) -> IdentityRecord | None:
     agent = self_or_agent
-    name = str(getattr(agent, "name", "") or "Strands Agent")
+    explicit_name = str(getattr(agent, "name", "") or "")
+    name = explicit_name or "Strands Agent"
     system_prompt = str(getattr(agent, "system_prompt", "") or "")
     tools = getattr(agent, "tools", []) or []
     tool_names: list[str] = []
@@ -28,10 +29,27 @@ def _derive(self_or_agent: Any, *args: Any, **kwargs: Any) -> IdentityRecord | N
         )
         if isinstance(tn, str):
             tool_names.append(tn)
+    # Identity v2 — anchor-dominant: an explicit ``name`` is the
+    # identity; prompt/tool edits on a named agent are revisions.
+    # Nameless agents key on the canonical prompt + tools. The v1
+    # bundle ships as the legacy hash for in-place migration.
+    if explicit_name:
+        bundle: tuple = ("strands", explicit_name)
+    else:
+        bundle = (
+            "strands",
+            canonicalize_identity_text(system_prompt),
+            tuple(sorted(tool_names)),
+        )
     return make_identity(
         source=FRAMEWORK_SOURCE,
         display_name=name,
-        bundle=("strands", name, system_prompt, tuple(sorted(tool_names))),
+        bundle=bundle,
+        legacy_bundle=(
+            "strands", name, system_prompt, tuple(sorted(tool_names)),
+        ),
+        prompt_text=system_prompt or None,
+        tool_names=tool_names,
     )
 
 

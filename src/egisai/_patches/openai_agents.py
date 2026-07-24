@@ -8,10 +8,15 @@ let the existing ``_patches/openai.py`` patch govern the per-LLM
 call (it sees ``current_identity()`` via the resolver and skips
 re-deriving from the system prompt).
 
-Tier 2A — explicit ``agent.name``. We hash ``(name, instructions,
-sorted_tools)`` so two distinct agents that happen to share a name
-inside the same org still get distinct dashboard rows (the user
-named both "Triage" but configured them differently).
+Tier 2A — explicit ``agent.name``. Identity v2 (anchor-dominant):
+the declared name IS the identity — ``("openai_agents", name)`` is
+the whole bundle. Editing a named agent's instructions or tool set
+is a *revision* of the same agent (the backend records a
+prompt-version event), never a fork. Two deployments that reuse one
+name intentionally coalesce; operators who want them separate give
+them distinct names — a name is a declaration of identity. Nameless
+agents fall back to a content bundle (canonical instructions +
+tools).
 
 Import-guarded: if ``agents`` isn't installed, ``apply()`` returns
 ``False`` and the SDK runs without it. Fail-open everywhere.
@@ -91,10 +96,32 @@ def _derive(self_or_runner: Any, *args: Any, **kwargs: Any) -> IdentityRecord | 
     name, instructions, tools = _agent_fields(agent)
     if not name and not instructions:
         return None
+    # Identity v2 — anchor-dominant: the explicit ``agent.name`` IS
+    # the identity. Editing instructions (prompt optimization) or
+    # adding a tool to a named agent is a revision of the SAME agent,
+    # recorded server-side as a prompt-version event — not a fork.
+    # Nameless agents key on the model-masked canonical instructions
+    # + tools. The v1 bundle ships as the legacy hash so existing
+    # rows re-stamp in place.
+    from egisai._auto_agent import canonicalize_identity_text
+
+    if name:
+        bundle: tuple = ("openai_agents", name)
+    else:
+        bundle = (
+            "openai_agents",
+            canonicalize_identity_text(instructions),
+            tuple(sorted(tools)),
+        )
     return make_identity(
         source=FRAMEWORK_SOURCE,
         display_name=name or "openai-agents-agent",
-        bundle=("openai_agents", name, instructions, tuple(sorted(tools))),
+        bundle=bundle,
+        legacy_bundle=(
+            "openai_agents", name, instructions, tuple(sorted(tools)),
+        ),
+        prompt_text=instructions or None,
+        tool_names=tools,
     )
 
 

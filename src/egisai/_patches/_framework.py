@@ -202,15 +202,22 @@ def make_identity(
     display_name: str,
     bundle: tuple[Any, ...],
     system_excerpt: str | None = None,
+    legacy_bundle: tuple[Any, ...] | None = None,
+    prompt_text: str | None = None,
+    tool_names: list[str] | None = None,
+    model: str | None = None,
 ) -> IdentityRecord | None:
     """Build an IdentityRecord from a framework patch's bundle.
 
     ``source`` is a controlled-vocabulary token from
     ``egisai._auto_agent.IdentitySource`` (e.g.
     ``"framework:openai_agents"``). ``bundle`` is the tuple of values
-    we hash to produce the ``identity_hash`` — typically
-    ``(framework_name, agent_name)`` for Tier 2A or
-    ``(framework_name, system_prompt, sorted_tools, model)`` for 2B.
+    we hash to produce the ``identity_hash`` — ``(framework_name,
+    agent_name)`` when the framework carries an explicit name anchor,
+    or ``(framework_name, canonical_prompt, sorted_tools)`` for
+    content-derived identities. Identity v2 invariant: the bundle
+    NEVER contains a model id — model is observed metadata, not
+    identity (see ``canonicalize_identity_text``).
 
     ``system_excerpt`` (optional) is the agent's raw system prompt /
     instructions, when the framework exposes one. It's forwarded to
@@ -218,21 +225,53 @@ def make_identity(
     the platform can auto-generate a description + business function.
     Patches without a system prompt simply omit it.
 
+    Identity v2 continuity fields:
+
+    * ``legacy_bundle`` — the exact pre-v2 bundle for this framework,
+      hashed and shipped as ``identity_hash_legacy`` so agents
+      registered by older SDKs re-stamp in place instead of forking.
+    * ``prompt_text`` — the raw prompt; only its canonical SimHash
+      leaves the process (prompt-evolution reconciliation).
+    * ``tool_names`` — hashed into ``tool_bundle_hash`` (the
+      reconciliation corroborator).
+    * ``model`` — observed metadata for the models_seen histogram.
+
     Returns ``None`` when the backend can't be reached so the caller
     falls through to the next tier (the gate's resolver re-tries).
     The fail-open semantics mirror the rest of the SDK.
     """
+    from egisai._auto_agent import (
+        canonicalize_identity_text,
+        simhash64_hex,
+        tool_bundle_hash_from_names,
+    )
+
     name = (display_name or "").strip() or "agent"
     if len(name) > 80:
         name = name[:77].rstrip() + "…"
     digest = _hash_bundle(bundle)
     identity_key = f"{source}:{digest}"
+    legacy_digest: str | None = None
+    if legacy_bundle is not None:
+        legacy_digest = _hash_bundle(legacy_bundle)
+        if legacy_digest == digest:
+            legacy_digest = None
+    simhash: str | None = None
+    if prompt_text:
+        try:
+            simhash = simhash64_hex(canonicalize_identity_text(prompt_text))
+        except Exception:  # noqa: BLE001
+            simhash = None
     agent_id = _ensure_agent_id(
         display_name=name,
         identity_key=identity_key,
         identity_hash=digest,
         source=source,
         system_excerpt=system_excerpt,
+        legacy_identity_hash=legacy_digest,
+        simhash=simhash,
+        tool_bundle_hash=tool_bundle_hash_from_names(tool_names or []),
+        model=(model or None),
     )
     if agent_id is None:
         return None

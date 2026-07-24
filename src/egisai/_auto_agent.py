@@ -379,6 +379,217 @@ def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", text)).strip()
 
 
+# ── Identity v2: model-invariant canonicalization ───────────────────
+#
+# An agent's identity is its *role* (persona + tools), never the model
+# engine it happens to run on today. Two churn sources broke that in
+# v1:
+#
+#   1. Framework patches hashed ``model`` into their identity bundles,
+#      so switching Claude → GPT forked the agent.
+#   2. Tool platforms (Cursor, n8n, …) embed the model name in the
+#      system-prompt *text* ("powered by GPT-5"), so a model switch
+#      changed the prompt bytes and forked the Tier-5 hash.
+#
+# ``canonicalize_identity_text`` fixes #2 by masking model-id tokens
+# to a fixed ``<model>`` placeholder BEFORE hashing. #1 is fixed in
+# the patches themselves (model is no longer part of any v2 bundle).
+#
+# The v2 hash recipe is versioned (``IDENTITY_ALGO_VERSION``) and the
+# SDK ships the v1 hash alongside it (``identity_hash_legacy``) so the
+# backend can migrate existing agents in place — no fork on upgrade,
+# and the same continuity rail covers any future recipe change.
+
+IDENTITY_ALGO_VERSION = "2"
+
+_MODEL_MASK = "<model>"
+
+# Families that are unambiguous model names even as bare words. A
+# bare "claude" / "gpt" in prose is essentially always model chrome
+# ("You are Claude, an AI assistant"), never operator-authored agent
+# identity. ``o[1-9]`` is safe because it carries its own digit.
+# Order matters inside the alternation: longer tokens first so
+# "chatgpt" isn't half-eaten by "gpt" and "codellama" by "llama".
+_MODEL_STRONG_FAMILIES = (
+    "chatgpt|gpt|claude|gemini|gemma|codellama|llama|mixtral|ministral"
+    "|mistral|codestral|deepseek|grok|qwen|kimi|davinci|dall-?e"
+    "|command-r|o[1-9]"
+)
+# Families that are also common English words ("write a sonnet",
+# "phi coefficient"). Masked ONLY when followed by a version-shaped
+# tail containing a digit ("Sonnet 4.5", "opus-4", "nova 2") so we
+# never mangle ordinary prose.
+_MODEL_WEAK_FAMILIES = "sonnet|opus|haiku|palm|bard|command|titan|jamba|phi|nova|turbo"
+
+# Provider-prefixed ids (Bedrock model ids, OpenRouter-style paths):
+# "anthropic.claude-3-haiku-20240307-v1:0", "openai/gpt-4o",
+# "us.meta.llama3-1-70b-instruct-v1:0".
+_MODEL_PROVIDER_PREFIX = (
+    r"(?:(?:us|eu|apac|global)\.)?"
+    r"(?:anthropic|openai|google|meta|amazon|mistralai|cohere|ai21|xai|deepseek)"
+    r"[./:][\w:-]*\w(?:\.[\w:-]*\w)*"
+)
+
+# Version-ish tail shared by strong families: digits directly attached
+# ("qwen2.5", "llama3") and/or hyphen/dot-joined components
+# ("gpt-4o-mini", "claude-3-5-sonnet-20241022"). Components can never
+# end in a bare "." so a sentence period after "GPT-5." survives the
+# mask exactly like the one after "Claude." does — otherwise the two
+# prompts would canonicalize differently and defeat the whole point.
+_MODEL_STRONG_TAIL = r"(?:\d\w*(?:\.\w+)*)?(?:[-.]\w+)*"
+# Weak families need at least one digit-led component ("sonnet 4.5",
+# "opus-4", "titan 2"), optionally followed by more components.
+_MODEL_WEAK_TAIL = r"(?:[ .-]v?\d\w*(?:\.\w+)*)+(?:[-.]\w+)*"
+
+_MODEL_TOKEN_RE = re.compile(
+    r"(?<![\w.-])"
+    r"(?:"
+    + _MODEL_PROVIDER_PREFIX
+    + r"|(?:" + _MODEL_STRONG_FAMILIES + r")" + _MODEL_STRONG_TAIL
+    + r"|(?:" + _MODEL_WEAK_FAMILIES + r")" + _MODEL_WEAK_TAIL
+    + r")"
+    r"(?![\w-])",
+    re.IGNORECASE,
+)
+
+# Adjacent masked tokens ("Claude Sonnet 4.5" → "<model> <model>")
+# collapse to one so multi-word and single-word model mentions
+# canonicalize identically.
+_MODEL_MASK_RUN_RE = re.compile(
+    r"<model>(?:[\s,/|:.-]*<model>)+"
+)
+
+
+def canonicalize_identity_text(text: str) -> str:
+    """Return the model-invariant canonical form of identity text.
+
+    NFKC-normalizes, collapses whitespace, and masks every model-id
+    token to ``<model>``. Deterministic and pure — the SAME function
+    runs in the SDK's Tier-5 resolver, the framework patches, and the
+    backend gateway (which imports it from this module), so a prompt
+    hashes identically no matter which door the traffic entered.
+
+    Known, accepted edges (all deterministic):
+
+    * Over-masking merges two prompts only when they differ *solely*
+      in a model-ish token — which is exactly the "same agent,
+      different engine" case we want to merge.
+    * Bare weak-family words ("write a sonnet") are never masked; a
+      weak family is only masked with a digit-led version tail.
+    """
+    normalized = _normalize_text(text)
+    masked = _MODEL_TOKEN_RE.sub(_MODEL_MASK, normalized)
+    masked = _MODEL_MASK_RUN_RE.sub(_MODEL_MASK, masked)
+    return re.sub(r"\s+", " ", masked).strip()
+
+
+# ── Identity v2: SimHash (prompt-evolution reconciliation) ──────────
+#
+# A 64-bit locality-sensitive fingerprint of the canonical prompt.
+# Similar prompts land within a small Hamming distance; unrelated
+# prompts land ~32 bits apart. The backend uses it — gated on same
+# org + same identity_source + same tool bundle — to recognise "same
+# agent, edited prompt" instead of forking a new agent when a prompt
+# is intentionally revised (operator edit or platform-driven prompt
+# optimization).
+#
+# Privacy: the simhash is a 16-hex digest of 3-token shingle votes.
+# Like the SHA-256 identity hash it is non-reversible — no prompt
+# text can be reconstructed from it — so shipping it preserves the
+# "only digests cross the boundary" contract.
+
+# 2-token shingles: an edited word only flips two shingles, so
+# incremental prompt revisions stay within a small Hamming distance
+# while unrelated prompts still land ~32 bits apart (binomial mean
+# for independent 64-bit hashes). 3-token shingles were measurably
+# too edit-sensitive: a 3-word tweak in a 30-word prompt already
+# drifted past any safe threshold.
+_SIMHASH_SHINGLE = 2
+# Below this many word tokens a simhash is statistically useless —
+# with so few shingles, two UNRELATED short prompts were measured at
+# Hamming distance ~20, well inside any threshold that catches real
+# edits. Short prompts therefore ship no simhash and never
+# participate in prompt-evolution reconciliation (their exact hash
+# stays the sole identity, which is cheap and safe).
+_SIMHASH_MIN_TOKENS = 8
+
+
+def simhash64_hex(text: str) -> str | None:
+    """64-bit SimHash over 2-token shingles, as 16 lowercase hex chars.
+
+    Returns ``None`` for texts shorter than ``_SIMHASH_MIN_TOKENS``
+    word tokens — a hashable-but-meaningless value would only invite
+    bad merges (see the constant's comment for the measurement).
+    """
+    tokens = re.findall(r"\w+", text.lower())
+    if len(tokens) < _SIMHASH_MIN_TOKENS:
+        return None
+    shingles = {
+        " ".join(tokens[i : i + _SIMHASH_SHINGLE])
+        for i in range(len(tokens) - _SIMHASH_SHINGLE + 1)
+    }
+    counts = [0] * 64
+    for sh in shingles:
+        h = int.from_bytes(
+            hashlib.blake2b(sh.encode("utf-8"), digest_size=8).digest(), "big"
+        )
+        for bit in range(64):
+            counts[bit] += 1 if (h >> bit) & 1 else -1
+    value = 0
+    for bit in range(64):
+        if counts[bit] >= 0:
+            value |= 1 << bit
+    return f"{value:016x}"
+
+
+def hamming64(a_hex: str, b_hex: str) -> int:
+    """Hamming distance between two 16-hex simhashes (0–64)."""
+    return bin(int(a_hex, 16) ^ int(b_hex, 16)).count("1")
+
+
+def tool_bundle_hash_from_names(names: Iterable[Any]) -> str:
+    """Order-insensitive SHA-256 of a tool-name set.
+
+    The reconciliation corroborator: the backend only merges a
+    changed-prompt identity into an existing agent when the tool
+    bundles match exactly. Shared verbatim by SDK patches and the
+    backend gateway so both sides compute byte-identical values
+    (including the constant empty-set hash when there are no tools).
+    """
+    canon = sorted({_normalize_text(str(n)) for n in names if str(n).strip()})
+    return hashlib.sha256("\x1f".join(canon).encode("utf-8")).hexdigest()
+
+
+def _payload_tool_names(payload: Any) -> list[str]:
+    """Extract declared tool names across provider payload shapes.
+
+    Recognises OpenAI (``{"type": "function", "function": {"name"}}``),
+    Anthropic (``{"name": …}``), and Bedrock ``toolConfig`` shapes.
+    Metadata only — never reads schemas or arguments.
+    """
+    if not isinstance(payload, dict):
+        return []
+    names: list[str] = []
+    tools = payload.get("tools")
+    if isinstance(tools, list):
+        for t in tools:
+            if not isinstance(t, dict):
+                continue
+            fn = t.get("function")
+            n = fn.get("name") if isinstance(fn, dict) else t.get("name")
+            if isinstance(n, str) and n.strip():
+                names.append(n.strip())
+    tool_config = payload.get("toolConfig")
+    if isinstance(tool_config, dict):
+        for t in tool_config.get("tools") or []:
+            if isinstance(t, dict):
+                spec = t.get("toolSpec") or {}
+                n = spec.get("name") if isinstance(spec, dict) else None
+                if isinstance(n, str) and n.strip():
+                    names.append(n.strip())
+    return names
+
+
 def _system_text(payload: Any, messages: Any) -> str:
     """Extract the system prompt across every framework's payload shape.
 
@@ -540,16 +751,57 @@ def _name_from_regex(text: str) -> str | None:
     return None
 
 
-def _derive_identity_from_system(system_text: str) -> tuple[str, str]:
-    """NER-first, hash-fallback display name + identity hash."""
+@dataclass(frozen=True)
+class PromptIdentity:
+    """Full v2 identity derivation for a system prompt.
+
+    ``digest`` is the v2 canonical hash (model tokens masked);
+    ``legacy_digest`` is the v1 hash (plain normalized text) shipped
+    for backend continuity so pre-v2 agents don't fork on upgrade;
+    ``simhash`` feeds prompt-evolution reconciliation server-side.
+    """
+
+    digest: str
+    legacy_digest: str
+    simhash: str | None
+    display_name: str
+
+
+def derive_prompt_identity(system_text: str) -> PromptIdentity:
+    """Canonical v2 prompt-identity derivation (hash + name + simhash).
+
+    The display name is derived from the *unmasked* normalized text
+    (NER quality is unchanged from v1); only the hashes use the
+    model-masked canonical form.
+    """
     normalized = _normalize_text(system_text)
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    canonical = canonicalize_identity_text(system_text)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    legacy_digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
     name = _name_from_ner(normalized)
     if not name:
         name = _name_from_regex(normalized)
     if not name:
         name = f"agent-{digest[:8]}"
-    return digest, name
+    return PromptIdentity(
+        digest=digest,
+        legacy_digest=legacy_digest,
+        simhash=simhash64_hex(canonical),
+        display_name=name,
+    )
+
+
+def _derive_identity_from_system(system_text: str) -> tuple[str, str]:
+    """NER-first, hash-fallback display name + identity hash.
+
+    Since Identity v2 the digest is computed over the model-masked
+    canonical text, so a system prompt that embeds a model name
+    ("powered by GPT-5") keeps the same identity when the model
+    changes. Callers that need the legacy digest / simhash too use
+    :func:`derive_prompt_identity`.
+    """
+    pid = derive_prompt_identity(system_text)
+    return pid.digest, pid.display_name
 
 
 # Back-compat shim for callers that still want the (hash, name) tuple.
@@ -668,24 +920,33 @@ def resolve_identity(
                 source="class",
             )
 
-    # Tier 5: system-prompt SHA-256 + NER
+    # Tier 5: system-prompt SHA-256 (model-masked canonical) + NER
     messages = payload.get("messages") if isinstance(payload, dict) else None
     system = _system_text(payload, messages)
     if system:
-        digest, name = _derive_identity_from_system(system)
+        pid = derive_prompt_identity(system)
+        model_v = payload.get("model") if isinstance(payload, dict) else None
         agent_id = _ensure_agent_id(
-            display_name=name,
-            identity_key=f"hash:{digest}",
-            identity_hash=digest,
+            display_name=pid.display_name,
+            identity_key=f"hash:{pid.digest}",
+            identity_hash=pid.digest,
             source="hash",
             system_excerpt=system,
+            legacy_identity_hash=(
+                pid.legacy_digest if pid.legacy_digest != pid.digest else None
+            ),
+            simhash=pid.simhash,
+            tool_bundle_hash=tool_bundle_hash_from_names(
+                _payload_tool_names(payload)
+            ),
+            model=model_v if isinstance(model_v, str) else None,
         )
         if agent_id is not None:
             return IdentityRecord(
                 agent_id=agent_id,
-                display_name=name,
-                identity_key=f"hash:{digest}",
-                identity_hash=digest,
+                display_name=pid.display_name,
+                identity_key=f"hash:{pid.digest}",
+                identity_hash=pid.digest,
                 source="hash",
             )
 
@@ -833,6 +1094,10 @@ def _ensure_agent_id(
     identity_hash: str,
     source: str,
     system_excerpt: str | None = None,
+    legacy_identity_hash: str | None = None,
+    simhash: str | None = None,
+    tool_bundle_hash: str | None = None,
+    model: str | None = None,
 ) -> str | None:
     """Get-or-fetch the backend agent_id for an identity.
 
@@ -846,6 +1111,17 @@ def _ensure_agent_id(
     shipped so the platform can generate a human description +
     business function in the background. Tiers without a system
     prompt (stack / class / app / OTEL / stored-id) pass ``None``.
+
+    Identity v2 continuity fields (all optional; older backends
+    ignore them):
+
+    * ``legacy_identity_hash`` — the v1 hash for the same identity,
+      so the backend can re-stamp an existing pre-v2 agent instead
+      of forking a new one.
+    * ``simhash`` / ``tool_bundle_hash`` — feed server-side
+      prompt-evolution reconciliation (same agent, edited prompt).
+    * ``model`` — observed metadata only (models_seen histogram);
+      NEVER part of the identity hash.
 
     Returns ``None`` on any error — fail-open per
     ``sdk-design-philosophy.mdc`` rule 5: the user's call must not
@@ -881,6 +1157,11 @@ def _ensure_agent_id(
                 identity_hash=identity_hash,
                 identity_source=source,
                 system_prompt_excerpt=_sanitized_excerpt(system_excerpt),
+                identity_version=IDENTITY_ALGO_VERSION,
+                identity_hash_legacy=legacy_identity_hash,
+                identity_simhash=simhash,
+                tool_bundle_hash=tool_bundle_hash,
+                model=model,
             )
             agent_id = payload.get("id")
             if isinstance(agent_id, str) and agent_id:

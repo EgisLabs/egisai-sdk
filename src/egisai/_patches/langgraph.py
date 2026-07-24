@@ -30,11 +30,11 @@ FRAMEWORK_SOURCE = "framework:langgraph"
 
 def _derive(self_or_pregel: Any, *args: Any, **kwargs: Any) -> IdentityRecord | None:
     pregel = self_or_pregel
-    name = (
+    explicit_name = (
         str(getattr(pregel, "name", "") or "")
         or str(getattr(pregel, "graph_id", "") or "")
-        or "LangGraph Agent"
     )
+    name = explicit_name or "LangGraph Agent"
     nodes: list[str] = []
     try:
         nodes_attr = getattr(pregel, "nodes", {}) or {}
@@ -42,10 +42,21 @@ def _derive(self_or_pregel: Any, *args: Any, **kwargs: Any) -> IdentityRecord | 
             nodes = sorted(str(k) for k in nodes_attr.keys())
     except Exception:  # noqa: BLE001
         nodes = []
+    # Identity v2 — anchor-dominant: a named graph IS the identity;
+    # adding a node to a named graph is a revision of the same agent.
+    # LangGraph auto-names compiled graphs "LangGraph" — treat that
+    # exactly like the missing-name default (it carries zero
+    # operator intent) and key on the node topology instead, or two
+    # unrelated unnamed graphs in one org would merge.
+    if explicit_name and explicit_name.lower() not in ("langgraph",):
+        bundle: tuple = ("langgraph", explicit_name)
+    else:
+        bundle = ("langgraph", name, tuple(nodes))
     return make_identity(
         source=FRAMEWORK_SOURCE,
         display_name=name,
-        bundle=("langgraph", name, tuple(nodes)),
+        bundle=bundle,
+        legacy_bundle=("langgraph", name, tuple(nodes)),
     )
 
 

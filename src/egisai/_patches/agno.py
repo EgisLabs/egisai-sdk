@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from egisai._auto_agent import IdentityRecord
+from egisai._auto_agent import IdentityRecord, canonicalize_identity_text
 from egisai._patches import has_module
 from egisai._patches._framework import make_identity, patch_method
 
@@ -23,15 +23,29 @@ FRAMEWORK_SOURCE = "framework:agno"
 
 def _derive(self_or_agent: Any, *args: Any, **kwargs: Any) -> IdentityRecord | None:
     agent = self_or_agent
-    name = str(getattr(agent, "name", "") or "Agno Agent")
+    explicit_name = str(getattr(agent, "name", "") or "")
+    name = explicit_name or "Agno Agent"
     description = str(getattr(agent, "description", "") or "")
     instructions = getattr(agent, "instructions", None) or ""
     if isinstance(instructions, list):
         instructions = "\n".join(str(i) for i in instructions)
+    prompt_text = "\n".join(
+        p for p in (description, str(instructions)) if p
+    )
+    # Identity v2 — anchor-dominant: Agno's explicit ``name`` is the
+    # identity; description/instruction edits on a named agent are
+    # revisions of the same agent. Nameless agents key on the
+    # canonical persona text. The v1 bundle ships as legacy hash.
+    if explicit_name:
+        bundle: tuple = ("agno", explicit_name)
+    else:
+        bundle = ("agno", name, canonicalize_identity_text(prompt_text))
     return make_identity(
         source=FRAMEWORK_SOURCE,
         display_name=name,
-        bundle=("agno", name, description, str(instructions)),
+        bundle=bundle,
+        legacy_bundle=("agno", name, description, str(instructions)),
+        prompt_text=prompt_text or None,
     )
 
 
