@@ -44,6 +44,12 @@ def reset_sdk() -> Iterator[None]:
 
     _run.reset_for_tests()
 
+    # 0.42.0 — Smart Model Routing: drop cached decisions + the
+    # enablement hint so one test's routing state never leaks.
+    from egisai import _routing
+
+    _routing.reset()
+
     # The init module also caches whether it's been called via _CONFIG; the
     # logger module's queue persists between tests, so we drain it.
     while not _logger._q.empty():
@@ -122,6 +128,15 @@ class FakeBackend:
         # can pin both the payload shape and the no-payload-on-
         # privacy-exit cases without standing up real HTTP.
         self.startup_warnings: list[dict[str, Any]] = []
+        # Handshake feature map (0.42.0 — carries
+        # ``smart_model_routing``). Empty by default so routing stays
+        # dormant in every test that doesn't opt in.
+        self.features: dict[str, bool] = {}
+        # Smart Model Routing decision endpoint — tests set
+        # ``route_response`` to script the platform's answer; every
+        # request body lands on ``route_requests``.
+        self.route_response: dict[str, Any] = {"routed": False}
+        self.route_requests: list[dict[str, Any]] = []
         self._next_agent_serial = 100
 
     def set_rules(
@@ -160,8 +175,17 @@ class FakeBackend:
                     "api_key_name": "test-key",
                     "policy_etag": self.etag,
                     "server_time": "2026-01-01T00:00:00Z",
+                    "features": self.features,
                 },
             )
+        if path.endswith("/v1/sdk/route"):
+            import json
+
+            try:
+                self.route_requests.append(json.loads(request.content.decode()))
+            except Exception:
+                self.route_requests.append({})
+            return httpx.Response(200, json=self.route_response)
         if path.endswith("/v1/sdk/policies"):
             if request.headers.get("if-none-match") == self.etag:
                 return httpx.Response(304)

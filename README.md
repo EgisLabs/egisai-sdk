@@ -256,6 +256,24 @@ What changes and what doesn't:
 
 ---
 
+## Smart Model Routing (optional, platform-controlled)
+
+When your organization enables Smart Model Routing on the Model Center, Egis picks the best-fit model for each governed call — and for each step an agent takes — with no change to your code:
+
+- **Downgrade** — a cheaper model in the same family (or another provider, when the process holds a key for it) serves simple requests; the saved dollars are audited per call.
+- **Upgrade** — requests that need more capability than the requested model (deep reasoning, complex code, very long context) are served on a stronger model; the extra spend is audited as a deliberate quality investment.
+- **Keep** — the requested model is the right fit; nothing changes.
+
+How it behaves in your process:
+
+- **Zero new code.** The feature is entirely operator-controlled from the dashboard (org-wide master switch on the Model Center; per-agent override on the agent's modal). When it's off, the SDK is fully dormant — no decision requests, no added latency.
+- **Privacy-preserving decisions.** The decision service only ever receives the post-sanitization, label-redacted preview the audit trail already carries — raw prompt text never rides on a routing call.
+- **Framework-shaped responses.** Same-provider swaps re-use your own client verbatim (only the model name changes). Cross-provider swaps run only for plain-text, non-streaming, tool-free calls, and the response is returned in your framework's native shape with the served model on `response.model`.
+- **Fail open, always.** Decision service unreachable → requested model. Routed call fails → one retry on the requested model. Payload too rich to translate → no cross-provider swap. A routing swap never makes a call fail that would otherwise have succeeded.
+- **Fully audited.** Every swap records the requested model, served model, direction, reason, and the exact signed cost delta (recomputed server-side from real token usage) on the request's audit row.
+
+---
+
 ## Policies (operator concepts)
 
 Organizations configure policies in the dashboard. Typical categories include:

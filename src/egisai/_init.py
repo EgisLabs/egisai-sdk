@@ -246,6 +246,19 @@ def init(
                 org_id=hs.get("org_id"),
                 agent_id=hs.get("agent_id"),
                 mcp_servers_enabled=bool(features.get("mcp_servers")),
+                smart_routing_enabled=bool(
+                    features.get("smart_model_routing")
+                ),
+            )
+            # Seed the routing client's enablement hint so entitled
+            # orgs route from call #1 and everyone else stays fully
+            # dormant (zero /route calls). Live flips arrive later
+            # via the ``routing.changed`` SSE event.
+            from egisai import _routing as _routing_mod
+
+            _routing_mod.reset()
+            _routing_mod.set_enabled_hint(
+                bool(features.get("smart_model_routing"))
             )
             handshake_ok = True
         except Exception as exc:  # noqa: BLE001
@@ -256,6 +269,13 @@ def init(
                 redact_api_key(cfg.api_key),
                 cfg.base_url,
             )
+            # Offline ⇒ the routing decision service is unreachable
+            # anyway; pin the client dormant so the hot path never
+            # pays a doomed /route round-trip.
+            from egisai import _routing as _routing_mod
+
+            _routing_mod.reset()
+            _routing_mod.set_enabled_hint(False)
 
         rules_count = 0
         if handshake_ok:
@@ -370,6 +390,12 @@ def shutdown() -> None:
         from egisai._evaluator import _close_semantic_blocker
 
         _close_semantic_blocker()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from egisai import _routing as _routing_mod
+
+        _routing_mod.reset()
     except Exception:  # noqa: BLE001
         pass
 

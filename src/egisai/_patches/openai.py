@@ -1053,6 +1053,140 @@ def _stub_response(decision: PolicyDecision, trace_id: str, model: str):
     )
 
 
+# ── Smart Model Routing ──────────────────────────────────────────────
+
+
+def _completion_from_canonical(result: dict[str, Any]) -> Any:
+    """Wrap a canonical cross-provider result into a ChatCompletion shape.
+
+    Used when the routing engine served an OpenAI-originated call on a
+    different provider: the caller's code still receives the
+    ``ChatCompletion`` surface it was written against — real content,
+    real token usage, the served model id on ``model``, and an
+    additive ``egis.routing`` marker for programmatic consumers. Same
+    Pydantic-first / SimpleNamespace-fallback posture as the stub
+    builders above.
+    """
+    text = str(result.get("text") or "")
+    served_model = str(result.get("model") or "")
+    tokens_in = int(result.get("tokens_in") or 0)
+    tokens_out = int(result.get("tokens_out") or 0)
+    import uuid as _uuid
+
+    chat_id = f"egis-routed-{_uuid.uuid4().hex[:12]}"
+    egis_meta = {"routing": {"applied": True, "served_model": served_model}}
+    try:  # pragma: no cover - exercised in real-SDK env
+        from openai.types.chat import (  # type: ignore[import-not-found]
+            ChatCompletion,
+            ChatCompletionMessage,
+        )
+        from openai.types.chat.chat_completion import Choice  # type: ignore[import-not-found]
+        from openai.types.completion_usage import CompletionUsage  # type: ignore[import-not-found]
+
+        completion = ChatCompletion(
+            id=chat_id,
+            object="chat.completion",
+            created=0,
+            model=served_model,
+            choices=[
+                Choice(
+                    index=0,
+                    message=ChatCompletionMessage(
+                        role="assistant", content=text
+                    ),
+                    finish_reason="stop",
+                    logprobs=None,
+                )
+            ],
+            usage=CompletionUsage(
+                prompt_tokens=tokens_in,
+                completion_tokens=tokens_out,
+                total_tokens=tokens_in + tokens_out,
+                prompt_tokens_details=_build_prompt_tokens_details(),
+                completion_tokens_details=_build_completion_tokens_details(),
+            ),
+            system_fingerprint=None,
+            service_tier=None,
+        )
+        completion.egis = egis_meta  # type: ignore[attr-defined]
+        return completion
+    except Exception:
+        msg_ns = SimpleNamespace(role="assistant", content=text, tool_calls=None)
+        return SimpleNamespace(
+            id=chat_id,
+            object="chat.completion",
+            created=0,
+            model=served_model,
+            choices=[
+                SimpleNamespace(
+                    index=0, message=msg_ns, finish_reason="stop", logprobs=None
+                )
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens=tokens_in,
+                completion_tokens=tokens_out,
+                total_tokens=tokens_in + tokens_out,
+                prompt_tokens_details=_build_prompt_tokens_details(),
+                completion_tokens_details=_build_completion_tokens_details(),
+            ),
+            system_fingerprint=None,
+            service_tier=None,
+            egis=egis_meta,
+        )
+
+
+def _routing_adapter_chat(kwargs: dict[str, Any], *, allow_cross: bool) -> Any:
+    """Build the chat-completions routing adapter for one call.
+
+    Same-provider swaps rewrite ``kwargs["model"]`` in place — the
+    ``forward`` lambda reads ``kwargs`` at call time, so the original
+    client library executes the routed model over its own auth and
+    wire format. Cross-provider swaps (plain-text, non-streaming,
+    tool-free calls only — enforced again by the gate) execute
+    directly against the target provider's REST API and come back as
+    a ``ChatCompletion``-shaped response. Fail-open at every step.
+    """
+    try:
+        from egisai._routing import (
+            RoutingAdapter,
+            canonicalize_openai_messages,
+            execute_cross_call,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+    def _apply(new_model: str) -> bool:
+        kwargs["model"] = new_model
+        return True
+
+    def _cross(decision: dict[str, Any]):  # noqa: ANN202
+        messages = canonicalize_openai_messages(kwargs.get("messages"))
+        if messages is None:
+            return None
+        params = {
+            "temperature": kwargs.get("temperature"),
+            "max_tokens": kwargs.get("max_tokens")
+            or kwargs.get("max_completion_tokens"),
+        }
+
+        def _forward() -> Any:
+            return _completion_from_canonical(
+                execute_cross_call(
+                    provider=str(decision.get("provider") or ""),
+                    model=str(decision.get("model") or ""),
+                    messages=messages,
+                    params=params,
+                )
+            )
+
+        return _forward
+
+    return RoutingAdapter(
+        apply_same_provider=_apply,
+        build_cross_forward=_cross if allow_cross else None,
+    )
+
+
 def _ensure_stream_usage(kwargs: dict[str, Any]) -> None:
     """Inject ``stream_options={"include_usage": True}`` when streaming.
 
@@ -1172,6 +1306,11 @@ def _wrap_create_chat(orig: Callable[..., Any], is_async: bool) -> Callable[...,
                     extract_usage=_extract_chat_usage,
                     extract_output_signals=extract_openai_chat,
                     emit_tool_call_steps=True,
+                    # Streams route same-provider only (the swap is a
+                    # kwargs rewrite; the real client keeps streaming).
+                    routing_adapter=_routing_adapter_chat(
+                        kwargs, allow_cross=False
+                    ),
                     forward=forward_async,
                 )
             return await async_gate_call(
@@ -1184,6 +1323,12 @@ def _wrap_create_chat(orig: Callable[..., Any], is_async: bool) -> Callable[...,
                 stub_factory=stub_factory_chat,
                 extract_usage=extract_usage_fn,
                 extract_output_signals=extract_signals_fn,
+                # Raw-mode responses must stay ``LegacyAPIResponse``-
+                # shaped end to end, so cross-provider execution (which
+                # returns a plain ChatCompletion) is disabled there.
+                routing_adapter=_routing_adapter_chat(
+                    kwargs, allow_cross=not raw_mode
+                ),
                 # Multi-step waterfall: when the model returns
                 # tool_calls, the gate appends a ``tool_call`` step
                 # per tool so the dashboard's RunTimelineModal shows
@@ -1240,6 +1385,9 @@ def _wrap_create_chat(orig: Callable[..., Any], is_async: bool) -> Callable[...,
                 extract_usage=_extract_chat_usage,
                 extract_output_signals=extract_openai_chat,
                 emit_tool_call_steps=True,
+                routing_adapter=_routing_adapter_chat(
+                    kwargs, allow_cross=False
+                ),
                 forward=forward_sync,
             )
         return gate_call(
@@ -1253,6 +1401,9 @@ def _wrap_create_chat(orig: Callable[..., Any], is_async: bool) -> Callable[...,
             extract_usage=extract_usage_fn,
             extract_output_signals=extract_signals_fn,
             emit_tool_call_steps=True,
+            routing_adapter=_routing_adapter_chat(
+                kwargs, allow_cross=not raw_mode
+            ),
             forward=lambda: orig(self, *args, **kwargs),
         )
 
@@ -1303,6 +1454,12 @@ def _wrap_create_responses(orig: Callable[..., Any], is_async: bool) -> Callable
                 stub_factory=stub_factory_resp,
                 extract_usage=extract_usage_fn,
                 extract_output_signals=extract_signals_fn,
+                # Responses-API calls route same-provider only — the
+                # cross-provider translator targets the Chat
+                # Completions shape, not Responses output items.
+                routing_adapter=_routing_adapter_chat(
+                    kwargs, allow_cross=False
+                ),
                 # See _wrap_create_chat for the per-tool waterfall
                 # rationale. The Responses API uses
                 # ``function_call`` output items rather than
@@ -1350,6 +1507,8 @@ def _wrap_create_responses(orig: Callable[..., Any], is_async: bool) -> Callable
             extract_usage=extract_usage_fn,
             extract_output_signals=extract_signals_fn,
             emit_tool_call_steps=True,
+            # Same-provider only — see the async sibling above.
+            routing_adapter=_routing_adapter_chat(kwargs, allow_cross=False),
             forward=lambda: orig(
                 self,
                 *args,

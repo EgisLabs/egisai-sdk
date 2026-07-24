@@ -94,7 +94,22 @@ def _handle_sse(event_name: str, data: str) -> None:
     ``refresh_now()`` so we always go through the cache-aware
     ETag path on the server (one no-op 304 round-trip on a
     duplicate event, no payload validation here).
+
+    ``routing.*`` events (the Model Center master switch or a
+    per-agent override flipping) drop the Smart Model Routing
+    client's caches instead — the next governed call re-asks
+    ``/v1/sdk/route``, whose authoritative answer reflects the
+    flip. Same opaque-trigger posture: the event body is never
+    trusted as state.
     """
+    if event_name.startswith("routing."):
+        try:
+            from egisai import _routing
+
+            _routing.invalidate()
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("routing cache invalidation failed", exc_info=True)
+        return
     if not any(event_name.startswith(p) for p in _REFRESH_EVENT_PREFIXES):
         return
     _ = data  # opaque trigger; refresh_now() handles cache validation
