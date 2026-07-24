@@ -1769,3 +1769,203 @@ def test_semantic_guard_text_block_still_fires_when_hooks_active(
     # ran the tool turn even though the SDK refused the response
     # at the boundary).
     assert parent.get("enforcement_status") == "advisory"
+
+
+# ── 9. Aggregated-output ``scope`` honesty ──────────────────────────
+#
+# The dashboard's run timeline paints the turn-final OUTPUT box after
+# the per-tool rows and captions it as an aggregate. When PreToolUse
+# hooks gated the tools individually, that aggregate covers ONLY the
+# assistant's text (the dedupe filter dropped the tool signals — see
+# ``_run_output_phase``), so the SDK must say so: the
+# ``response_decision`` block carries ``scope: "text_only"``. Without
+# the marker, a turn whose tool was blocked but whose text passed
+# renders "Output policy · Allowed … reflects the full turn" directly
+# under a blocked tool row — a contradiction operators file as a bug.
+
+
+def test_output_scope_text_only_when_hooks_gated_a_blocked_tool(
+    fake_claude_with_hooks: tuple[Any, type, types.ModuleType],
+) -> None:
+    """The exact turn shape from the field report: input passes, a
+    tool is blocked by the PreToolUse hook (enforced, pre-execution),
+    the assistant's final text passes. The turn-final ``model_call``
+    step must carry ``response_decision.verdict == "allow"`` (the
+    text really did pass) AND ``scope == "text_only"`` (the verdict
+    does NOT cover the tool leg — the tool row above does)."""
+    fake_backend, client_cls, mod = fake_claude_with_hooks
+    _load_rules(_deny_tool_rule(r"^run_shell$"))
+
+    mod.__script__ = [
+        AssistantMessage(
+            [
+                TextBlock("Let me try running that for you."),
+                ToolUseBlock("run_shell", {"cmd": "rm -rf /"}, id_="tu_b1"),
+            ]
+        ),
+        ResultMessage(),
+    ]
+
+    async def run() -> None:
+        opts = _ClaudeAgentOptions()
+        async with client_cls(options=opts) as client:
+            await client.query("Clean up the disk.")
+            async for _ in client.receive_response():
+                pass
+
+    asyncio.run(run())
+    _flush()
+
+    # The tool leg: blocked, enforced, on its own step row.
+    tool_steps = _step_events(fake_backend.events_received, kind="tool_call")
+    assert tool_steps, "expected a tool_call step from the hook"
+    blocked = [t for t in tool_steps if t.get("verdict") == "block"]
+    assert blocked, "the deny_tool_call rule must block run_shell"
+    assert blocked[0].get("enforcement_status") == "enforced"
+
+    # The turn-final aggregate: allow, but scoped to the text alone.
+    model_steps = _step_events(fake_backend.events_received, kind="model_call")
+    assert model_steps, "expected a model_call step"
+    parent = model_steps[-1]
+    rd = parent.get("response_decision")
+    assert isinstance(rd, dict), (
+        "the output phase ran (text signal present) so the parent "
+        "step must carry a response_decision block"
+    )
+    assert rd["verdict"] == "allow", (
+        "the assistant's text carried no violation — flipping the "
+        "aggregate to block would falsely claim the response was "
+        "withheld"
+    )
+    assert rd.get("scope") == "text_only", (
+        "hooks gated the tool signals individually, so the aggregate "
+        "covers the text alone and MUST say so — the dashboard's "
+        "'reflects the full turn' caption keys off this marker"
+    )
+
+
+def test_output_scope_full_turn_for_pure_text_turn_with_hooks(
+    fake_claude_with_hooks: tuple[Any, type, types.ModuleType],
+) -> None:
+    """A turn that never invoked a tool has nothing for the hook to
+    gate — the aggregate genuinely covered every signal the turn
+    produced, so ``scope == "full_turn"`` even with hooks wired."""
+    fake_backend, client_cls, mod = fake_claude_with_hooks
+    _load_rules()  # no rules — clean allow
+
+    mod.__script__ = [
+        AssistantMessage([TextBlock("Just a plain text answer.")]),
+        ResultMessage(),
+    ]
+
+    async def run() -> None:
+        opts = _ClaudeAgentOptions()
+        async with client_cls(options=opts) as client:
+            await client.query("Say something.")
+            async for _ in client.receive_response():
+                pass
+
+    asyncio.run(run())
+    _flush()
+
+    model_steps = _step_events(fake_backend.events_received, kind="model_call")
+    assert model_steps, "expected a model_call step"
+    rd = model_steps[-1].get("response_decision")
+    assert isinstance(rd, dict)
+    assert rd["verdict"] == "allow"
+    assert rd.get("scope") == "full_turn"
+
+
+def test_output_scope_full_turn_on_legacy_no_hooks_path(
+    fake_claude_legacy: tuple[Any, type, types.ModuleType],
+) -> None:
+    """Hooks-off fallback: the turn-final phase is the ONLY place the
+    tool signals get evaluated (advisory mode), so the aggregate
+    really does cover the full turn — ``scope == "full_turn"``."""
+    fake_backend, client_cls, mod = fake_claude_legacy
+    _load_rules()  # no rules — clean allow
+
+    mod.__script__ = [
+        AssistantMessage(
+            [
+                TextBlock("Reading the file."),
+                ToolUseBlock("Read", {"path": "/tmp/x"}, id_="tu_l1"),
+            ]
+        ),
+        ResultMessage(),
+    ]
+
+    async def run() -> None:
+        opts = _LegacyOptions()
+        async with client_cls(options=opts) as client:
+            await client.query("Open the file.")
+            async for _ in client.receive_response():
+                pass
+
+    asyncio.run(run())
+    _flush()
+
+    model_steps = _step_events(fake_backend.events_received, kind="model_call")
+    assert model_steps, "expected a model_call step"
+    rd = model_steps[-1].get("response_decision")
+    assert isinstance(rd, dict)
+    assert rd["verdict"] == "allow"
+    assert rd.get("scope") == "full_turn", (
+        "without hooks the aggregate evaluated text AND tool signals "
+        "— claiming text_only here would hide coverage the phase "
+        "actually had"
+    )
+
+
+def test_output_scope_stamped_on_text_block_path_too(
+    fake_claude_with_hooks: tuple[Any, type, types.ModuleType],
+) -> None:
+    """Block path parity: when the turn-final phase blocks on the
+    assistant's text (tool signals deduped away), the block's
+    ``response_decision`` carries ``scope == "text_only"`` exactly
+    like the allow path — auditors reading the export must see the
+    coverage marker on every aggregated verdict, not just the calm
+    ones."""
+    fake_backend, client_cls, mod = fake_claude_with_hooks
+    _load_rules(
+        {
+            "id": "regex-out-scope",
+            "name": "block-output-scope",
+            "type": "deny_output_regex",
+            "tenant": None,
+            "config": {
+                "pattern": r"forbidden phrase",
+                "message": "Blocked output content.",
+            },
+        }
+    )
+
+    mod.__script__ = [
+        AssistantMessage(
+            [
+                TextBlock("Here is the forbidden phrase, verbatim."),
+                ToolUseBlock("Read", {"path": "/etc/hostname"}, id_="tu_s1"),
+            ]
+        ),
+        ResultMessage(),
+    ]
+
+    async def run() -> None:
+        opts = _ClaudeAgentOptions()
+        async with client_cls(options=opts) as client:
+            await client.query("Help me.")
+            try:
+                async for _ in client.receive_response():
+                    pass
+            except PermissionError:
+                pass
+
+    asyncio.run(run())
+    _flush()
+
+    model_steps = _step_events(fake_backend.events_received, kind="model_call")
+    assert model_steps, "expected a model_call step"
+    rd = model_steps[-1].get("response_decision")
+    assert isinstance(rd, dict)
+    assert rd["verdict"] == "block"
+    assert rd.get("scope") == "text_only"
