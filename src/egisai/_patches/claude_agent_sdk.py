@@ -2099,6 +2099,30 @@ def _run_output_phase(
     else:
         ev["response_decision"] = _decision_block(decision)
         ev.setdefault("enforcement_status", ENFORCEMENT_ENFORCED)
+
+    # Scope honesty for the dashboard (additive — the backend's
+    # ``_coerce_decision_block`` passes recognised values through and
+    # older backends simply drop the key):
+    #
+    #   ``text_only`` — hooks were active AND the turn carried tool
+    #     signals, so this aggregated verdict covers ONLY the
+    #     assistant's accumulated text. The per-tool verdicts live on
+    #     the ``tool_call`` step rows the PreToolUse hook emitted
+    #     (see the dedupe filter at the top of this function). Without
+    #     this marker the dashboard's "Aggregated OUTPUT verdict —
+    #     … reflect the full turn" caption reads as a contradiction
+    #     when a tool row above was blocked but the text here passed.
+    #   ``full_turn`` — every signal the turn produced was evaluated
+    #     in THIS phase (hooks off, or a pure-text turn), so the
+    #     verdict genuinely aggregates the whole turn.
+    scope = (
+        "text_only"
+        if hooks_active and saw_tool_signals_pre_filter
+        else "full_turn"
+    )
+    response_block = ev.get("response_decision")
+    if isinstance(response_block, dict):
+        response_block["scope"] = scope
     return decision
 
 

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.45.0] — 2026-07-24
+
+### Added
+
+- **Output-verdict `scope` on the aggregated decision (Claude Agent
+  SDK).** The turn-final `response_decision` block now carries an
+  additive `scope` key: `"text_only"` when PreToolUse hooks already
+  gated the turn's tool invocations individually (their verdicts
+  live on the per-tool `tool_call` step rows) so the aggregated
+  verdict covers only the assistant's accumulated text, or
+  `"full_turn"` when this one phase evaluated every signal the turn
+  produced (hooks off, or a pure-text turn). Fixes the dashboard
+  timeline reading "Output policy · Allowed … reflects the full
+  turn" directly under a tool row a policy had blocked — the two
+  verdicts were both correct but the caption claimed a coverage the
+  evaluation didn't have. Older backends simply drop the unknown
+  key; no wire or behavior change otherwise.
+
 ## [0.44.0] — 2026-07-24
 
 ### Changed
