@@ -172,6 +172,14 @@ INFLIGHT_POST_HOOKS_ACTIVE_ATTR = "__egisai_post_hooks_active__"
 # wire-protocol explanation.
 INFLIGHT_PRE_CALLBACK_ATTR = "__egisai_pre_cb__"
 INFLIGHT_POST_CALLBACK_ATTR = "__egisai_post_cb__"
+# Smart Model Routing (ClaudeSDKClient) — the model this wrapper last
+# pinned on the LIVE session via the ``set_model`` control request.
+# Unset / ``None`` ⇒ the session runs on whatever the user configured
+# (``options.model`` or the CLI default). Only updated AFTER a
+# ``set_model`` round-trip succeeds, so it always mirrors the model
+# the subprocess is actually serving — the restore logic in
+# ``_route_client_turn`` relies on that invariant.
+SESSION_ROUTED_MODEL_ATTR = "__egisai_session_routed_model__"
 
 
 # ── Identity helpers (unchanged shape from 0.17.5) ──────────────────
@@ -2201,6 +2209,95 @@ def _wrap_client_connect(orig: Any) -> Any:
     return wrapped
 
 
+async def _route_client_turn(
+    client: Any, *, requested_model: str, ev: dict[str, Any]
+) -> str | None:
+    """Per-turn Smart Model Routing for a live ``ClaudeSDKClient`` session.
+
+    The CLI subprocess boots at ``connect()`` with ``--model`` frozen,
+    so (unlike the module-level ``query()``) rewriting
+    ``options.model`` at query time is a silent no-op. Newer
+    claude-agent-sdk releases expose the ``set_model`` control request
+    that switches the model on the LIVE session — that's the lever
+    here: decide from the post-sanitization prompt preview, pin the
+    routed model right before the prompt goes over stdio, and restore
+    the user's configured model on a later turn when the engine stops
+    routing (``set_model`` persists session-wide; a decision is
+    per-turn).
+
+    Same-provider by construction — the CLI only speaks Anthropic, so
+    ``allow_cross=False`` and the decision is applied only when the
+    platform answered with an Anthropic model. Fully fail-open: any
+    error (backend down, ``set_model`` unsupported or raising, session
+    not connected) leaves the session on the model it is already
+    running and ships no routing stamps. Feature-detected via
+    ``hasattr`` so older SDKs without ``set_model`` skip routing
+    entirely — no regression.
+
+    Returns the served model when a swap was applied this turn, else
+    ``None``.
+    """
+    set_model = getattr(client, "set_model", None)
+    if not callable(set_model):
+        return None
+
+    # The model the subprocess is serving right now: the last routed
+    # pin, or the user's configured model when we never pinned /
+    # already restored.
+    pinned: str | None = getattr(client, SESSION_ROUTED_MODEL_ATTR, None)
+    try:
+        from egisai import _routing as _routing_mod
+
+        options = getattr(client, "options", None)
+        # Client sessions usually carry MCP servers / allowed tools —
+        # tell the selector so it only ever picks tool-capable models.
+        has_tools = bool(
+            getattr(options, "mcp_servers", None)
+            or getattr(options, "allowed_tools", None)
+        )
+        # The decision round-trip is sync HTTP — park it on a worker
+        # thread so the caller's event loop stays free (same pattern
+        # as the module-level query()'s session routing).
+        decision = await asyncio.to_thread(
+            lambda: _routing_mod.maybe_route(
+                model=requested_model,
+                prompt_preview=ev.get("prompt_preview") or "",
+                prompt_chars=int(ev.get("prompt_chars") or 0),
+                has_tools=has_tools,
+                agent_id=ev.get("agent_id"),
+                allow_cross=False,
+            )
+        )
+
+        if decision and decision.get("provider") == "anthropic":
+            target = str(decision["model"])
+            if target != (pinned or requested_model):
+                await set_model(target)
+            setattr(client, SESSION_ROUTED_MODEL_ATTR, target)
+            ev["requested_model"] = requested_model
+            ev["requested_provider"] = "anthropic"
+            ev["routing_applied"] = True
+            ev["routing_direction"] = decision.get("direction")
+            ev["routing_reason"] = decision.get("reason")
+            ev["model"] = target
+            return target
+
+        # No decision this turn. If an earlier turn pinned a routed
+        # model, restore the user's configured one (``None`` ⇒ the CLI
+        # default) so "keep the requested model" holds per turn, not
+        # per session.
+        if pinned is not None:
+            await set_model(getattr(options, "model", None) or None)
+            setattr(client, SESSION_ROUTED_MODEL_ATTR, None)
+        return None
+    except Exception:  # noqa: BLE001
+        LOGGER.debug(
+            "client session routing failed — keeping the current model",
+            exc_info=True,
+        )
+        return None
+
+
 def _wrap_client_query(orig: Any) -> Any:
     """``ClaudeSDKClient.query`` — Phase 1+2 input gate + stash inflight."""
 
@@ -2318,6 +2415,20 @@ def _wrap_client_query(orig: Any) -> Any:
                         # stdio instead of the raw original.
                         prompt = payload["input"]
 
+                    # Smart Model Routing — per-turn, via the CLI's
+                    # ``set_model`` control request (see
+                    # ``_route_client_turn``). Runs AFTER the input
+                    # phase so the decision preview is the
+                    # post-sanitization audit copy, and BEFORE the
+                    # inflight stash / provisional step so the audit
+                    # trail (hook callbacks, seq-0 row, terminal
+                    # event) reads the SERVED model throughout.
+                    routed_model = await _route_client_turn(
+                        self, requested_model=model, ev=ev
+                    )
+                    if routed_model is not None:
+                        model = routed_model
+
                     # Stash inflight handle for receive_messages to
                     # extend. Identity record is stashed so the
                     # response side re-enters the same scope (output
@@ -2427,7 +2538,15 @@ def _wrap_client_receive_messages(orig: Any) -> Any:
             except Exception:  # noqa: BLE001
                 record = None
 
-        model = _model_for(self, kwargs) or "claude"
+        # Prefer the session's routed pin (Smart Model Routing via
+        # ``set_model``) over ``options.model`` — tool_call step rows
+        # and the output phase should attribute to the model actually
+        # serving this session, not the one the user configured.
+        model = (
+            getattr(self, SESSION_ROUTED_MODEL_ATTR, None)
+            or _model_for(self, kwargs)
+            or "claude"
+        )
         scope_cm = identity_scope(record) if record is not None else nullcontext()
 
         ctx = copy_context()

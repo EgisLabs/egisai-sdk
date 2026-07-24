@@ -128,6 +128,39 @@ def _stub_response(decision: PolicyDecision, trace_id: str, model: str):
     )
 
 
+def _routing_adapter(kwargs: dict[str, Any]) -> Any:
+    """Same-provider Smart Model Routing adapter (Gemini → Gemini).
+
+    A swap rewrites ``kwargs["model"]`` in place — the forward lambda
+    rebuilds its kwargs at call time, so the routed model rides the
+    user's own configured client (auth, base URL, retries all
+    untouched). Works for streaming and tool-carrying calls alike;
+    the gate's ``has_tools`` signal keeps the selector on
+    tool-capable models. No cross-provider hook: Gemini payloads
+    (``contents`` trees, function declarations) have no faithful
+    canonical translation yet, so cross-provider stays off — exactly
+    like the Responses-API adapter in the OpenAI patch.
+
+    ``None`` (routing skipped) when the caller passed ``model``
+    positionally: the rewrite target must be the same slot the
+    forward reads, and adding a ``model`` kwarg next to a positional
+    one would raise a duplicate-argument ``TypeError`` on the routed
+    attempt.
+    """
+    if "model" not in kwargs:
+        return None
+    try:
+        from egisai._routing import RoutingAdapter
+    except Exception:  # noqa: BLE001
+        return None
+
+    def _apply(new_model: str) -> bool:
+        kwargs["model"] = new_model
+        return True
+
+    return RoutingAdapter(apply_same_provider=_apply)
+
+
 def _wrap_sync(orig: Callable[..., Any], stream: bool) -> Callable[..., Any]:
     target = (
         "google.genai.models.generate_content_stream"
@@ -173,6 +206,7 @@ def _wrap_sync(orig: Callable[..., Any], stream: bool) -> Callable[..., Any]:
             # so an operator reading a Run never sees "this provider
             # collapses tools, that one doesn't".
             emit_tool_call_steps=True,
+            routing_adapter=_routing_adapter(kwargs),
             forward=lambda: orig(
                 self,
                 *args,
@@ -214,6 +248,7 @@ def _wrap_async(orig: Callable[..., Any], stream: bool) -> Callable[..., Any]:
             extract_usage=_extract_genai_usage,
             extract_output_signals=extract_google,
             emit_tool_call_steps=True,
+            routing_adapter=_routing_adapter(kwargs),
             forward=lambda: orig(
                 self,
                 *args,

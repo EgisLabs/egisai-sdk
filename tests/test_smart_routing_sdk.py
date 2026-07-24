@@ -487,3 +487,131 @@ def test_e2e_dormant_org_sends_zero_route_calls(fake_backend) -> None:
     )
     assert out["kwargs"]["model"] == "gpt-4o"
     assert fake_backend.route_requests == []
+
+
+# ── google.genai adapter (same-provider Gemini → Gemini) ────────────
+
+
+class TestGenaiAdapter:
+    def test_apply_swaps_model_kwarg_in_place(self) -> None:
+        from egisai._patches.genai import _routing_adapter
+
+        kwargs: dict[str, Any] = {"model": "gemini-3.1-pro", "contents": "hi"}
+        adapter = _routing_adapter(kwargs)
+        assert adapter is not None
+        assert adapter.supports_cross is False  # no faithful translation
+        assert adapter.apply_same_provider("gemini-2.5-flash-lite") is True
+        assert kwargs["model"] == "gemini-2.5-flash-lite"
+
+    def test_positional_model_skips_routing(self) -> None:
+        # ``kwargs`` without a ``model`` key means the caller passed it
+        # positionally — rewriting would add a duplicate argument.
+        from egisai._patches.genai import _routing_adapter
+
+        assert _routing_adapter({"contents": "hi"}) is None
+
+    def test_gate_swap_applies_and_stamps(self, monkeypatch) -> None:
+        from egisai._patches.genai import _routing_adapter
+
+        kwargs: dict[str, Any] = {"model": "gemini-3.1-pro", "contents": "hi"}
+        monkeypatch.setattr(
+            _routing,
+            "maybe_route",
+            lambda **kw: _decision(
+                model="gemini-2.5-flash-lite",
+                provider="google",
+                requested_provider="google",
+            ),
+        )
+        ev: dict[str, Any] = {"prompt_preview": "hi", "prompt_chars": 2}
+        state = _prepare_route(
+            ev=ev,
+            model="gemini-3.1-pro",
+            stream=False,
+            payload={"contents": "hi", "tools": None},
+            routing_adapter=_routing_adapter(kwargs),
+        )
+        assert state is not None and state["applied"]
+        assert kwargs["model"] == "gemini-2.5-flash-lite"
+
+        _stamp_route(ev, state)
+        assert ev["model"] == "gemini-2.5-flash-lite"
+        assert ev["requested_model"] == "gemini-3.1-pro"
+        assert ev["requested_provider"] == "google"
+
+
+def _install_fake_genai() -> type:
+    google_pkg = types.ModuleType("google")
+    genai_mod = types.ModuleType("google.genai")
+    models_mod = types.ModuleType("google.genai.models")
+
+    class Models:
+        def generate_content(self, **kwargs):
+            return {"id": "real", "kwargs": kwargs}
+
+    class AsyncModels:
+        async def generate_content(self, **kwargs):
+            return {"id": "real-async", "kwargs": kwargs}
+
+    models_mod.Models = Models
+    models_mod.AsyncModels = AsyncModels
+    google_pkg.genai = genai_mod
+    genai_mod.models = models_mod
+    sys.modules.update(
+        {
+            "google": google_pkg,
+            "google.genai": genai_mod,
+            "google.genai.models": models_mod,
+        }
+    )
+    return Models
+
+
+def test_e2e_genai_same_provider_swap_and_audit(fake_backend) -> None:
+    fake_backend.features = {"smart_model_routing": True}
+    fake_backend.route_response = {
+        "routed": True,
+        "model": "gemini-2.5-flash-lite",
+        "provider": "google",
+        "direction": "downgrade",
+        "reason": "trivial request",
+        "projected_savings_usd": 0.005,
+    }
+
+    import egisai
+
+    egisai.init(
+        api_key="egis_live_x", app="a", env="t",
+        base_url="http://fake", enable_sse=False,
+    )
+    # Install AFTER init so the explicit apply() below is the first
+    # wrap (init's own patch pass would otherwise claim it).
+    Models = _install_fake_genai()
+    try:
+        from egisai._patches import genai as genai_patch
+
+        assert genai_patch.apply() is True
+
+        out = Models().generate_content(
+            model="gemini-3.1-pro",
+            contents="What does HTTP stand for?",
+        )
+        # The upstream call ran on the routed model, same client.
+        assert out["kwargs"]["model"] == "gemini-2.5-flash-lite"
+
+        assert len(fake_backend.route_requests) == 1
+        req = fake_backend.route_requests[0]
+        assert req["model"] == "gemini-3.1-pro"
+
+        egisai.shutdown()  # flush the audit event
+        routed = [
+            e for e in fake_backend.events_received if e.get("routing_applied")
+        ]
+        assert routed, "no routed audit event was flushed"
+        ev = routed[0]
+        assert ev["model"] == "gemini-2.5-flash-lite"
+        assert ev["requested_model"] == "gemini-3.1-pro"
+        assert ev["requested_provider"] == "google"
+    finally:
+        for name in ("google", "google.genai", "google.genai.models"):
+            sys.modules.pop(name, None)
