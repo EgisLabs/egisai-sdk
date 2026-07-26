@@ -50,7 +50,7 @@ def reset_sdk() -> Iterator[None]:
 
     _routing.reset()
 
-    # 0.46.0 — rate_limit / budget_limit: stop the usage-sync worker
+    # 0.46.1 — rate_limit / budget_limit: stop the usage-sync worker
     # and wipe local counters + the backend snapshot.
     from egisai.policy import limits
 
@@ -143,7 +143,7 @@ class FakeBackend:
         # request body lands on ``route_requests``.
         self.route_response: dict[str, Any] = {"routed": False}
         self.route_requests: list[dict[str, Any]] = []
-        # Usage snapshot for rate_limit / budget_limit (0.46.0).
+        # Usage snapshot for rate_limit / budget_limit (0.46.1).
         # ``None`` ⇒ the endpoint 404s, mimicking a backend that
         # pre-dates ``/v1/sdk/usage``. ``usage_calls`` counts hits so
         # tests can assert the sync worker's polling behavior.
