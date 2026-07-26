@@ -72,6 +72,16 @@ class EgisaiConfig:
     # ``/v1/sdk/route`` calls). Live flips are picked up via the
     # ``routing.changed`` SSE event without a process restart.
     smart_routing_enabled: bool = False
+    # Identity stamping (``init(stamp_identity=True)`` /
+    # ``EGISAI_STAMP_IDENTITY=1``). When enabled, allowlisted tool
+    # invocations that create durable artifacts (git commits via the
+    # Bash tool, GitHub MCP pull requests / issues / file commits)
+    # get an ``On-Behalf-Of: <agent> (egis:<id>)`` trailer appended
+    # via the Claude Agent SDK PreToolUse hook's ``updatedInput``
+    # rewrite, so agent attribution survives inside the artifact
+    # itself. Default False — nothing is ever touched unless the
+    # operator opts in. See ``egisai._patches._identity_stamp``.
+    stamp_identity: bool = False
     # Gateway mode (``init(gateway=True)`` / ``EGISAI_GATEWAY=1``).
     # When enabled, OpenAI chat-completions calls are rerouted through
     # the platform's inline Gateway (``<base_url>/v1``) with the
@@ -126,6 +136,7 @@ def update_config(**fields: object) -> EgisaiConfig:
         "auto_describe": _CONFIG.auto_describe,
         "mcp_servers_enabled": _CONFIG.mcp_servers_enabled,
         "smart_routing_enabled": _CONFIG.smart_routing_enabled,
+        "stamp_identity": _CONFIG.stamp_identity,
         "gateway_mode": _CONFIG.gateway_mode,
     }
     base.update(fields)

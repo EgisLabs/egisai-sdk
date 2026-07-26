@@ -411,6 +411,30 @@ def _is_agent_ungoverned(agent_id: str) -> bool:
     return agent_id in get_ungoverned_agent_ids()
 
 
+def _record_limits_usage(
+    surfaces: tuple[str, ...], agent_id: str, verdict: str
+) -> None:
+    """Feed the rate-limit counters after an input-side evaluation.
+
+    Only *model-surface* evaluations count — a model call is the unit
+    both ``rate_limit`` and the backend's usage aggregation meter.
+    Tool / MCP gates re-enter ``evaluate`` with narrowed surfaces and
+    must not double-count their parent turn. Blocked calls don't
+    count either: the limit meters calls that actually go out, so a
+    blocked agent drains back under its limit as the window slides
+    (counting refusals would let a retry loop extend its own lockout
+    forever). Exception-proof — never breaks the call path.
+    """
+    if surfaces != ("model",) or verdict == "block":
+        return
+    try:
+        from egisai.policy import limits
+
+        limits.record_model_call(agent_id)
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("limits usage recording failed", exc_info=True)
+
+
 def evaluate(call: InputCall) -> PolicyDecision:
     """Run the cached input rules against an in-flight call.
 
@@ -445,15 +469,18 @@ def evaluate(call: InputCall) -> PolicyDecision:
         prompt_text=call.prompt_text,
         prompt_chars=len(call.prompt_text),
         stream=call.stream,
+        agent_id=agent_id,
     )
     blocker = _get_semantic_blocker() if _has_semantic_rule(rules) else None
     try:
-        return evaluate_policies(
+        decision = evaluate_policies(
             rules, ctx, semantic_blocker=blocker, surfaces=call.surfaces
         )
     except Exception:  # noqa: BLE001
         LOGGER.warning("policy evaluator errored, allowing by default", exc_info=True)
-        return PolicyDecision.allow()
+        decision = PolicyDecision.allow()
+    _record_limits_usage(call.surfaces, agent_id, decision.verdict)
+    return decision
 
 
 def evaluate_output(call: OutputCall) -> PolicyDecision:

@@ -191,7 +191,19 @@ def replace_rules(
             _ungoverned_agent_ids = frozenset(
                 str(a).strip().lower() for a in ungoverned_agent_ids if a
             )
-        return len(_rules)
+        count = len(_rules)
+        rules_snapshot = list(_rules)
+    # Outside the lock: let the limits module start/stop its usage-
+    # sync worker based on whether any ``rate_limit`` / ``budget_limit``
+    # rule is now active. Best-effort — a failure here must never
+    # poison the cache write.
+    try:
+        from egisai.policy import limits
+
+        limits.notify_rules(rules_snapshot)
+    except Exception:  # noqa: BLE001
+        pass
+    return count
 
 
 def refresh_now() -> bool:
@@ -219,3 +231,10 @@ def clear() -> None:
         _rules = []
         _paused_agent_ids = frozenset()
         _ungoverned_agent_ids = frozenset()
+    # No rules ⇒ no limit rules ⇒ the usage-sync worker can stop.
+    try:
+        from egisai.policy import limits
+
+        limits.notify_rules([])
+    except Exception:  # noqa: BLE001
+        pass

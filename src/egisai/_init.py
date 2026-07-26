@@ -61,6 +61,7 @@ def init(
     auto_stack_hints: str = "loose",
     auto_describe: bool | None = None,
     gateway: bool | None = None,
+    stamp_identity: bool | None = None,
     quiet: bool = False,
 ) -> None:
     """Activate egisai for the current process.
@@ -147,6 +148,18 @@ def init(
         in-process path. Requires the org's ``inline_gateway``
         feature. Defaults to ``False``; also settable via the
         ``EGISAI_GATEWAY`` env var.
+    stamp_identity
+        Propagate agent identity into the durable artifacts agents
+        create. When enabled, allowlisted tool invocations (git
+        commits made through the Claude Agent SDK's Bash tool,
+        GitHub MCP pull requests / issues / file commits) get an
+        ``On-Behalf-Of: <agent-name> (egis:<agent-id>)`` trailer
+        appended before execution, so anyone reading the git
+        history or the PR later can attribute it to the specific
+        agent. Only the agent's display name and Egis UUID are
+        embedded — never prompt text or PII. Defaults to ``False``
+        (nothing is touched); also settable via the
+        ``EGISAI_STAMP_IDENTITY`` env var.
     quiet
         Suppress the one-line "egisai active" startup log.
     """
@@ -199,6 +212,19 @@ def init(
         else:
             resolved_gateway = bool(gateway)
 
+        # ``stamp_identity`` resolves explicit kwarg → env var →
+        # default False, mirroring ``gateway``'s resolution shape.
+        # Default-off is the contract: nothing about a user's tool
+        # traffic changes unless they opted in.
+        if stamp_identity is None:
+            env_stamp = os.getenv("EGISAI_STAMP_IDENTITY")
+            resolved_stamp_identity = (
+                env_stamp is not None
+                and env_stamp.strip().lower() in ("1", "true", "yes", "on")
+            )
+        else:
+            resolved_stamp_identity = bool(stamp_identity)
+
         cfg = EgisaiConfig(
             api_key=api_key,
             app=app,
@@ -214,6 +240,7 @@ def init(
             sdk_version=__version__,
             auto_stack_hints=auto_stack_hints,  # type: ignore[arg-type]
             auto_describe=resolved_auto_describe,
+            stamp_identity=resolved_stamp_identity,
             gateway_mode=resolved_gateway,
         )
         set_config(cfg)
@@ -396,6 +423,12 @@ def shutdown() -> None:
         from egisai import _routing as _routing_mod
 
         _routing_mod.reset()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from egisai.policy import limits as _limits_mod
+
+        _limits_mod.stop()
     except Exception:  # noqa: BLE001
         pass
 

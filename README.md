@@ -195,6 +195,7 @@ egisai.init(..., on_block="stub")
 | `enable_http_fallback` | `True` | Optional patching of `httpx` / `requests` for broader HTTP visibility where enabled. |
 | `auto_stack_hints` | `"loose"` | Controls the stack-frame inspector used by the agent identity resolver. `"loose"` (default) honors common conventions; `"strict"` requires an explicit `__egisai_agent__` marker; `"off"` disables stack inspection. |
 | `gateway` | `False` | Route OpenAI chat-completions calls through the platform's inline Gateway instead of evaluating policies in-process — see "Gateway mode" below. |
+| `stamp_identity` | `False` | Opt-in identity propagation: allowlisted artifact-creating tool invocations (git commits via the Claude Agent SDK's Bash tool, GitHub MCP pull requests / issues / file commits) get an `On-Behalf-Of: <agent> (egis:<id>)` trailer appended before execution, so agent attribution survives inside the artifact itself. |
 | `quiet` | `False` | Set `True` to suppress the one-line startup banner on stderr. |
 
 ### Environment variables
@@ -204,6 +205,8 @@ egisai.init(..., on_block="stub")
 | `EGISAI_API_KEY` | SDK API key if not passed as `api_key=`. |
 | `EGISAI_BASE_URL` | Control plane base URL override when supplied by EgisAI. |
 | `EGISAI_GATEWAY` | Set `1` to enable Gateway mode without a code change. |
+| `EGISAI_STAMP_IDENTITY` | Set `1` to enable identity stamping (`stamp_identity`) without a code change. |
+| `EGISAI_USAGE_SYNC_SECONDS` | How often the SDK refreshes the usage snapshot backing `rate_limit` / `budget_limit` rules (default `15`). |
 
 Treat API keys as secrets—use environment variables or a secrets manager, never commit them to source control.
 
