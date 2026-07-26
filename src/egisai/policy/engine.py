@@ -70,13 +70,22 @@ class PolicyRule:
 
 @dataclass(frozen=True)
 class PolicyContext:
-    """Inputs for evaluating *input-side* policies (before the LLM call)."""
+    """Inputs for evaluating *input-side* policies (before the LLM call).
+
+    ``agent_id`` is the lower-case UUID of the agent this call is
+    attributed to (empty when identity could not be resolved). Added
+    for the ``rate_limit`` / ``budget_limit`` kinds, whose counters
+    are keyed per agent; every other evaluator ignores it. Appended
+    with a default so existing positional/kwarg constructions keep
+    compiling unchanged.
+    """
 
     tenant: str
     model: str
     prompt_text: str
     prompt_chars: int
     stream: bool
+    agent_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -252,6 +261,11 @@ _DETERMINISTIC_KINDS = frozenset(
         "deny_mcp_call",
         "deny_db_query",
         "deny_financial_action",
+        # Per-agent runtime limits (0.46.0). Pure in-memory counter
+        # compares against the backend-synced usage snapshot — no
+        # network on the hot path (see ``egisai.policy.limits``).
+        "rate_limit",
+        "budget_limit",
     }
 )
 
@@ -437,6 +451,7 @@ def evaluate_policies(
         prompt_text=text_for_phase2,
         prompt_chars=len(text_for_phase2),
         stream=context.stream,
+        agent_id=context.agent_id,
     )
     phase2_matches = _collect_input_matches(
         phase2, phase2_ctx, semantic_blocker=semantic_blocker
@@ -542,6 +557,12 @@ def _evaluate_one_input_policy(
             side="prompt",
         )
 
+    if policy.type == "rate_limit":
+        return _rate_limit_match(policy, context.agent_id)
+
+    if policy.type == "budget_limit":
+        return _budget_limit_match(policy, context.agent_id)
+
     # Tool / bash / MCP rules need response-side signals
     # (tool_names, tool_calls, mcp_targets) that ``PolicyContext``
     # does not carry today. Operators may still target them on the
@@ -549,6 +570,127 @@ def _evaluate_one_input_policy(
     # no-ops here so the call isn't broken. They fire normally
     # when ``phase`` includes ``response``.
     return None
+
+
+# ── Per-agent runtime limits (rate_limit / budget_limit) ───────────────
+#
+# Both kinds are Phase-1 deterministic: a counter compare against the
+# in-memory state ``egisai.policy.limits`` keeps (backend-synced
+# snapshot + local sliding window). They only have request-side
+# semantics — counting happens when a model call is about to leave
+# the process — so ``_evaluate_one_output_policy`` intentionally does
+# NOT dispatch them (an operator who force-targets one on the
+# response phase gets a silent no-op, same as ``deny_tool_call`` on
+# the request side).
+
+
+def _rate_limit_match(
+    policy: PolicyRule, agent_id: str
+) -> MatchedPolicyRecord | None:
+    """Block when the agent (or org) exceeded ``max_requests`` in the
+    configured sliding window.
+
+    Fail-open rules:
+    * ``max_requests`` missing / non-positive ⇒ rule is inert.
+    * ``scope="per_agent"`` with an unresolved agent identity ⇒
+      skip (we cannot attribute a per-agent counter; same posture
+      as the pause gate for unknown identities).
+    """
+    from egisai.policy import limits
+
+    config = policy.config or {}
+    try:
+        max_requests = int(config.get("max_requests") or 0)
+    except (TypeError, ValueError):
+        return None
+    if max_requests <= 0:
+        return None
+
+    try:
+        window = int(config.get("window_seconds") or 60)
+    except (TypeError, ValueError):
+        window = 60
+    if window not in limits.RATE_WINDOWS:
+        # Defensive: backend validation pins the window to the
+        # supported trio, but a hand-crafted config could carry
+        # anything. Snap UP to the smallest supported window that
+        # covers the requested one (strictest honest reading);
+        # beyond the largest window, use the largest.
+        window = next(
+            (w for w in sorted(limits.RATE_WINDOWS) if w >= window),
+            max(limits.RATE_WINDOWS),
+        )
+
+    scope = str(config.get("scope") or "per_agent")
+    if scope not in ("per_agent", "per_org"):
+        scope = "per_agent"
+    if scope == "per_agent" and not agent_id:
+        return None
+
+    current = limits.rate_limit_usage(agent_id, window, scope)
+    if current < max_requests:
+        return None
+
+    window_label = {60: "minute", 3600: "hour", 86400: "24 hours"}.get(
+        window, f"{window}s"
+    )
+    scope_label = "agent" if scope == "per_agent" else "organization"
+    return MatchedPolicyRecord(
+        name=policy.name,
+        type="rate_limit",
+        verdict="block",
+        reason_code="rate_limit_exceeded",
+        message=(
+            f"Rate limit exceeded: {current} of {max_requests} model "
+            f"calls in the last {window_label} for this {scope_label}."
+        ),
+    )
+
+
+def _budget_limit_match(
+    policy: PolicyRule, agent_id: str
+) -> MatchedPolicyRecord | None:
+    """Block when the agent (or org) spent ``max_usd`` in the window.
+
+    Spend is priced by the backend at ingest and arrives via the
+    usage snapshot; without a snapshot the rule fails open (the SDK
+    cannot observe cost locally — see ``limits.budget_usage_usd``).
+    """
+    from egisai.policy import limits
+
+    config = policy.config or {}
+    try:
+        max_usd = float(config.get("max_usd") or 0)
+    except (TypeError, ValueError):
+        return None
+    if max_usd <= 0:
+        return None
+
+    window = str(config.get("window") or "monthly")
+    if window not in limits.BUDGET_WINDOWS:
+        window = "monthly"
+
+    scope = str(config.get("scope") or "per_agent")
+    if scope not in ("per_agent", "per_org"):
+        scope = "per_agent"
+    if scope == "per_agent" and not agent_id:
+        return None
+
+    spend = limits.budget_usage_usd(agent_id, window, scope)
+    if spend is None or spend < max_usd:
+        return None
+
+    scope_label = "agent" if scope == "per_agent" else "organization"
+    return MatchedPolicyRecord(
+        name=policy.name,
+        type="budget_limit",
+        verdict="block",
+        reason_code="budget_exceeded",
+        message=(
+            f"Budget exceeded: ${spend:.4f} of the ${max_usd:.2f} "
+            f"{window} budget for this {scope_label} has been spent."
+        ),
+    )
 
 
 def _synthesize_decision(

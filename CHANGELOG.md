@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.46.0] — 2026-07-26
+
+### Added
+
+- **`rate_limit` policy kind — per-agent request caps.** Blocks
+  model calls once an agent (or the whole org, `scope: "per_org"`)
+  exceeds `max_requests` in a sliding window of 60, 3600, or 86400
+  seconds. Enforcement is Phase-1 deterministic and fully local on
+  the hot path: a backend-synced usage snapshot
+  (`GET /v1/sdk/usage`, polled every `EGISAI_USAGE_SYNC_SECONDS`,
+  default 15 s, while a limit rule is active) plus an in-process
+  sliding-window counter. Multi-process agents converge within one
+  sync interval; older backends without the endpoint degrade to
+  local-only counting. Blocked calls are not counted, so a retry
+  loop can never extend its own lockout — the window drains and the
+  agent recovers on its own.
+- **`budget_limit` policy kind — per-agent spend caps.** Blocks new
+  model calls once the ingest-priced spend (`cost_usd`, the same
+  numbers the dashboard cost cards read) crosses `max_usd` in a
+  UTC-calendar window (`daily` / `weekly` / `monthly`), per agent
+  or org-wide. Spend truth comes from the platform's usage
+  snapshot; without one the rule fails open (availability posture —
+  the SDK does not price calls locally).
+- **Identity propagation into side effects (`stamp_identity`,
+  opt-in).** With `egisai.init(stamp_identity=True)` (or
+  `EGISAI_STAMP_IDENTITY=1`), allowlisted artifact-creating tool
+  invocations gated by the Claude Agent SDK PreToolUse hook get an
+  `On-Behalf-Of: <agent-name> (egis:<agent-id>)` trailer appended
+  before execution — plain `git commit` commands via the Bash tool
+  (as a `--trailer` flag) and GitHub MCP `create_pull_request` /
+  `create_issue` / `push_files` / `create_or_update_file` bodies
+  and commit messages. Attribution then survives inside the
+  artifact (git history, PR body) itself. Conservative by design:
+  allowlist-only, idempotent, compound shell commands are never
+  touched, hostile display names are sanitized before embedding,
+  blocked invocations are never stamped, and any stamping failure
+  forwards the original input unchanged. The audit row previews the
+  post-mutation input and carries an additive `identity_stamped`
+  marker. Default off — nothing about tool traffic changes without
+  the opt-in.
+
 ## [0.45.0] — 2026-07-24
 
 ### Added

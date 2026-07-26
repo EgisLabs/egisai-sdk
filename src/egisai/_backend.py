@@ -177,6 +177,30 @@ def fetch_policies(
     return body.get("etag"), body.get("rules", []), paused, ungoverned
 
 
+def fetch_usage() -> dict[str, Any] | None:
+    """Pull the per-org usage snapshot for ``rate_limit`` / ``budget_limit``.
+
+    Returns the parsed JSON payload, or ``None`` on any non-200 —
+    including 404 from backends that pre-date ``/v1/sdk/usage``.
+    Callers (the ``egisai.policy.limits`` sync worker) treat ``None``
+    as "keep the previous snapshot" so limit enforcement degrades to
+    local-only counting instead of erroring. No 429-retry wrapper:
+    the worker retries on its own schedule anyway, and a retry storm
+    from many SDK processes would defeat the endpoint's purpose.
+    """
+    try:
+        r = get_client().get("/v1/sdk/usage")
+    except Exception:  # noqa: BLE001
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        body = r.json()
+    except Exception:  # noqa: BLE001
+        return None
+    return body if isinstance(body, dict) else None
+
+
 def ensure_agent(
     *,
     name: str,

@@ -50,6 +50,12 @@ def reset_sdk() -> Iterator[None]:
 
     _routing.reset()
 
+    # 0.46.0 — rate_limit / budget_limit: stop the usage-sync worker
+    # and wipe local counters + the backend snapshot.
+    from egisai.policy import limits
+
+    limits.clear()
+
     # The init module also caches whether it's been called via _CONFIG; the
     # logger module's queue persists between tests, so we drain it.
     while not _logger._q.empty():
@@ -137,6 +143,12 @@ class FakeBackend:
         # request body lands on ``route_requests``.
         self.route_response: dict[str, Any] = {"routed": False}
         self.route_requests: list[dict[str, Any]] = []
+        # Usage snapshot for rate_limit / budget_limit (0.46.0).
+        # ``None`` ⇒ the endpoint 404s, mimicking a backend that
+        # pre-dates ``/v1/sdk/usage``. ``usage_calls`` counts hits so
+        # tests can assert the sync worker's polling behavior.
+        self.usage_response: dict[str, Any] | None = None
+        self.usage_calls = 0
         self._next_agent_serial = 100
 
     def set_rules(
@@ -186,6 +198,11 @@ class FakeBackend:
             except Exception:
                 self.route_requests.append({})
             return httpx.Response(200, json=self.route_response)
+        if path.endswith("/v1/sdk/usage"):
+            self.usage_calls += 1
+            if self.usage_response is None:
+                return httpx.Response(404)
+            return httpx.Response(200, json=self.usage_response)
         if path.endswith("/v1/sdk/policies"):
             if request.headers.get("if-none-match") == self.etag:
                 return httpx.Response(304)

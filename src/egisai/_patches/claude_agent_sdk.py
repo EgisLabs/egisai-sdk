@@ -95,7 +95,7 @@ from egisai._auto_agent import (
     canonicalize_identity_text,
     identity_scope,
 )
-from egisai._config import get_config
+from egisai._config import get_config, get_config_optional
 from egisai._context import (
     get_init_latency,
     get_policy_checked,
@@ -523,14 +523,25 @@ def _hooks_supported() -> bool:
             return False
 
 
-def _hook_response_allow() -> dict[str, Any]:
-    """Build the SyncHookJSONOutput for an allow decision."""
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-        }
+def _hook_response_allow(
+    updated_input: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the SyncHookJSONOutput for an allow decision.
+
+    ``updated_input`` (identity stamping — see
+    ``_patches._identity_stamp``) rides on the CLI's
+    ``updatedInput`` rewrite channel. CLI versions that pre-date
+    the key ignore it and run the tool with its original input —
+    the stamp silently doesn't land, which is the documented
+    degradation (never an error, never a changed verdict).
+    """
+    out: dict[str, Any] = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
     }
+    if updated_input is not None:
+        out["updatedInput"] = updated_input
+    return {"hookSpecificOutput": out}
 
 
 def _hook_response_deny(reason: str) -> dict[str, Any]:
@@ -550,6 +561,38 @@ def _hook_response_deny(reason: str) -> dict[str, Any]:
             "permissionDecisionReason": reason,
         }
     }
+
+
+def _maybe_stamp_identity(
+    tool_name: str,
+    tool_input: Any,
+    record: IdentityRecord | None,
+) -> dict[str, Any] | None:
+    """Identity stamping for allowed tool invocations (opt-in).
+
+    Returns the stamped copy of ``tool_input`` when ALL of these
+    hold: the operator enabled ``stamp_identity``, the turn has a
+    resolved agent identity, and the tool is on the conservative
+    allowlist in ``_identity_stamp``. Otherwise ``None`` — the
+    caller forwards the original input untouched. Never raises.
+    """
+    cfg = get_config_optional()
+    if cfg is None or not cfg.stamp_identity:
+        return None
+    if record is None or not record.agent_id:
+        return None
+    try:
+        from egisai._patches._identity_stamp import stamp_tool_input
+
+        return stamp_tool_input(
+            tool_name,
+            tool_input,
+            agent_name=record.display_name,
+            agent_id=record.agent_id,
+        )
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("identity stamping failed; forwarding original input", exc_info=True)
+        return None
 
 
 def _build_pretooluse_callback(
@@ -704,6 +747,20 @@ def _build_pretooluse_callback(
                 )
                 cur_pol_in, cur_pol_out = get_policy_usage()
 
+                # Identity stamping (opt-in, allowed tools only).
+                # Computed BEFORE the audit row is built so the
+                # preview reflects the post-mutation input that
+                # actually executes — the same audit-before-persist
+                # contract sanitization follows.
+                stamped_input: dict[str, Any] | None = None
+                if decision.verdict != "block":
+                    stamped_input = _maybe_stamp_identity(
+                        tool_name, tool_input, record
+                    )
+                effective_input = (
+                    stamped_input if stamped_input is not None else tool_input
+                )
+
                 # Build + dispatch the tool_call step row. We use
                 # the same shape as the legacy ``_dispatch_tool_call_step``
                 # path but stamp ``enforcement_status="enforced"``
@@ -733,7 +790,7 @@ def _build_pretooluse_callback(
                     # ``request_text`` silently drops the value on the
                     # floor (column name on the DB ≠ wire key). Bug
                     # fix in 0.27.1 — see CHANGELOG.
-                    "prompt_preview": _safe_preview_tool_input(tool_input),
+                    "prompt_preview": _safe_preview_tool_input(effective_input),
                     "verdict": "allow",
                     "enforcement_status": ENFORCEMENT_ENFORCED,
                     "policy_latency_ms": elapsed_policy_ms,
@@ -750,6 +807,11 @@ def _build_pretooluse_callback(
                 }
                 if hook_init_ms > 0:
                     ev["init_latency_ms"] = hook_init_ms
+                if stamped_input is not None:
+                    # Additive audit marker — backends that pre-date
+                    # the key drop it at ingest; newer ones can
+                    # surface a "Stamped" chip on the tool row.
+                    ev["identity_stamped"] = True
 
                 ev["response_decision"] = _decision_block(decision)
                 if decision.verdict == "block":
@@ -777,7 +839,7 @@ def _build_pretooluse_callback(
                     )
                     return _hook_response_deny(reason)
 
-                return _hook_response_allow()
+                return _hook_response_allow(stamped_input)
         finally:
             if run_token is not None:
                 try:
