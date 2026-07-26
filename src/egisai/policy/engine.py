@@ -261,7 +261,7 @@ _DETERMINISTIC_KINDS = frozenset(
         "deny_mcp_call",
         "deny_db_query",
         "deny_financial_action",
-        # Per-agent runtime limits (0.46.0). Pure in-memory counter
+        # Per-agent runtime limits (0.46.1). Pure in-memory counter
         # compares against the backend-synced usage snapshot — no
         # network on the hot path (see ``egisai.policy.limits``).
         "rate_limit",
@@ -635,15 +635,18 @@ def _rate_limit_match(
         window, f"{window}s"
     )
     scope_label = "agent" if scope == "per_agent" else "organization"
+    # Operator-set ``config.message`` wins (same contract as every
+    # other kind); the dynamic count-carrying text is the default.
+    message = str(config.get("message") or "").strip() or (
+        f"Rate limit exceeded: {current} of {max_requests} model "
+        f"calls in the last {window_label} for this {scope_label}."
+    )
     return MatchedPolicyRecord(
         name=policy.name,
         type="rate_limit",
         verdict="block",
         reason_code="rate_limit_exceeded",
-        message=(
-            f"Rate limit exceeded: {current} of {max_requests} model "
-            f"calls in the last {window_label} for this {scope_label}."
-        ),
+        message=message,
     )
 
 
@@ -681,15 +684,18 @@ def _budget_limit_match(
         return None
 
     scope_label = "agent" if scope == "per_agent" else "organization"
+    # Operator-set ``config.message`` wins (same contract as every
+    # other kind); the dynamic spend-carrying text is the default.
+    message = str(config.get("message") or "").strip() or (
+        f"Budget exceeded: ${spend:.4f} of the ${max_usd:.2f} "
+        f"{window} budget for this {scope_label} has been spent."
+    )
     return MatchedPolicyRecord(
         name=policy.name,
         type="budget_limit",
         verdict="block",
         reason_code="budget_exceeded",
-        message=(
-            f"Budget exceeded: ${spend:.4f} of the ${max_usd:.2f} "
-            f"{window} budget for this {scope_label} has been spent."
-        ),
+        message=message,
     )
 
 

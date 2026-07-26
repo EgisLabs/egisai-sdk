@@ -194,6 +194,14 @@ class TestRateLimitEngine:
         decision = evaluate_policies([_rate_rule(3)], _ctx())
         assert decision.verdict == "allow"
 
+    def test_operator_message_overrides_dynamic_default(self) -> None:
+        limits.record_model_call(AGENT_A)
+        decision = evaluate_policies(
+            [_rate_rule(1, message="Slow down, agent.")], _ctx()
+        )
+        assert decision.verdict == "block"
+        assert decision.message == "Slow down, agent."
+
     def test_per_agent_counters_are_isolated(self) -> None:
         for _ in range(5):
             limits.record_model_call(AGENT_A)
@@ -273,6 +281,18 @@ class TestBudgetLimitEngine:
         )
         decision = evaluate_policies([_budget_rule(50.0)], _ctx())
         assert decision.verdict == "allow"
+
+    def test_operator_message_overrides_dynamic_default(self) -> None:
+        limits.replace_snapshot(
+            _snapshot(
+                agents={AGENT_A: {"spend_usd": {"daily": "99.00"}}},
+            )
+        )
+        rule = _budget_rule(50.0)
+        rule.config["message"] = "Out of budget for today."
+        decision = evaluate_policies([rule], _ctx())
+        assert decision.verdict == "block"
+        assert decision.message == "Out of budget for today."
 
     def test_fails_open_without_snapshot(self) -> None:
         decision = evaluate_policies([_budget_rule(0.01)], _ctx())
