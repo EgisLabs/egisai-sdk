@@ -49,10 +49,54 @@ _source: contextvars.ContextVar[str] = contextvars.ContextVar(
 _policy_checked: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "egisai_checked", default=False
 )
+class _PolicyUsageAccumulator:
+    """Thread-safe, call-scoped token accumulator.
+
+    Deliberately **mutable**. The policy engine fans judge calls out
+    across worker threads, and threads do not inherit context vars —
+    a worker's ``ContextVar.set()`` is written into that thread's own
+    (initially empty) context and is invisible to the gate that later
+    reads it. Before this type existed the accumulator was a plain
+    ``tuple`` rewritten via ``.set()``, so every judge call made on a
+    worker thread silently dropped its ``policy_tokens_in`` /
+    ``policy_tokens_out`` off the audit row.
+
+    The fix has two halves and needs both:
+
+    1. This object is mutated in place instead of being replaced, and
+    2. fan-out sites submit work through ``contextvars.copy_context()``,
+       which copies the var *mapping* but shares the value
+       *references* — so the worker and the gate mutate the same
+       accumulator.
+
+    ``reset_policy_usage`` installs a brand-new instance per governed
+    call rather than zeroing this one, so a stale reference captured
+    by a previous call's copied context can never bleed into the next
+    call's counts.
+    """
+
+    __slots__ = ("_lock", "_tokens_in", "_tokens_out")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._tokens_in = 0
+        self._tokens_out = 0
+
+    def add(self, tokens_in: int, tokens_out: int) -> None:
+        with self._lock:
+            self._tokens_in += max(0, int(tokens_in or 0))
+            self._tokens_out += max(0, int(tokens_out or 0))
+
+    def snapshot(self) -> tuple[int, int]:
+        with self._lock:
+            return (self._tokens_in, self._tokens_out)
+
+
 # Per-call accumulator for tokens consumed by policy-side LLM calls
-# (e.g. the ``semantic_guard`` judge).
-_policy_usage: contextvars.ContextVar[tuple[int, int]] = contextvars.ContextVar(
-    "egisai_policy_usage", default=(0, 0)
+# (e.g. the ``semantic_guard`` judge). ``None`` until a governed call
+# installs one; readers treat the absent case as ``(0, 0)``.
+_policy_usage: contextvars.ContextVar[_PolicyUsageAccumulator | None] = (
+    contextvars.ContextVar("egisai_policy_usage", default=None)
 )
 
 # Per-call accumulator for **init-time wall-clock** the gate paid that
@@ -276,20 +320,36 @@ def set_policy_checked(v: bool) -> None:
 
 
 def reset_policy_usage() -> None:
-    """Zero out the per-call policy-step token accumulator."""
-    _policy_usage.set((0, 0))
+    """Install a fresh per-call policy-step token accumulator.
+
+    Replaces the accumulator rather than zeroing it in place — see
+    :class:`_PolicyUsageAccumulator` for why identity matters when
+    judge calls run on worker threads.
+    """
+    _policy_usage.set(_PolicyUsageAccumulator())
 
 
 def add_policy_usage(tokens_in: int, tokens_out: int) -> None:
-    """Add tokens to the per-call policy-step accumulator."""
-    cur_in, cur_out = _policy_usage.get()
-    _policy_usage.set((cur_in + max(0, int(tokens_in or 0)),
-                       cur_out + max(0, int(tokens_out or 0))))
+    """Add tokens to the per-call policy-step accumulator.
+
+    Safe to call from a worker thread **provided** the caller entered
+    a ``contextvars.copy_context()`` copied from the gate's context;
+    the copy shares this accumulator by reference so the mutation is
+    visible to the gate. Without an accumulator installed (a bare
+    call outside any governed request) one is created lazily so the
+    call is still a no-op rather than an error.
+    """
+    acc = _policy_usage.get()
+    if acc is None:
+        acc = _PolicyUsageAccumulator()
+        _policy_usage.set(acc)
+    acc.add(tokens_in, tokens_out)
 
 
 def get_policy_usage() -> tuple[int, int]:
     """Return ``(tokens_in, tokens_out)`` consumed by the policy step."""
-    return _policy_usage.get()
+    acc = _policy_usage.get()
+    return (0, 0) if acc is None else acc.snapshot()
 
 
 def reset_init_latency() -> None:

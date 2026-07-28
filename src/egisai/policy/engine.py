@@ -6,7 +6,10 @@ Evaluates ``PolicyRule`` objects against an input or output
 
 from __future__ import annotations
 
+import contextvars
+import logging
 import re
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
@@ -14,6 +17,8 @@ from typing import Any
 from egisai.policy import pii as pii_scanner
 from egisai.policy._regex_safe import safe_search
 from egisai.policy.semantic import SemanticBlocker
+
+LOGGER = logging.getLogger("egisai.policy.engine")
 
 
 @dataclass(frozen=True)
@@ -495,12 +500,63 @@ def _collect_input_matches(
     context: PolicyContext,
     semantic_blocker: SemanticBlocker | None,
 ) -> _PhaseMatches:
+    """Walk a list of prompt-side rules and accumulate matches.
+
+    Phase 1 (``semantic_blocker is None``) runs inline: the checks are
+    pure-Python regex/math where a thread hand-off would cost more
+    than the work itself.
+
+    Phase 2 fans out. Each ``semantic_guard`` policy is an independent
+    judge round-trip against the *same* prompt, so N policies used to
+    cost N round-trips **serially** — policy latency grew linearly
+    with the number of guards an operator configured, which is the
+    one thing a runtime governance layer cannot afford. Concurrency
+    collapses that to roughly the slowest single call.
+
+    Accuracy is unchanged by construction: every judge call carries
+    the byte-identical payload it carried when this loop was serial,
+    and results are re-walked in policy order below (``_fan_out``
+    guarantees input ordering) so ``_synthesize_decision`` still
+    picks the same primary ``matched_policy``. There is no
+    short-circuit to lose — this walk never broke early even when an
+    earlier policy blocked, so the call count is identical too.
+    """
     out = _PhaseMatches()
-    for policy in policies:
-        rec = _evaluate_one_input_policy(policy, context, semantic_blocker)
+    if semantic_blocker is None or len(policies) < 2:
+        for policy in policies:
+            rec = _evaluate_one_input_policy(policy, context, semantic_blocker)
+            if rec is not None:
+                out.add(rec)
+        return out
+
+    results = _fan_out(
+        [
+            _bind_input_policy(policy, context, semantic_blocker)
+            for policy in policies
+        ],
+        max_workers=_judge_budget.get(),
+    )
+    for rec in results:
         if rec is not None:
             out.add(rec)
     return out
+
+
+def _bind_input_policy(
+    policy: PolicyRule,
+    context: PolicyContext,
+    semantic_blocker: SemanticBlocker | None,
+) -> Callable[[], MatchedPolicyRecord | None]:
+    """Freeze one prompt-side evaluation into a zero-arg callable.
+
+    A named factory rather than an inline ``lambda`` in a
+    comprehension — the loop variable would otherwise be captured by
+    reference and every task would evaluate the *last* policy.
+    """
+    def run() -> MatchedPolicyRecord | None:
+        return _evaluate_one_input_policy(policy, context, semantic_blocker)
+
+    return run
 
 
 def _evaluate_one_input_policy(
@@ -895,27 +951,20 @@ def _semantic_guard_match(
                 ),
             )
 
-        # Parallel path. ``max_workers`` is min(8, batch size) so a
-        # 3-tool turn doesn't spawn 8 idle threads.
-        max_workers = min(_TOOL_JUDGE_MAX_WORKERS, len(normalized))
-        with ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="egisai-judge",
-        ) as pool:
-            futures = [
-                pool.submit(semantic_blocker.check, synthesized, policy.config)
+        # Parallel path, via the shared ``_fan_out`` primitive. It
+        # owns input-order preservation, per-task context copying (so
+        # judge token spend still lands on the audit row — worker
+        # threads don't inherit context vars), and per-task fail-open.
+        # ``_judge_budget`` is the remaining concurrency this call may
+        # use, already divided down if Phase 2 fanned out across
+        # policies above us.
+        results = _fan_out(
+            [
+                _bind_tool_judge(semantic_blocker, synthesized, policy.config)
                 for _, synthesized in normalized
-            ]
-            results: list[Any] = []
-            for f in futures:
-                try:
-                    results.append(f.result())
-                except Exception:  # noqa: BLE001
-                    # A single judge call failed; treat as no-match
-                    # for that tool and continue. Honours the
-                    # platform-level fail-open contract — one dead
-                    # tool eval doesn't poison the whole batch.
-                    results.append(None)
+            ],
+            max_workers=_judge_budget.get(),
+        )
 
         for (name, _synthesized), match in zip(normalized, results, strict=True):
             if match is None:
@@ -942,6 +991,106 @@ def _semantic_guard_match(
 # constant is module-level so tests / advanced operators could
 # monkeypatch it temporarily without forking the engine.
 _TOOL_JUDGE_MAX_WORKERS = 8
+
+# Remaining concurrency budget for judge round-trips inside the
+# current governed call.
+#
+# Two levels of the engine fan out to the judge: Phase 2 fans out
+# across *policies* (``_collect_*_matches``) and each
+# ``semantic_guard`` policy fans out across *tool calls*
+# (``_semantic_guard_match``). Left uncoordinated, a 3-guard turn
+# with 6 tool calls would issue 18 simultaneous round-trips and
+# rate-limit itself into ``Retry-After`` storms.
+#
+# The outer level divides its budget among the tasks it spawns and
+# publishes the per-task share here; the inner level reads it as its
+# own ceiling. The product therefore stays bounded by
+# ``_TOOL_JUDGE_MAX_WORKERS`` no matter how the work is shaped.
+#
+# A context var (rather than a parameter threaded through five
+# signatures) keeps ``_semantic_guard_match``'s public-ish shape
+# untouched — tests call it directly with keyword args. Each fan-out
+# task runs in its own copied context, so a task writing its share
+# here cannot disturb its siblings.
+_judge_budget: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "egisai_judge_budget", default=_TOOL_JUDGE_MAX_WORKERS
+)
+
+
+def _bind_tool_judge(
+    semantic_blocker: SemanticBlocker,
+    synthesized: str,
+    config: dict[str, Any],
+) -> Callable[[], Any]:
+    """Freeze one tool-call judge round-trip into a zero-arg callable."""
+    def run() -> Any:
+        return semantic_blocker.check(synthesized, config)
+
+    return run
+
+
+def _fan_out(
+    tasks: list[Callable[[], Any]],
+    *,
+    max_workers: int,
+) -> list[Any]:
+    """Run ``tasks`` concurrently; return results in **input** order.
+
+    The single fan-out primitive for judge round-trips. Contract:
+
+    * **Input order is preserved.** Callers resolve first-match
+      semantics by walking the returned list, so completion order
+      must never influence which policy a verdict is attributed to.
+    * **Each task gets a fresh ``contextvars.copy_context()``.**
+      Worker threads start with an *empty* context, so a judge call
+      made on one would otherwise lose the gate's per-call token
+      accumulator (see ``_PolicyUsageAccumulator``). The copy shares
+      value references, so the worker and the gate mutate the same
+      accumulator. The copy must be per-task: one ``Context`` cannot
+      be entered by two threads at once.
+    * **A raising task yields ``None``.** One failed judge call must
+      not poison the batch — same fail-open contract the platform
+      applies to a judge outage.
+    * **Degenerate cases run inline.** A single task, or a budget of
+      one, skips executor construction entirely so the common
+      one-policy / one-tool turn pays no threading overhead.
+    """
+    if not tasks:
+        return []
+    if len(tasks) == 1 or max_workers <= 1:
+        results: list[Any] = []
+        for task in tasks:
+            try:
+                results.append(task())
+            except Exception:  # noqa: BLE001
+                LOGGER.debug("judge task failed; treating as no-match", exc_info=True)
+                results.append(None)
+        return results
+
+    workers = min(max_workers, len(tasks))
+    # Share the remaining budget among the tasks we're about to
+    # spawn so any nested fan-out inside them stays inside the cap.
+    share = max(1, max_workers // workers)
+
+    def _run(task: Callable[[], Any]) -> Any:
+        _judge_budget.set(share)
+        return task()
+
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="egisai-judge"
+    ) as pool:
+        futures = [
+            pool.submit(contextvars.copy_context().run, _run, task)
+            for task in tasks
+        ]
+        out: list[Any] = []
+        for f in futures:
+            try:
+                out.append(f.result())
+            except Exception:  # noqa: BLE001
+                LOGGER.debug("judge task failed; treating as no-match", exc_info=True)
+                out.append(None)
+        return out
 
 
 def _synthesize_tool_call_text(name: str, args: Any) -> str:
@@ -1230,13 +1379,46 @@ def _collect_output_matches(
     blocker. Each phase's records are appended to the same
     ``_PhaseMatches`` shape used on the input side, so the
     downstream synthesizer is one path for both evaluators.
+
+    Phase 2 fans out across policies for the same reason (and with
+    the same accuracy-neutrality argument) as
+    ``_collect_input_matches`` — see its docstring.
     """
     out = _PhaseMatches()
-    for policy in policies:
-        rec = _evaluate_one_output_policy(policy, context, semantic_blocker)
+    if semantic_blocker is None or len(policies) < 2:
+        for policy in policies:
+            rec = _evaluate_one_output_policy(policy, context, semantic_blocker)
+            if rec is not None:
+                out.add(rec)
+        return out
+
+    results = _fan_out(
+        [
+            _bind_output_policy(policy, context, semantic_blocker)
+            for policy in policies
+        ],
+        max_workers=_judge_budget.get(),
+    )
+    for rec in results:
         if rec is not None:
             out.add(rec)
     return out
+
+
+def _bind_output_policy(
+    policy: PolicyRule,
+    context: OutputPolicyContext,
+    semantic_blocker: SemanticBlocker | None,
+) -> Callable[[], MatchedPolicyRecord | None]:
+    """Freeze one response-side evaluation into a zero-arg callable.
+
+    Sibling of ``_bind_input_policy``; see it for why this isn't a
+    ``lambda`` inside the comprehension.
+    """
+    def run() -> MatchedPolicyRecord | None:
+        return _evaluate_one_output_policy(policy, context, semantic_blocker)
+
+    return run
 
 
 def _evaluate_one_output_policy(

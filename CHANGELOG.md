@@ -7,7 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.47.3] — 2026-07-27
+## [0.48.0] — 2026-07-28
+
+### Changed
+
+- **Policy latency no longer grows with the number of
+  `semantic_guard` policies.** Phase 2 previously issued one judge
+  round-trip per policy, back to back, so an org with three guards
+  paid three serial network calls on every governed call and an org
+  with eight paid eight. Those round-trips now run concurrently and
+  the phase costs roughly its slowest single call instead of the sum.
+
+  Accuracy is unchanged by construction: every judge call carries the
+  byte-identical payload it carried when the walk was serial, and
+  results are re-read in policy order, so `matched_policy` still names
+  the same rule. The call count is identical too — this walk never
+  short-circuited on an earlier block, so nothing was lost by making
+  it parallel.
+
+  Concurrency across policies and concurrency across tool calls now
+  share one budget, so a many-guard × many-tool turn can't fan out
+  into a rate-limit storm.
+
+### Added
+
+- **Judge verdicts are memoized.** Repeat questions — an agent loop
+  resending a dominant system prompt, a retried tool call — are
+  answered from memory instead of the network.
+
+  Safe for governance because the judge is a temperature-0 classifier
+  over exactly three inputs, and the cache key is all three (prompt
+  text, intent list, threshold). Identical inputs have an identical
+  correct answer. Editing a policy changes its intents or threshold,
+  which changes the key, so a stale rule cannot keep firing —
+  invalidation is structural rather than a race against the TTL.
+
+  Deliberately excluded: judge outages (a network blip must not govern
+  traffic for a whole window) and token spend (a cache hit paid no
+  tokens, so `policy_tokens_in` / `policy_tokens_out` keep meaning
+  "what this call actually cost").
+
+  Tune with `EGISAI_JUDGE_CACHE_TTL_SECS` (default `60`). Set it to
+  `0` to disable memoization entirely and have every call judged.
+
+### Fixed
+
+- **`policy_tokens_in` / `policy_tokens_out` were silently dropped for
+  judge calls made on worker threads.** The per-call token accumulator
+  lived in a `ContextVar` rewritten with `.set()`. Worker threads start
+  with an empty context and never propagate writes back, so token spend
+  from the parallel `tool_calls` judge path (0.24+) vanished from the
+  audit row. The accumulator is now a mutable, lock-guarded object and
+  every fan-out task runs inside a copied context, so spend is
+  attributed no matter which thread paid it.
 
 ### Added
 

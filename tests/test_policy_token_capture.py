@@ -198,12 +198,17 @@ def test_policy_tokens_dont_leak_between_calls(fake_backend) -> None:
     blocker = _get_semantic_blocker()
     blocker._http_client = httpx.Client(transport=httpx.MockTransport(transport))
 
-    for _ in range(2):
+    # Distinct prompt per call. The judge memoizes verdicts keyed on
+    # (prompt_text, intents, threshold), so reusing one prompt here
+    # would make the second call a cache hit that correctly books zero
+    # tokens — which would test the cache instead of the per-call
+    # accumulator reset this case is about.
+    for prompt in ("anything", "something else"):
         gate_call(
             source="openai",
             target="openai.chat.completions.create",
             model="gpt-4",
-            prompt_text="anything",
+            prompt_text=prompt,
             stream=False,
             payload={"messages": [{"role": "user", "content": "x"}]},
             forward=lambda: SimpleNamespace(),
