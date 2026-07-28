@@ -100,6 +100,34 @@ If you find a way to exfiltrate raw PII, OR to bypass a policy
 that should have blocked or sanitised, that's a Critical-severity
 issue and we want to know within hours.
 
+## Availability posture (what happens when EgisAI is down)
+
+The SDK never breaks your call path. Every EgisAI dependency
+degrades instead of failing:
+
+| Dependency unreachable | Behaviour |
+|---|---|
+| Handshake / policy refresh at `init()` | Offline mode — the SDK keeps running with the last-known-good policy cache (empty on a cold start). |
+| Audit log ingest | Events buffer in a bounded queue and drain later; oldest are dropped past the cap. Never blocks a call. |
+| Agent registration | The call proceeds unattributed-but-governed. The identity is backed off and retried later, so an outage costs one attempt per window, not one per call. |
+| `semantic_guard` judge | Governed by `semantic_on_outage` — `"allow"` (default) or `"block"`. |
+| Inline Gateway (gateway mode) | Governed by `gateway_on_outage` — `"local"` (default) re-runs the call under in-process governance; `"fail"` propagates the error. Only transport failures and HTTP 502/503/504 qualify; a 4xx is a decision and is never retried locally. |
+
+Two invariants hold regardless:
+
+- **PII detection never degrades.** It is pure-local, so no
+  network failure can let raw PII through. If the PII engine
+  itself errors, the call is treated as if PII *was* detected
+  (fail closed).
+- **An enforced decision is never re-litigated.** A block stays a
+  block. Nothing in the availability path converts a refusal into
+  an allowed call.
+
+Choosing `semantic_on_outage="block"` and `gateway_on_outage="fail"`
+makes the SDK fail closed on both network-dependent checks — the
+right choice when a refused call is preferable to a call governed
+by local, possibly stale policy.
+
 ## Agent descriptor (system-prompt excerpt)
 
 To replace the opaque `Auto-detected by SDK …` placeholder with a

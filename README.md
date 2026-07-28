@@ -195,6 +195,7 @@ egisai.init(..., on_block="stub")
 | `enable_http_fallback` | `True` | Optional patching of `httpx` / `requests` for broader HTTP visibility where enabled. |
 | `auto_stack_hints` | `"loose"` | Controls the stack-frame inspector used by the agent identity resolver. `"loose"` (default) honors common conventions; `"strict"` requires an explicit `__egisai_agent__` marker; `"off"` disables stack inspection. |
 | `gateway` | `False` | Route OpenAI chat-completions calls through the platform's inline Gateway instead of evaluating policies in-process — see "Gateway mode" below. |
+| `gateway_on_outage` | `"local"` | Gateway mode only: what happens when the Gateway itself can't be reached. `"local"` re-runs the call on your own provider client under in-process governance; `"fail"` propagates the error. See "Gateway mode" below. |
 | `stamp_identity` | `False` | Opt-in identity propagation: allowlisted artifact-creating tool invocations (git commits via the Claude Agent SDK's Bash tool, GitHub MCP pull requests / issues / file commits) get an `On-Behalf-Of: <agent> (egis:<id>)` trailer appended before execution, so agent attribution survives inside the artifact itself. |
 | `quiet` | `False` | Set `True` to suppress the one-line startup banner on stderr. |
 
@@ -205,6 +206,7 @@ egisai.init(..., on_block="stub")
 | `EGISAI_API_KEY` | SDK API key if not passed as `api_key=`. |
 | `EGISAI_BASE_URL` | Control plane base URL override when supplied by EgisAI. |
 | `EGISAI_GATEWAY` | Set `1` to enable Gateway mode without a code change. |
+| `EGISAI_GATEWAY_ON_OUTAGE` | `local` or `fail` — Gateway-mode behaviour when the Gateway is unreachable (see "Gateway mode"). |
 | `EGISAI_STAMP_IDENTITY` | Set `1` to enable identity stamping (`stamp_identity`) without a code change. |
 | `EGISAI_USAGE_SYNC_SECONDS` | How often the SDK refreshes the usage snapshot backing `rate_limit` / `budget_limit` rules (default `15`). |
 
@@ -256,6 +258,25 @@ What changes and what doesn't:
 - **Same policies, evaluated server-side.** The Gateway runs the identical engine, sanitizes/blocks inline, and writes the audit row itself; the local gate is skipped for rerouted calls so nothing is governed twice.
 - **Everything else stays local.** The Responses API, Anthropic / Google / Bedrock SDKs, agent frameworks, and MCP keep the normal in-process governance path. Azure OpenAI clients are never rerouted.
 - **Fail open.** If the reroute can't be constructed, the call falls back to in-process governance from the locally cached policies — your call path never breaks because of the mode switch.
+
+### If the Gateway is unreachable
+
+Rerouting puts the Gateway inline on your call path, so its availability becomes yours. `gateway_on_outage` decides what happens when it can't be reached:
+
+| Setting | Behaviour |
+|---------|-----------|
+| `"local"` (default) | Re-run the call against your own provider client and govern it **in-process** from the last-known-good policy cache. Your traffic keeps flowing; governance degrades from server-side to client-side. |
+| `"fail"` | Let the error propagate. Choose this when the Gateway must remain a hard enforcement boundary and a refused call is preferable to a locally governed one. |
+
+Only "we never got an answer" triggers the fallback — a transport failure, or HTTP 502 / 503 / 504. Specifically:
+
+- **A 4xx is never retried locally.** It's a decision: a policy block, an auth or entitlement refusal, a rate limit. Retrying it would turn an enforced refusal into an allowed call.
+- **A bare 500 also propagates.** Unlike 502/503/504 it can be raised *after* the Gateway already forwarded your request upstream, so a retry could bill you twice.
+- **Your client must be able to reach the provider directly.** In BYOK vault mode the provider key lives server-side, so there's nothing to fall back to and the call fails with the Gateway's own error rather than a confusing 401. The same applies to `egisai.Client`, which targets the Gateway by construction.
+
+What you give up during a fallback: policies created since the SDK last refreshed its cache aren't visible, and the audit row is written by the SDK rather than the Gateway. What you keep: the same policy engine, fully local PII detection, and your application staying up. Every fallback logs a warning and increments `egisai.diagnostics()["gateway_fallback_total"]` — alert on that counter, because a non-zero value means enforcement is running on cached policy.
+
+Server-side there's a matching control. If the Gateway is reachable but can't read your organization's policies, it first falls back to the last policy set it loaded successfully for that agent. If even that is unavailable, the **Gateway page** setting decides: refuse the call with a `503` (the default — enforcement first), or forward it ungoverned with an `X-Egis-Degraded` response header (availability first).
 
 ---
 

@@ -12,6 +12,7 @@ import threading
 from typing import Any
 
 from egisai import __version__
+from egisai import _gateway as _gateway_mod
 from egisai._backend import close_client, handshake
 from egisai._config import EgisaiConfig, get_config_optional, set_config, update_config
 from egisai._logger import start_worker as start_logger
@@ -61,6 +62,7 @@ def init(
     auto_stack_hints: str = "loose",
     auto_describe: bool | None = None,
     gateway: bool | None = None,
+    gateway_on_outage: str | None = None,
     stamp_identity: bool | None = None,
     quiet: bool = False,
 ) -> None:
@@ -148,6 +150,23 @@ def init(
         in-process path. Requires the org's ``inline_gateway``
         feature. Defaults to ``False``; also settable via the
         ``EGISAI_GATEWAY`` env var.
+    gateway_on_outage
+        What happens in gateway mode when the Gateway can't be
+        reached (connection refused, timeout, HTTP 502 / 503 / 504).
+
+        * ``"local"`` (default) — re-run the call against your own
+          provider client and govern it in-process from the
+          last-known-good policy cache. Your call path survives an
+          Egis outage; governance degrades from server-side to
+          client-side and the audit row is written by the SDK. Only
+          possible when your client carries a real provider key —
+          BYOK-vault callers have no upstream credential locally.
+        * ``"fail"`` — let the error propagate, keeping the Gateway a
+          hard enforcement boundary.
+
+        A 4xx from the Gateway is never retried locally under either
+        setting: it's a decision (policy block, auth, quota), not an
+        outage. Also settable via ``EGISAI_GATEWAY_ON_OUTAGE``.
     stamp_identity
         Propagate agent identity into the durable artifacts agents
         create. When enabled, allowlisted tool invocations (git
@@ -185,6 +204,20 @@ def init(
             raise ValueError(
                 f"auto_stack_hints must be 'strict', 'loose', or 'off', "
                 f"got {auto_stack_hints!r}"
+            )
+        # ``gateway_on_outage`` resolves explicit kwarg → env var →
+        # default "local". Validated the same way as ``on_block`` so a
+        # typo fails at init() rather than silently disabling the
+        # fallback during the outage it exists for.
+        resolved_gateway_on_outage = (
+            gateway_on_outage
+            or os.getenv("EGISAI_GATEWAY_ON_OUTAGE")
+            or "local"
+        ).strip().lower()
+        if resolved_gateway_on_outage not in ("local", "fail"):
+            raise ValueError(
+                f"gateway_on_outage must be 'local' or 'fail', "
+                f"got {resolved_gateway_on_outage!r}"
             )
 
         # ``auto_describe`` resolves explicit kwarg → env var → default
@@ -242,8 +275,13 @@ def init(
             auto_describe=resolved_auto_describe,
             stamp_identity=resolved_stamp_identity,
             gateway_mode=resolved_gateway,
+            gateway_on_outage=resolved_gateway_on_outage,  # type: ignore[arg-type]
         )
         set_config(cfg)
+        # A fresh init() starts a fresh fallback tally — the counter
+        # describes this process's current gateway health, not a
+        # previous config's.
+        _gateway_mod.reset_fallback_total()
 
         handshake_ok = False
         try:
@@ -384,7 +422,11 @@ def init(
 
         if not quiet:
             integrations = ", ".join(enabled) if enabled else "none"
-            mode = " mode=gateway" if cfg.gateway_mode else ""
+            mode = (
+                f" mode=gateway on_outage={cfg.gateway_on_outage}"
+                if cfg.gateway_mode
+                else ""
+            )
             print(
                 f"✓ [egisai] active — app={cfg.app} env={cfg.env} "
                 f"on_block={cfg.on_block}{mode} integrations=[{integrations}] "
@@ -446,6 +488,10 @@ def diagnostics() -> dict[str, object]:
     * ``policy_rule_count`` — number of cached rules currently active.
     * ``audit_queue_size`` — pending audit events not yet flushed.
     * ``audit_dropped_total`` — events dropped due to queue overflow.
+    * ``gateway_fallback_total`` — gateway-mode calls this process
+      served under local governance because the Gateway was
+      unreachable. Non-zero means governance is currently degrading
+      to the local cache; pair it with an alert.
     """
     cfg = get_config_optional()
     if cfg is None:
@@ -463,6 +509,8 @@ def diagnostics() -> dict[str, object]:
             "base_url": cfg.base_url,
             "on_block": cfg.on_block,
             "gateway_mode": cfg.gateway_mode,
+            "gateway_on_outage": cfg.gateway_on_outage,
+            "gateway_fallback_total": _gateway_mod.fallback_total(),
             "semantic_on_outage": cfg.semantic_on_outage,
             "policy_etag": get_etag(),
             "policy_rule_count": len(get_rules()),

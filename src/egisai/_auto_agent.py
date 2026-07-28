@@ -69,9 +69,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import sys
 import threading
+import time
 import unicodedata
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -145,6 +147,78 @@ class IdentityRecord:
 
 _identity_cache: dict[str, str] = {}
 _identity_lock = threading.Lock()
+
+# ── Registration backoff (negative cache) ───────────────────────────
+#
+# ``_identity_cache`` only ever holds *successes*. Without a
+# companion record of failures, an unreachable backend turns every
+# governed call into a fresh ``POST /v1/sdk/agents/ensure`` attempt —
+# inline on the customer's call path, serialized behind
+# ``_identity_lock``. Connection-refused fails in microseconds, but
+# the outage shape that actually hurts is a black-holed load
+# balancer: there the customer pays the full HTTP timeout on *every*
+# call, one at a time.
+#
+# So a failed ensure marks its identity key as "don't try again
+# before <deadline>". Inside the window the resolver returns ``None``
+# immediately (the documented unattributed-but-governed path); after
+# it, exactly one call retries. Steady-state cost is one dict lookup.
+_ENSURE_BACKOFF_S = 60.0
+_ENSURE_BACKOFF_ENV = "EGISAI_AGENT_ENSURE_BACKOFF_SECS"
+# Bound on the negative cache. Identity keys are derived from system
+# prompts, so a pathological caller could mint many distinct ones;
+# capping keeps the dict from growing without limit during a long
+# outage. Expired entries are pruned first, then the whole map is
+# dropped (which only costs one extra ensure attempt per identity).
+_ENSURE_BACKOFF_MAX_ENTRIES = 2048
+_ensure_backoff: dict[str, float] = {}
+
+
+def _ensure_backoff_secs() -> float:
+    """How long to wait before retrying a failed registration."""
+    raw = os.environ.get(_ENSURE_BACKOFF_ENV)
+    if raw is None or not raw.strip():
+        return _ENSURE_BACKOFF_S
+    try:
+        return max(0.0, float(raw.strip()))
+    except ValueError:
+        return _ENSURE_BACKOFF_S
+
+
+def _in_ensure_backoff(identity_key: str) -> bool:
+    """True while ``identity_key``'s registration is being backed off.
+
+    Reads the plain dict without taking ``_identity_lock`` — a stale
+    read only costs one redundant ensure attempt, and keeping the
+    fast path lock-free is the whole point.
+    """
+    deadline = _ensure_backoff.get(identity_key)
+    if deadline is None:
+        return False
+    if time.monotonic() >= deadline:
+        _ensure_backoff.pop(identity_key, None)
+        return False
+    return True
+
+
+def _note_ensure_failure(identity_key: str) -> None:
+    """Record that registering ``identity_key`` just failed."""
+    backoff = _ensure_backoff_secs()
+    if backoff <= 0:
+        return
+    now = time.monotonic()
+    if len(_ensure_backoff) >= _ENSURE_BACKOFF_MAX_ENTRIES:
+        for key in [k for k, v in _ensure_backoff.items() if now >= v]:
+            _ensure_backoff.pop(key, None)
+        if len(_ensure_backoff) >= _ENSURE_BACKOFF_MAX_ENTRIES:
+            _ensure_backoff.clear()
+    _ensure_backoff[identity_key] = now + backoff
+
+
+def reset_ensure_backoff() -> None:
+    """Clear the registration backoff map. Used by tests."""
+    _ensure_backoff.clear()
+
 
 # ── Identity stack (ContextVar — async/thread-inherits) ─────────────
 #
@@ -1125,16 +1199,25 @@ def _ensure_agent_id(
 
     Returns ``None`` on any error — fail-open per
     ``sdk-design-philosophy.mdc`` rule 5: the user's call must not
-    break because we can't reach the backend.
+    break because we can't reach the backend. A failure also arms a
+    short backoff for this identity key (see ``_ensure_backoff``) so
+    an outage costs one attempt per window instead of one per call.
     """
     cached = _identity_cache.get(identity_key)
     if cached:
         return cached
+    if _in_ensure_backoff(identity_key):
+        return None
 
     with _identity_lock:
         cached = _identity_cache.get(identity_key)
         if cached:
             return cached
+        # Re-checked under the lock: while this thread waited, the
+        # holder may have just failed and armed the backoff. Without
+        # this, every thread queued on the lock pays its own timeout.
+        if _in_ensure_backoff(identity_key):
+            return None
         try:
             from egisai._backend import ensure_agent
             from egisai._config import get_config_optional
@@ -1166,16 +1249,22 @@ def _ensure_agent_id(
             agent_id = payload.get("id")
             if isinstance(agent_id, str) and agent_id:
                 _identity_cache[identity_key] = agent_id
+                _ensure_backoff.pop(identity_key, None)
                 if payload.get("created"):
                     LOGGER.info(
                         "[egisai] registered agent %r (id=%s…, source=%s)",
                         display_name, agent_id[:8], source,
                     )
                 return agent_id
+            # 2xx without a usable id — treat as unavailable rather
+            # than retrying it on every subsequent call.
+            _note_ensure_failure(identity_key)
         except Exception as exc:  # noqa: BLE001
+            _note_ensure_failure(identity_key)
             LOGGER.warning(
-                "[egisai] agent ensure failed (%s, source=%s): %s",
-                display_name, source, exc,
+                "[egisai] agent ensure failed (%s, source=%s): %s — "
+                "proceeding unattributed, retrying in %.0fs",
+                display_name, source, exc, _ensure_backoff_secs(),
             )
         return None
 

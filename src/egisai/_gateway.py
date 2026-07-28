@@ -38,16 +38,47 @@ Scope (v1):
   deployment-based and incompatible with the passthrough contract).
 * Fail open: if the reroute cannot even be constructed, the call
   falls back to the local-governance path — policies still enforce
-  from the local cache, per the SDK's availability philosophy. An
-  HTTP error *from* the Gateway propagates like any provider error
-  (the caller opted into an inline hop).
+  from the local cache, per the SDK's availability philosophy.
+
+Outage fallback (``init(gateway_on_outage=…)``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Rerouting makes the Gateway an inline dependency of the customer's
+call path, so an outage on our side would otherwise stop their
+traffic. :func:`should_fall_back` decides whether the SDK may re-run
+the call locally instead. It says yes only when *all* of these hold:
+
+* ``gateway_on_outage="local"`` (the default),
+* the error means "we never got an answer from Egis" — a transport
+  failure, or HTTP 502 / 503 / 504 (see :func:`is_outage_error`),
+* the customer's own client can still reach the provider directly:
+  it isn't pointed at the Gateway itself and its ``api_key`` is a
+  real provider key, not an ``egis_`` key (BYOK-vault callers hold
+  no upstream credential locally — see
+  :func:`_client_can_reach_provider`).
+
+Everything else propagates. In particular a 4xx is an *answer*: a
+policy block, an auth/entitlement refusal, or a rate limit. Retrying
+those locally would convert an enforced decision into an allowed
+call. A bare 500 also propagates — unlike 502/503/504 it can be
+raised after the Gateway already forwarded upstream, so retrying
+risks double-charging the customer's provider.
+
+Falling back does not disable governance: the local path runs the
+same engine against the last-known-good policy cache, with PII
+detection fully local. It does mean the audit row is written by the
+SDK rather than the Gateway, and that a policy created during the
+outage isn't visible yet. Both are logged loudly.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 from urllib.parse import quote
+
+import httpx
 
 from egisai._config import get_config_optional
 
@@ -137,6 +168,122 @@ def points_at_gateway(resource: Any) -> bool:
 def should_carry(resource: Any) -> bool:
     """Should the patch hand this chat call to the Gateway path?"""
     return enabled() or points_at_gateway(resource)
+
+
+# ── Outage fallback ─────────────────────────────────────────────────
+
+# HTTP statuses that mean "the request never reached a Gateway
+# handler, or the handler declared itself unavailable". 503 is what
+# the Gateway returns when it can't load policy (see the backend's
+# ``GatewayDegradedError``); 502 / 504 come from the load balancer in
+# front of it. All three are safe to re-run: no upstream provider
+# call was made under them.
+_OUTAGE_STATUS_CODES = frozenset({502, 503, 504})
+
+# ``openai`` exception class names that mean "no HTTP response".
+# Matched by name across the MRO so this module stays importable
+# without ``openai`` installed, and so it keeps working if upstream
+# re-parents the classes. ``APITimeoutError`` subclasses
+# ``APIConnectionError`` today; both are listed for clarity.
+_OUTAGE_EXC_NAMES = frozenset(
+    {"APIConnectionError", "APITimeoutError"}
+)
+
+_fallback_lock = threading.Lock()
+_fallback_total = 0
+
+
+def fallback_total() -> int:
+    """How many calls have fallen back to local governance.
+
+    Surfaced by :func:`egisai.diagnostics` so an operator can tell
+    "the Gateway is degraded and my SDK is covering for it" apart
+    from "everything is fine".
+    """
+    with _fallback_lock:
+        return _fallback_total
+
+
+def reset_fallback_total() -> None:
+    """Reset the fallback counter. Used by tests."""
+    global _fallback_total
+    with _fallback_lock:
+        _fallback_total = 0
+
+
+def is_outage_error(exc: BaseException) -> bool:
+    """Does ``exc`` mean the Gateway never answered this call?
+
+    See the module docstring for why 4xx and a bare 500 are excluded.
+    """
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status in _OUTAGE_STATUS_CODES
+    for klass in type(exc).__mro__:
+        if klass.__name__ in _OUTAGE_EXC_NAMES:
+            return True
+    # Raw httpx transport errors reach us when the customer supplied
+    # their own ``http_client`` and the failure escaped before the
+    # openai layer could wrap it.
+    return isinstance(exc, httpx.TransportError)
+
+
+def _client_can_reach_provider(resource: Any) -> bool:
+    """Can this resource's client still call the provider directly?
+
+    Two disqualifiers:
+
+    * The client is already pointed at the Gateway (``egisai.Client``
+      or a hand-set ``base_url``). There is no other upstream to fall
+      back to — the reroute wasn't what put us here.
+    * The client's key is an Egis key (BYOK-vault / Bearer mode). The
+      provider key lives in our encrypted vault, not in the process,
+      so a direct call would 401 at the provider. Failing with the
+      Gateway's own error is more honest than that.
+    """
+    if points_at_gateway(resource):
+        return False
+    try:
+        api_key = getattr(resource._client, "api_key", None)  # noqa: SLF001
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(api_key, str) or not api_key.strip():
+        return False
+    return not api_key.startswith("egis_")
+
+
+def should_fall_back(resource: Any, exc: BaseException) -> bool:
+    """Should this failed gateway call be re-run under local governance?"""
+    cfg = get_config_optional()
+    if cfg is None or cfg.gateway_on_outage != "local":
+        return False
+    if not is_outage_error(exc):
+        return False
+    return _client_can_reach_provider(resource)
+
+
+def note_fallback(exc: BaseException) -> None:
+    """Count + announce one outage fallback.
+
+    Loud by design (``sdk-design-philosophy.mdc`` rule 5): the
+    customer's call is being served, but it is being governed by the
+    local cache instead of the Gateway, and the audit row for it now
+    comes from the SDK. An operator must be able to find that in the
+    logs without turning on debug logging.
+    """
+    global _fallback_total
+    with _fallback_lock:
+        _fallback_total += 1
+        total = _fallback_total
+    status = getattr(exc, "status_code", None)
+    LOGGER.warning(
+        "[egisai] gateway unreachable (%s%s) — governing this call "
+        "in-process from the local policy cache instead "
+        "(gateway_on_outage='local', fallbacks=%d)",
+        exc.__class__.__name__,
+        f" HTTP {status}" if isinstance(status, int) else "",
+        total,
+    )
 
 
 def gateway_base_url() -> str:
