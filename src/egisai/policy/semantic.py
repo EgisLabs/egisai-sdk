@@ -320,9 +320,30 @@ class SemanticBlocker:
         exactly ``_prepare``'s output, so the key can never drift out
         of sync with what gets posted. Sorted keys make the digest
         stable across dict ordering.
+
+        Fast-governance mode ``on`` additionally canonicalises opaque
+        identifiers (UUIDs, hex run ids, ``CUST-9374731``-style
+        prefixed ids) before hashing, so two questions that differ
+        only in an id share one verdict. The normalisation is applied
+        to the KEY only — the judge always receives the raw text —
+        and never touches bare numbers (amounts). See
+        ``egisai.policy.fastpath.normalize_for_cache_key``.
         """
+        keyed = body
+        try:
+            from egisai.policy import fastpath
+
+            if fastpath.cache_normalization_enabled():
+                keyed = {
+                    **body,
+                    "prompt_text": fastpath.normalize_for_cache_key(
+                        str(body.get("prompt_text") or "")
+                    ),
+                }
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("cache-key normalization failed", exc_info=True)
         return hashlib.sha256(
-            json.dumps(body, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            json.dumps(keyed, sort_keys=True, ensure_ascii=False).encode("utf-8")
         ).hexdigest()
 
     def _cache_get(self, key: str) -> tuple[SemanticMatch | None, bool]:

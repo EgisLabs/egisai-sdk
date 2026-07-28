@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.49.0] — 2026-07-28
+
+### Added
+
+- **Fast-governance mode** (`EGISAI_FAST_GOVERNANCE=off|shadow|on`,
+  default `off`) — fewer judge questions, provably-equal answers.
+  Three changes, all confined to Phase-2 `semantic_guard` semantics
+  and all inert until the operator opts in:
+
+  1. **Merged judge calls.** Policies that share a threshold are asked
+     in ONE round-trip carrying the union of their intents; the cited
+     intent is mapped back to its owning policy, so per-policy
+     attribution, `reason_code`s, and custom messages are unchanged.
+     Three guards over a turn with four tool calls drop from 15 judge
+     round-trips to 4.
+  2. **Windowed judge text**
+     (`EGISAI_JUDGE_TEXT_WINDOW_CHARS`, default 16000, `0` disables) —
+     the text target judges the most recent window of the transcript
+     instead of re-judging the whole conversation every turn. Every
+     message is still judged (each turn was inside the window when it
+     was new); tokens stop growing quadratically and latency stays
+     flat over long agentic loops. Phase-1 regex/PII checks still see
+     the full text.
+  3. **Normalized verdict-cache keys**
+     (`EGISAI_JUDGE_CACHE_NORMALIZE`, kill switch) — opaque ids
+     (UUIDs, hex run ids, `CUST-9374731`-style prefixed ids) are
+     canonicalised before the cache key is hashed, so two calls that
+     differ only in an id share one verdict. Key-only: the judge
+     always receives the raw text. Amounts and bare numbers are never
+     collapsed.
+
+  **Shadow rollout is the safety story.** With
+  `EGISAI_FAST_GOVERNANCE=shadow`, the legacy path keeps making every
+  enforcement decision while the fast path runs on a background
+  thread, decides nothing, and prints one AGREE/DISAGREE line per
+  evaluation (policy names and verdicts only — never prompt text).
+  Shadow token spend is not booked to the governed call's
+  `policy_tokens_*`. Flip to `on` only after your own traffic shows
+  agreement; flip back at any time.
+  `EGISAI_FAST_SHADOW_SAMPLE` (0.0–1.0) bounds the doubled judge
+  spend during the shadow period.
+
+  The backend gateway evaluates policies through this same engine, so
+  one env var on the Cloud Run service enables the identical fast
+  path for gateway traffic.
+
+---
+
 ## [0.48.0] — 2026-07-28
 
 ### Changed
