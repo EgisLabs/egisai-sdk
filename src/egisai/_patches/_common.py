@@ -787,19 +787,24 @@ def _prepare_route(
     try:
         from egisai import _routing
 
-        has_tools = bool(payload.get("tools")) if isinstance(payload, dict) else False
+        shape = _routing.inspect_payload(payload)
         # Cross-provider swaps require a faithful payload translation;
-        # streams and tool-carrying calls stay same-provider.
+        # streams, tool-carrying calls, and image-carrying calls stay
+        # same-provider.
         allow_cross = (
-            routing_adapter.supports_cross and not stream and not has_tools
+            routing_adapter.supports_cross
+            and not stream
+            and not shape.has_tools
+            and not shape.has_images
         )
         decision = _routing.maybe_route(
             model=model,
             prompt_preview=ev.get("prompt_preview") or "",
             prompt_chars=int(ev.get("prompt_chars") or 0),
-            has_tools=has_tools,
+            has_tools=shape.has_tools,
             agent_id=ev.get("agent_id"),
             allow_cross=allow_cross,
+            shape=shape,
         )
         if not decision:
             return None

@@ -146,16 +146,123 @@ def detect_available_providers(
     return providers
 
 
+# ── Call shape ───────────────────────────────────────────────────────
+#
+# Three facts about the pending call that the prompt preview can't
+# carry, and that the platform's selector needs so it never routes
+# onto a model that would *fail* the request:
+#
+#   images   — a text-only target 400s the call outright.
+#   max out  — a target with a lower output ceiling truncates/rejects.
+#   caching  — a swap cold-starts the cache, so the "cheaper" model
+#              can bill more than the one the caller asked for.
+#
+# Detection is best-effort and fails safe: an unrecognised payload
+# yields the all-default shape, which adds no restriction beyond what
+# the selector already applies.
+
+#: Content-part discriminators meaning "this message carries an image",
+#: across the OpenAI Chat Completions, Anthropic Messages, and OpenAI
+#: Responses payload shapes.
+_IMAGE_PART_TYPES = frozenset({"image_url", "image", "input_image"})
+
+
+@dataclass(frozen=True)
+class CallShape:
+    """Routing-relevant capability requirements of one pending call."""
+
+    has_tools: bool = False
+    has_images: bool = False
+    #: Output ceiling the caller asked for; ``0`` means unspecified.
+    max_output_tokens: int = 0
+    uses_prompt_caching: bool = False
+
+
+def _blocks_have(content: Any, key: str) -> bool:
+    """True when any dict block in ``content`` carries a truthy ``key``."""
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(block, dict) and block.get(key) for block in content
+    )
+
+
+def _blocks_have_image(content: Any) -> bool:
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(block, dict) and block.get("type") in _IMAGE_PART_TYPES
+        for block in content
+    )
+
+
+def inspect_payload(payload: Any) -> CallShape:
+    """Read the call shape off a patch's payload dict. Never raises.
+
+    Handles both framework shapes the patches produce: OpenAI-style
+    ``messages`` with a list ``content``, and Anthropic-style
+    ``messages`` plus a separate ``system``.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return CallShape()
+        has_tools = bool(payload.get("tools") or payload.get("functions"))
+        max_output = 0
+        for field in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+            value = payload.get(field)
+            if isinstance(value, int) and not isinstance(value, bool):
+                max_output = max(max_output, value)
+        has_images = False
+        uses_caching = False
+        messages = payload.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                content = message.get("content")
+                has_images = has_images or _blocks_have_image(content)
+                uses_caching = (
+                    uses_caching
+                    or bool(message.get("cache_control"))
+                    or _blocks_have(content, "cache_control")
+                )
+        system = payload.get("system")
+        if isinstance(system, dict):
+            uses_caching = uses_caching or bool(system.get("cache_control"))
+        else:
+            uses_caching = uses_caching or _blocks_have(system, "cache_control")
+        return CallShape(
+            has_tools=has_tools,
+            has_images=has_images,
+            max_output_tokens=max(0, max_output),
+            uses_prompt_caching=uses_caching,
+        )
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("call-shape inspection failed", exc_info=True)
+        return CallShape()
+
+
 # ── Decision client ──────────────────────────────────────────────────
 
 
-def _cache_key(model: str, preview: str, has_tools: bool, providers: list[str]) -> str:
+def _cache_key(
+    model: str,
+    preview: str,
+    shape: CallShape,
+    providers: list[str],
+) -> str:
     h = hashlib.sha256()
     h.update(model.encode())
     h.update(b"\x00")
     h.update(preview.encode("utf-8", "replace"))
     h.update(b"\x00")
-    h.update(("1" if has_tools else "0").encode())
+    # The full shape participates: two calls with identical prompts
+    # but different capability requirements can route differently, so
+    # they must not share a cache entry.
+    h.update(
+        f"{int(shape.has_tools)}:{int(shape.has_images)}:"
+        f"{shape.max_output_tokens}:{int(shape.uses_prompt_caching)}".encode()
+    )
     h.update(b"\x00")
     h.update(",".join(sorted(providers)).encode())
     return h.hexdigest()
@@ -169,6 +276,7 @@ def maybe_route(
     has_tools: bool,
     agent_id: str | None,
     allow_cross: bool,
+    shape: CallShape | None = None,
 ) -> dict[str, Any] | None:
     """Ask the platform for a best-fit model. Never raises.
 
@@ -176,6 +284,11 @@ def maybe_route(
     "reason", "projected_savings_usd"}``) or ``None`` ("keep the
     requested model"). ``prompt_preview`` MUST already be the
     label-redacted audit preview.
+
+    ``shape`` carries the call's capability requirements (images,
+    output ceiling, prompt caching). ``has_tools`` stays an explicit
+    argument for backwards compatibility; when both are supplied the
+    ``shape`` value wins.
     """
     global _disabled_until
     try:
@@ -185,12 +298,15 @@ def maybe_route(
             if time.monotonic() < _disabled_until:
                 return None
 
+        call_shape = shape or CallShape()
+        if shape is None and has_tools:
+            call_shape = CallShape(has_tools=True)
         requested_provider = provider_for_model(model)
         providers = detect_available_providers(
             requested_provider, allow_cross=allow_cross
         )
         preview = (prompt_preview or "")[:2000]
-        key = _cache_key(model, preview, has_tools, providers)
+        key = _cache_key(model, preview, call_shape, providers)
         now = time.monotonic()
         with _lock:
             hit = _decision_cache.get(key)
@@ -206,7 +322,10 @@ def maybe_route(
             model=model,
             prompt_preview=preview,
             prompt_chars=prompt_chars,
-            has_tools=has_tools,
+            has_tools=call_shape.has_tools,
+            has_images=call_shape.has_images,
+            max_output_tokens=call_shape.max_output_tokens,
+            uses_prompt_caching=call_shape.uses_prompt_caching,
             available_providers=providers,
             agent_id=agent_id,
             timeout_s=_ROUTE_TIMEOUT_S,

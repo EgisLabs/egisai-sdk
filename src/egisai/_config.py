@@ -10,6 +10,11 @@ from typing import Literal
 
 OnBlock = Literal["raise", "stub"]
 OnOutage = Literal["allow", "block"]
+# Behavior when the inline Gateway itself is unreachable in gateway
+# mode. "local" — re-run the call on the customer's own provider
+# client under in-process governance. "fail" — let the transport
+# error propagate so the Gateway stays a hard enforcement boundary.
+GatewayOnOutage = Literal["local", "fail"]
 # Stack-frame inspection mode for ``_auto_agent`` Tier 3.
 # "strict"  — only honor the explicit ``__egisai_agent__`` marker.
 # "loose"   — also honor ``agent_name`` / ``egisai_agent`` / string ``agent`` locals.
@@ -91,6 +96,23 @@ class EgisaiConfig:
     # evaluation. Every other endpoint / provider keeps the normal
     # in-process governance path. See ``egisai._gateway``.
     gateway_mode: bool = False
+    # What happens in gateway mode when the Gateway is unreachable
+    # (connection refused / timeout / 502 / 503 / 504).
+    #
+    # "local" (default) — the SDK re-runs the call against the
+    #     customer's own provider client and governs it in-process
+    #     from the last-known-good policy cache. Governance degrades
+    #     from server-side to client-side; the customer's call path
+    #     survives. Only possible when the client carries a real
+    #     provider key (header/passthrough mode) — BYOK-vault callers
+    #     have no upstream credential locally, so they always fail.
+    # "fail" — the transport error propagates to the caller. Pick
+    #     this when the Gateway must remain a hard enforcement
+    #     boundary and a refused call is preferable to a locally
+    #     governed one.
+    #
+    # See ``egisai._gateway.should_fall_back``.
+    gateway_on_outage: GatewayOnOutage = "local"
 
 
 _CONFIG: EgisaiConfig | None = None
@@ -138,6 +160,7 @@ def update_config(**fields: object) -> EgisaiConfig:
         "smart_routing_enabled": _CONFIG.smart_routing_enabled,
         "stamp_identity": _CONFIG.stamp_identity,
         "gateway_mode": _CONFIG.gateway_mode,
+        "gateway_on_outage": _CONFIG.gateway_on_outage,
     }
     base.update(fields)
     new = EgisaiConfig(**base)  # type: ignore[arg-type]

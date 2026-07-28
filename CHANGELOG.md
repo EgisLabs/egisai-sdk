@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.47.3] — 2026-07-27
+
+### Added
+
+- **Gateway mode survives an EgisAI outage.** In `init(gateway=True)`,
+  a Gateway that never answered — connection refused, timeout, HTTP
+  502 / 503 / 504 — no longer takes your call down with it. The SDK
+  re-runs the call against your own provider client and governs it
+  in-process from the last-known-good policy cache. Controlled by the
+  new `init(gateway_on_outage=…)` kwarg (`EGISAI_GATEWAY_ON_OUTAGE`):
+
+  - `"local"` (default) — fall back to in-process governance.
+  - `"fail"` — propagate the error, keeping the Gateway a hard
+    enforcement boundary.
+
+  A **4xx is never retried locally** under either setting: it's a
+  decision (policy block, auth, quota), and retrying it would convert
+  an enforced refusal into an allowed call. A bare 500 also
+  propagates, because unlike 502/503/504 it can be raised after the
+  Gateway already forwarded upstream — a retry there could
+  double-charge your provider. Fallback also requires that your client
+  can still reach the provider directly, so BYOK-vault callers (whose
+  provider key lives server-side) always fail rather than 401.
+
+  Every fallback logs loudly and increments
+  `diagnostics()["gateway_fallback_total"]` — alert on it: governance
+  is degrading from server-side to client-side while it's non-zero.
+
+### Fixed
+
+- **Agent auto-registration can no longer stall your call path.**
+  Registering a newly-seen agent identity is the one backend hop that
+  runs inline on a model call. Failures were not cached, so an
+  unreachable backend re-attempted the hop on *every* call, serialized
+  behind the identity lock — against a black-holed load balancer that
+  meant each call paid the full HTTP timeout in turn. Three fixes:
+
+  - A failed registration now backs that identity off for 60 s
+    (`EGISAI_AGENT_ENSURE_BACKOFF_SECS`; `0` restores the old
+    retry-every-call behaviour). Attempts scale with the number of
+    distinct agent identities, never with request volume.
+  - The hop has its own 2 s budget
+    (`EGISAI_AGENT_ENSURE_TIMEOUT_SECS`) instead of the shared 10 s
+    client timeout.
+  - It no longer retries HTTP 429. A rate-limited registration is
+    skipped and retried after the backoff rather than slept through
+    on the hot path.
+
+  Behaviour is unchanged: the call proceeds unattributed-but-governed,
+  exactly as it did before, and registers on a later call.
+
+- A server-supplied `Retry-After` is now clamped to 5 s
+  (`EGISAI_RETRY_AFTER_MAX_SECS`) across every backend call. A large
+  value could previously sleep the calling thread for minutes.
+
+## [0.47.0] — 2026-07-27
+
+### Added
+
+- Smart Model Routing now reports the **call's capability shape** to
+  the platform, so a routing decision can never land on a model that
+  would reject the request. The SDK detects, per call:
+  - **image parts** (OpenAI, Anthropic and Responses payload shapes) —
+    routing is restricted to vision-capable models, and cross-provider
+    swaps are disabled for multimodal calls;
+  - the caller's **output ceiling** (`max_tokens` /
+    `max_completion_tokens` / `max_output_tokens`) — models whose
+    published cap is lower are excluded;
+  - **explicit prompt caching** (`cache_control` blocks) — routing is
+    declined outright, because a model swap cold-starts the cache and
+    the "cheaper" model can bill more than the requested one.
+
+  Detection is best-effort and never raises; an unrecognised payload
+  simply adds no restriction.
+
+### Changed
+
+- The routing decision cache key now includes the full call shape, so
+  two calls with identical prompts but different capability
+  requirements no longer share a cached decision.
+
 ## [0.46.1] — 2026-07-26
 
 ### Added

@@ -10,6 +10,7 @@ upstream response bodies are never echoed.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Callable
 from typing import Any, TypeVar
@@ -25,6 +26,54 @@ LOGGER = logging.getLogger("egisai.backend")
 RETRY_429_MAX = 3
 RETRY_429_FALLBACK_SLEEP_S = 1.0
 
+# Ceiling on the ``Retry-After`` value we are willing to honour, in
+# seconds. The header is operator-controlled on our side, but the
+# retry ``time.sleep`` happens wherever the caller runs — and some
+# callers (``ensure_agent``) sit on the customer's model-call hot
+# path. Without a cap, a backend answering ``Retry-After: 300``
+# would stall a customer's ``client.chat.completions.create(...)``
+# for five minutes per attempt, which is a far worse outcome than
+# skipping the operation and retrying on the next call.
+#
+# ``egisai.policy.semantic`` has carried the same clamp for its
+# judge round-trip since 0.11; this is the same idea applied to the
+# shared client. Tunable so an operator running a self-hosted
+# backend with long maintenance windows can widen it.
+RETRY_AFTER_CAP_S = 5.0
+RETRY_AFTER_CAP_ENV = "EGISAI_RETRY_AFTER_MAX_SECS"
+
+# Wall-clock budget for ``ensure_agent``. Deliberately much tighter
+# than the shared ``timeout_seconds`` (10 s) because this is the one
+# backend round-trip that runs *inline* on the customer's model call,
+# the first time each agent identity is seen. A slow or black-holed
+# backend must cost the call a couple of seconds at most; the SDK
+# then proceeds unattributed and retries after the caller-side
+# backoff (see ``egisai._auto_agent._ensure_agent_id``).
+ENSURE_AGENT_TIMEOUT_S = 2.0
+ENSURE_AGENT_TIMEOUT_ENV = "EGISAI_AGENT_ENSURE_TIMEOUT_SECS"
+
+
+def _env_float(name: str, default: float, *, lo: float) -> float:
+    """Read a float env var, clamped at ``lo``. Never raises."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return max(lo, float(raw.strip()))
+    except ValueError:
+        LOGGER.debug("ignoring unparseable %s=%r", name, raw)
+        return default
+
+
+def retry_after_cap_secs() -> float:
+    """Current ceiling for honoured ``Retry-After`` values."""
+    return _env_float(RETRY_AFTER_CAP_ENV, RETRY_AFTER_CAP_S, lo=0.1)
+
+
+def ensure_agent_timeout_secs() -> float:
+    """Current wall-clock budget for the inline ``ensure_agent`` hop."""
+    return _env_float(ENSURE_AGENT_TIMEOUT_ENV, ENSURE_AGENT_TIMEOUT_S, lo=0.1)
+
 
 class BackendError(Exception):
     """Backend returned an error or could not be reached."""
@@ -36,18 +85,27 @@ T = TypeVar("T")
 def _retry_on_429(
     op: str,
     fn: Callable[[], httpx.Response],
+    *,
+    max_attempts: int = RETRY_429_MAX,
 ) -> httpx.Response:
     """Execute ``fn`` and transparently retry on HTTP 429.
 
-    Honours ``Retry-After`` (delta-seconds) and falls back to a
-    constant sleep otherwise.
+    Honours ``Retry-After`` (delta-seconds), clamped to
+    :func:`retry_after_cap_secs` so a large server-supplied value can
+    never stall the calling thread for minutes, and falls back to a
+    constant sleep when the header is absent or unparseable.
+
+    ``max_attempts=0`` disables retrying entirely — the 429 is handed
+    straight back. Hot-path callers use that: a rate-limited
+    best-effort operation is better skipped than slept through.
     """
+    cap = retry_after_cap_secs()
     last: httpx.Response | None = None
-    for attempt in range(RETRY_429_MAX + 1):
+    for attempt in range(max_attempts + 1):
         last = fn()
         if last.status_code != 429:
             return last
-        if attempt >= RETRY_429_MAX:
+        if attempt >= max_attempts:
             break
         retry_after_raw = last.headers.get("Retry-After")
         delay = RETRY_429_FALLBACK_SLEEP_S
@@ -56,9 +114,10 @@ def _retry_on_429(
                 delay = max(0.1, float(retry_after_raw))
             except ValueError:
                 pass
+        delay = min(delay, cap)
         LOGGER.info(
             "%s rate-limited (HTTP 429) — retrying in %.1fs (attempt %d/%d)",
-            op, delay, attempt + 1, RETRY_429_MAX,
+            op, delay, attempt + 1, max_attempts,
         )
         time.sleep(delay)
     return last  # type: ignore[return-value]
@@ -252,6 +311,14 @@ def ensure_agent(
     * ``model`` — the model id observed on the registering call.
       Observed *metadata* only (models_seen histogram) — never part
       of any identity hash.
+
+    Availability contract: this is the only backend hop that runs
+    inline on the customer's model call, so it gets its own tight
+    timeout (:func:`ensure_agent_timeout_secs`) and no 429 retry
+    loop. A rate-limited or unreachable backend surfaces as a
+    ``BackendError`` immediately; the caller treats registration as
+    unavailable, proceeds unattributed, and backs off before trying
+    again.
     """
     payload: dict[str, Any] = {"name": name}
     if description:
@@ -290,7 +357,12 @@ def ensure_agent(
         )
     r = _retry_on_429(
         "ensure_agent",
-        lambda: get_client().post("/v1/sdk/agents/ensure", json=payload),
+        lambda: get_client().post(
+            "/v1/sdk/agents/ensure",
+            json=payload,
+            timeout=ensure_agent_timeout_secs(),
+        ),
+        max_attempts=0,
     )
     if r.status_code not in (200, 201):
         raise _http_error(op="ensure_agent", status=r.status_code)
@@ -381,6 +453,9 @@ def route(
     has_tools: bool,
     available_providers: list[str],
     agent_id: str | None,
+    has_images: bool = False,
+    max_output_tokens: int = 0,
+    uses_prompt_caching: bool = False,
     timeout_s: float = 3.0,
 ) -> dict[str, Any] | None:
     """Ask the platform for a Smart Model Routing decision. Never raises.
@@ -396,6 +471,9 @@ def route(
         "prompt_preview": prompt_preview,
         "prompt_chars": prompt_chars,
         "has_tools": has_tools,
+        "has_images": has_images,
+        "max_output_tokens": max_output_tokens,
+        "uses_prompt_caching": uses_prompt_caching,
         "available_providers": available_providers,
     }
     if agent_id:

@@ -38,6 +38,15 @@ def reset_sdk() -> Iterator[None]:
     # test's resolver.
     _auto_agent._identity_cache.clear()
     _auto_agent._identity_stack.set(())
+    # 0.47.3 — drop the registration backoff so a test that simulated
+    # an unreachable backend doesn't suppress the next test's ensure.
+    _auto_agent.reset_ensure_backoff()
+
+    # 0.47.3 — zero the gateway outage-fallback tally so one test's
+    # simulated outage isn't visible in the next test's diagnostics.
+    from egisai import _gateway
+
+    _gateway.reset_fallback_total()
 
     # 0.18.0 — clear any open Run that a previous test forgot to close.
     from egisai import _run

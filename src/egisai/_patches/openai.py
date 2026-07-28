@@ -1249,6 +1249,14 @@ def _wrap_create_chat(orig: Callable[..., Any], is_async: bool) -> Callable[...,
                         "to in-process governance for this call",
                         exc,
                     )
+                except Exception as exc:
+                    # The Gateway itself was unreachable. Re-run the
+                    # call locally when that's safe and allowed;
+                    # otherwise the error is the customer's answer.
+                    # See ``_gateway.should_fall_back``.
+                    if not _gateway.should_fall_back(self, exc):
+                        raise
+                    _gateway.note_fallback(exc)
             model = kwargs.get("model", "unknown")
             messages = kwargs.get("messages")
             stream = bool(kwargs.get("stream", False))
@@ -1354,6 +1362,11 @@ def _wrap_create_chat(orig: Callable[..., Any], is_async: bool) -> Callable[...,
                     "to in-process governance for this call",
                     exc,
                 )
+            except Exception as exc:
+                # See the async twin above.
+                if not _gateway.should_fall_back(self, exc):
+                    raise
+                _gateway.note_fallback(exc)
         model = kwargs.get("model", "unknown")
         messages = kwargs.get("messages")
         stream = bool(kwargs.get("stream", False))
