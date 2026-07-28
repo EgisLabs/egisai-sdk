@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
+from egisai.policy import fastpath
 from egisai.policy import pii as pii_scanner
 from egisai.policy._regex_safe import safe_search
 from egisai.policy.semantic import SemanticBlocker
@@ -458,9 +459,43 @@ def evaluate_policies(
         stream=context.stream,
         agent_id=context.agent_id,
     )
-    phase2_matches = _collect_input_matches(
-        phase2, phase2_ctx, semantic_blocker=semantic_blocker
-    )
+    # Fast-governance dispatch (see ``egisai.policy.fastpath``).
+    # ``off`` keeps the release-tested legacy walk byte-identical.
+    # ``shadow`` enforces via the legacy walk while the fast walk
+    # runs on a background thread and reports agreement. ``on``
+    # enforces via the fast walk. Phase 1 above is untouched in
+    # every mode — the dispatch covers ONLY the Phase-2 judges.
+    fast_mode = fastpath.mode()
+    sem2 = [p for p in phase2 if p.type == "semantic_guard"]
+    other2 = [p for p in phase2 if p.type != "semantic_guard"]
+    if fast_mode == "on":
+        phase2_matches = _collect_semantic_fast(
+            sem2,
+            text=text_for_phase2,
+            tool_calls=None,
+            semantic_blocker=semantic_blocker,
+            side="prompt",
+        )
+        # Any future non-mergeable LLM-backed kind still runs, via
+        # the legacy walker, in every mode.
+        if other2:
+            for rec in _collect_input_matches(
+                other2, phase2_ctx, semantic_blocker=semantic_blocker
+            ).records:
+                phase2_matches.add(rec)
+    else:
+        phase2_matches = _collect_input_matches(
+            phase2, phase2_ctx, semantic_blocker=semantic_blocker
+        )
+        if fast_mode == "shadow":
+            _spawn_semantic_shadow(
+                sem2,
+                text=text_for_phase2,
+                tool_calls=None,
+                semantic_blocker=semantic_blocker,
+                side="prompt",
+                legacy_records=phase2_matches.records,
+            )
 
     return _synthesize_decision(phase1_matches.records + phase2_matches.records)
 
@@ -1124,6 +1159,312 @@ def _synthesize_tool_call_text(name: str, args: Any) -> str:
     )
 
 
+# ── Fast-governance Phase-2 walk ────────────────────────────────────────
+#
+# The merged-question evaluator behind ``EGISAI_FAST_GOVERNANCE``.
+# Rationale, rollout contract, and compliance notes live in
+# ``egisai.policy.fastpath``; the mechanics live here because they
+# reuse the engine's private primitives (``_fan_out``, the judge
+# budget, ``_synthesize_tool_call_text``).
+#
+# Question inventory for one turn, legacy vs fast, with G guards that
+# all target ["text", "tool_calls"] and share a threshold, and T
+# unique tool calls:
+#
+#     legacy:  G × (1 + T)   judge round-trips
+#     fast:    1 + T         judge round-trips
+#
+# plus the text question is windowed (bounded tokens) and byte-equal
+# tool questions are asked once instead of once per policy per
+# duplicate. Verdict semantics per question are unchanged: the judge
+# receives the same threshold it would have received per-policy
+# (grouping is BY threshold), and the union intent list is exactly
+# the set of intents that would have been spread across the
+# per-policy calls.
+
+
+def _semantic_intents(policy: PolicyRule) -> list[str]:
+    """The rule's operator-authored intent strings (may be empty)."""
+    raw = policy.config.get("intents") or []
+    if not isinstance(raw, list):
+        return []
+    return [i for i in raw if isinstance(i, str) and i.strip()]
+
+
+def _semantic_targets(policy: PolicyRule) -> list[str]:
+    """Mirror of ``_semantic_guard_match``'s targets resolution."""
+    raw = policy.config.get("targets")
+    if isinstance(raw, list) and raw:
+        return [str(t) for t in raw if isinstance(t, str)]
+    return ["text"]
+
+
+def _threshold_group_key(policy: PolicyRule) -> str:
+    """Policies merge ONLY when their judge threshold is identical.
+
+    The merged call ships one ``threshold`` on the wire, so a shared
+    value is what makes merging exact rather than approximate. ``None``
+    (policy defers to the platform default) is its own group. ``repr``
+    keeps ``0.7`` and ``"0.7"`` apart — coercing operator config here
+    would be guessing.
+    """
+    return repr(policy.config.get("threshold"))
+
+
+def _merged_judge_config(group: list[PolicyRule]) -> dict[str, Any]:
+    """One judge-call config carrying the group's union intent list.
+
+    Order-preserving dedup: policy order then intent order, so the
+    judge's prompt lists intents in the same relative order operators
+    see on the dashboard. The shared threshold (identical across the
+    group by construction) rides along verbatim.
+    """
+    union: dict[str, None] = {}
+    for policy in group:
+        for intent in _semantic_intents(policy):
+            union.setdefault(intent, None)
+    cfg: dict[str, Any] = {"intents": list(union)}
+    threshold = group[0].config.get("threshold")
+    if threshold is not None:
+        cfg["threshold"] = threshold
+    return cfg
+
+
+def _owning_policy(
+    intent: str, group: list[PolicyRule]
+) -> tuple[PolicyRule, str]:
+    """Map the judge's cited intent back to the policy that owns it.
+
+    The backend already resolves the judge's (possibly paraphrased)
+    citation to a canonical string from the union list, so the exact
+    pass below is the overwhelmingly common case. The fuzzy pass
+    mirrors the backend's own containment matching for older backends
+    that return the raw citation. The final fallback attributes to the
+    group's first policy — the same "trust the verdict, best-effort
+    label" posture ``_build_verdict`` takes server-side. A BLOCK is
+    never dropped because attribution was ambiguous.
+    """
+    low = intent.strip().lower()
+    for policy in group:
+        for candidate in _semantic_intents(policy):
+            if candidate.strip().lower() == low:
+                return policy, candidate
+    for policy in group:
+        for candidate in _semantic_intents(policy):
+            c = candidate.strip().lower()
+            if c and (c in low or low in c):
+                return policy, candidate
+    return group[0], intent
+
+
+def _collect_semantic_fast(
+    policies: list[PolicyRule],
+    *,
+    text: str,
+    tool_calls: list[dict[str, Any]] | None,
+    semantic_blocker: SemanticBlocker | None,
+    side: str,
+) -> _PhaseMatches:
+    """Merged-question Phase-2 walk. Enforcement path of fast mode.
+
+    Behaviour contract relative to the legacy walk:
+
+    * Same verdict inputs. Every question carries the threshold the
+      per-policy call would have carried, and the union intent list
+      is exactly the intents the per-policy calls would have spread
+      over G separate prompts.
+    * Same fail-open posture. A ``None`` blocker, empty intents, the
+      legacy embedding engine, judge outages — all degrade exactly as
+      the legacy walk degrades (outage handling lives inside
+      ``SemanticBlocker.check`` and is shared verbatim).
+    * At most one record per policy, ``reason_code`` /  message
+      templates identical to ``_semantic_guard_match``'s.
+    * Text questions are windowed via ``fastpath.window_text``; tool
+      questions are deduped by their synthesized sentence (a repeated
+      tool call is the same question — asked once).
+    """
+    out = _PhaseMatches()
+    if semantic_blocker is None:
+        return out
+
+    active: list[PolicyRule] = []
+    for policy in policies:
+        if policy.type != "semantic_guard":
+            # Callers split non-semantic phase-2 kinds off to the
+            # legacy walkers BEFORE calling this collector (see the
+            # dispatch sites in ``evaluate_policies`` /
+            # ``evaluate_output_policies``); a stray one here means a
+            # new LLM-backed kind was added without teaching either
+            # the dispatch or this collector about it. Say so loudly
+            # rather than guessing at its semantics.
+            LOGGER.warning(
+                "fast-governance: policy type %r is not mergeable and was "
+                "not routed to the legacy walker — rule %r did not run "
+                "this turn; route it at the dispatch site",
+                policy.type, policy.name,
+            )
+            continue
+        if not _semantic_intents(policy):
+            continue
+        if (policy.config.get("engine") or "").lower() == "embedding":
+            continue
+        active.append(policy)
+
+    if not active:
+        return out
+
+    judge_text = fastpath.window_text(text) if text else ""
+
+    # ── Build the merged question set ──────────────────────────────
+    tasks: list[Callable[[], Any]] = []
+    # (kind, tool_name, group) per task, index-aligned with ``tasks``.
+    meta: list[tuple[str, str, list[PolicyRule]]] = []
+
+    def _grouped(candidates: list[PolicyRule]) -> list[list[PolicyRule]]:
+        groups: dict[str, list[PolicyRule]] = {}
+        for p in candidates:
+            groups.setdefault(_threshold_group_key(p), []).append(p)
+        return list(groups.values())
+
+    text_policies = [
+        p for p in active if "text" in _semantic_targets(p)
+    ] if judge_text else []
+    for group in _grouped(text_policies):
+        tasks.append(
+            _bind_tool_judge(
+                semantic_blocker, judge_text, _merged_judge_config(group)
+            )
+        )
+        meta.append(("text", "", group))
+
+    tool_policies = [
+        p for p in active if "tool_calls" in _semantic_targets(p)
+    ] if tool_calls else []
+    if tool_policies:
+        # Normalize + dedup by synthesized sentence. Two byte-equal
+        # questions have one answer; asking twice (per duplicate tool
+        # call, and again per policy) was pure latency. First tool
+        # name wins the audit label, matching the legacy walk's
+        # first-match-by-input-order semantics.
+        seen: dict[str, str] = {}
+        for tc in tool_calls or []:
+            if not isinstance(tc, dict):
+                continue
+            name = tc.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            args = tc.get("input")
+            if args is None:
+                args = tc.get("arguments")
+            synthesized = _synthesize_tool_call_text(name, args)
+            if synthesized and synthesized not in seen:
+                seen[synthesized] = name
+        for synthesized, name in seen.items():
+            for group in _grouped(tool_policies):
+                tasks.append(
+                    _bind_tool_judge(
+                        semantic_blocker,
+                        synthesized,
+                        _merged_judge_config(group),
+                    )
+                )
+                meta.append(("tool", name, group))
+
+    if not tasks:
+        return out
+
+    results = _fan_out(tasks, max_workers=_judge_budget.get())
+
+    # ── Attribute matches back to owning policies ───────────────────
+    # Walk in task order (text first, then tools in input order) and
+    # keep at most one record per policy — identical to the legacy
+    # walk, where ``_semantic_guard_match`` returns that policy's
+    # first match and nothing else.
+    claimed: set[int] = set()
+    for (kind, tool_name, group), match in zip(meta, results, strict=True):
+        if match is None:
+            continue
+        owner, _canonical = _owning_policy(match.intent, group)
+        if id(owner) in claimed:
+            continue
+        claimed.add(id(owner))
+        if kind == "text":
+            out.add(
+                MatchedPolicyRecord(
+                    name=owner.name,
+                    type=owner.type,
+                    verdict="block",
+                    reason_code="semantic_blocked",
+                    message=owner.config.get(
+                        "message",
+                        f"{side.capitalize()} matches blocked intent: "
+                        f"'{match.intent}'",
+                    ),
+                )
+            )
+        else:
+            out.add(
+                MatchedPolicyRecord(
+                    name=owner.name,
+                    type=owner.type,
+                    verdict="block",
+                    reason_code="semantic_blocked_tool",
+                    message=owner.config.get(
+                        "message",
+                        (
+                            f"Tool call '{tool_name}' matches blocked "
+                            f"intent: '{match.intent}'"
+                        ),
+                    ),
+                )
+            )
+    return out
+
+
+def _spawn_semantic_shadow(
+    policies: list[PolicyRule],
+    *,
+    text: str,
+    tool_calls: list[dict[str, Any]] | None,
+    semantic_blocker: SemanticBlocker | None,
+    side: str,
+    legacy_records: list[MatchedPolicyRecord],
+) -> None:
+    """Kick off one background fast-vs-legacy comparison.
+
+    Never blocks, never raises, never influences the decision the
+    caller already made. Inputs are snapshotted before the thread
+    starts so a framework mutating its payload after the gate returns
+    cannot skew the comparison.
+    """
+    if semantic_blocker is None or not policies:
+        return
+    if not fastpath.shadow_sampled():
+        return
+    tools_snapshot = [
+        dict(tc) for tc in (tool_calls or []) if isinstance(tc, dict)
+    ]
+    legacy_snapshot = list(legacy_records)
+
+    def _run() -> None:
+        started = fastpath.now_ms()
+        fast = _collect_semantic_fast(
+            policies,
+            text=text,
+            tool_calls=tools_snapshot,
+            semantic_blocker=semantic_blocker,
+            side=side,
+        )
+        fastpath.report_shadow(
+            side=side,
+            legacy_records=legacy_snapshot,
+            fast_records=fast.records,
+            elapsed_ms=fastpath.now_ms() - started,
+        )
+
+    fastpath.spawn_shadow(_run)
+
+
 # ── Shared per-type evaluators (phase-symmetric) ────────────────────────
 #
 # Each helper takes the rule's ``config`` plus whichever signals it
@@ -1357,9 +1698,39 @@ def evaluate_output_policies(
     if not phase2:
         return _synthesize_decision(phase1_matches.records)
 
-    phase2_matches = _collect_output_matches(
-        phase2, context, semantic_blocker=semantic_blocker
-    )
+    # Fast-governance dispatch — mirror of the input side; see
+    # ``evaluate_policies`` and ``egisai.policy.fastpath``.
+    fast_mode = fastpath.mode()
+    sem2 = [p for p in phase2 if p.type == "semantic_guard"]
+    other2 = [p for p in phase2 if p.type != "semantic_guard"]
+    if fast_mode == "on":
+        phase2_matches = _collect_semantic_fast(
+            sem2,
+            text=context.text,
+            tool_calls=context.tool_calls,
+            semantic_blocker=semantic_blocker,
+            side="output",
+        )
+        # Any future non-mergeable LLM-backed kind still runs, via
+        # the legacy walker, in every mode.
+        if other2:
+            for rec in _collect_output_matches(
+                other2, context, semantic_blocker=semantic_blocker
+            ).records:
+                phase2_matches.add(rec)
+    else:
+        phase2_matches = _collect_output_matches(
+            phase2, context, semantic_blocker=semantic_blocker
+        )
+        if fast_mode == "shadow":
+            _spawn_semantic_shadow(
+                sem2,
+                text=context.text,
+                tool_calls=context.tool_calls,
+                semantic_blocker=semantic_blocker,
+                side="output",
+                legacy_records=phase2_matches.records,
+            )
 
     return _synthesize_decision(
         phase1_matches.records + phase2_matches.records
