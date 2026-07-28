@@ -25,8 +25,12 @@ synchronous ``check()`` retains identical semantics for
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -86,6 +90,11 @@ def _env_float(name: str, default: float, *, lo: float = 0.0) -> float:
 #     real bursty rate limit while keeping a misbehaving header
 #     from holding governance hostage.
 #
+#   * ``EGISAI_JUDGE_CACHE_TTL_SECS`` — how long an identical
+#     judge question may be answered from memory instead of the
+#     network. See the verdict-cache notes below. ``0`` disables
+#     caching entirely.
+#
 # Both are read every time a ``SemanticBlocker`` is constructed
 # (i.e. once per ``egisai.init()``), so changing the env var
 # requires re-initialising the SDK — same lifecycle as every
@@ -93,6 +102,50 @@ def _env_float(name: str, default: float, *, lo: float = 0.0) -> float:
 # tunables would be a footgun for compliance.
 _DEFAULT_JUDGE_TIMEOUT_SECS = 8.0
 _DEFAULT_JUDGE_RETRY_AFTER_MAX_SECS = 5.0
+
+# ── Verdict cache ────────────────────────────────────────────────────
+#
+# Agentic workloads re-ask the judge the same question constantly: a
+# multi-turn loop resends a system prompt that dominates the text, and
+# a retried tool call is byte-identical to its first attempt. Every one
+# of those was a fresh network round-trip on the policy hot path.
+#
+# Why this is accuracy-neutral rather than a speed/precision trade:
+# the judge is a temperature-0 classifier over exactly three inputs —
+# the prompt text, the intent list, and the threshold. The cache key is
+# all three. Identical inputs therefore have an identical correct
+# answer, and returning it from memory cannot change a verdict. Editing
+# a policy changes its intents (or threshold), which changes the key,
+# so a stale rule can't keep firing — invalidation is structural, not
+# time-based.
+#
+# What is deliberately NOT cached:
+#
+#   * Outage results. A synthesized fail-open ``None`` or fail-closed
+#     ``_OUTAGE_MATCH`` reflects the judge being unreachable at one
+#     instant, not a verdict about the text. Caching those would let a
+#     two-second blip govern traffic for the whole TTL window.
+#   * Token spend. A cache hit consumed no tokens, so it books none.
+#     ``policy_tokens_*`` keeps meaning "tokens this call actually
+#     paid for", which is what the cost columns are built on.
+#
+# The key is a SHA-256 digest, so no prompt text is retained in the
+# cache — only a fingerprint of it. (Phase 1 has already
+# label-redacted PII by the time text reaches the judge; hashing is
+# belt-and-braces on top of that.)
+#
+# TTL is short by default: long enough to cover an agent loop or a
+# retry storm, short enough that an operator watching the dashboard
+# sees their policy edit take effect promptly even in the pathological
+# case where the edit somehow preserved the key.
+_DEFAULT_JUDGE_CACHE_TTL_SECS = 60.0
+
+# Entry ceiling. Judge verdicts are tiny (a bool, a short string, a
+# float) so this is kilobytes, but an unbounded dict in a long-lived
+# server process is a leak. On overflow the cache is cleared outright
+# rather than LRU-evicted: the access pattern is bursty-then-idle, a
+# full clear is O(1), and the cost of a miss is one round-trip.
+_JUDGE_CACHE_MAX = 512
 
 
 # ── Public surface ────────────────────────────────────────────────────
@@ -136,6 +189,7 @@ class SemanticBlocker:
         on_outage: str = "allow",
         judge_timeout_secs: float | None = None,
         judge_retry_after_max_secs: float | None = None,
+        judge_cache_ttl_secs: float | None = None,
     ) -> None:
         if on_outage not in ("allow", "block"):
             raise ValueError(
@@ -160,10 +214,22 @@ class SemanticBlocker:
                 _DEFAULT_JUDGE_RETRY_AFTER_MAX_SECS,
                 lo=0.1,
             )
+        if judge_cache_ttl_secs is None:
+            judge_cache_ttl_secs = _env_float(
+                "EGISAI_JUDGE_CACHE_TTL_SECS",
+                _DEFAULT_JUDGE_CACHE_TTL_SECS,
+                lo=0.0,
+            )
         self._judge_timeout_secs = float(judge_timeout_secs)
         self._judge_retry_after_max_secs = float(judge_retry_after_max_secs)
+        self._judge_cache_ttl_secs = float(judge_cache_ttl_secs)
         self._http_client = httpx.Client(timeout=self._judge_timeout_secs)
         self._async_http_client: httpx.AsyncClient | None = None
+        # Verdict cache. Guarded by its own lock because Phase 2 fans
+        # judge calls out across worker threads, so concurrent
+        # get/put on the same blocker instance is the normal case.
+        self._cache: dict[str, tuple[float, SemanticMatch | None]] = {}
+        self._cache_lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -176,14 +242,23 @@ class SemanticBlocker:
             return None
         body = prepared
 
+        key = self._cache_key(body)
+        hit, found = self._cache_get(key)
+        if found:
+            return hit
+
         try:
             response = self._post_with_429_retry(body)
             response.raise_for_status()
             data = response.json()
         except Exception as exc:  # noqa: BLE001
+            # Not cached: an outage is a fact about the network at one
+            # instant, not a verdict about this text.
             return self._on_outage_response(exc)
 
-        return self._interpret(data, body)
+        match = self._interpret(data, body)
+        self._cache_put(key, match)
+        return match
 
     async def acheck(
         self, prompt_text: str, config: dict[str, Any]
@@ -194,6 +269,11 @@ class SemanticBlocker:
             return None
         body = prepared
 
+        key = self._cache_key(body)
+        hit, found = self._cache_get(key)
+        if found:
+            return hit
+
         try:
             response = await self._apost_with_429_retry(body)
             response.raise_for_status()
@@ -201,7 +281,9 @@ class SemanticBlocker:
         except Exception as exc:  # noqa: BLE001
             return self._on_outage_response(exc)
 
-        return self._interpret(data, body)
+        match = self._interpret(data, body)
+        self._cache_put(key, match)
+        return match
 
     def close(self) -> None:
         """Close both HTTP clients. Idempotent."""
@@ -227,6 +309,53 @@ class SemanticBlocker:
                     asyncio.run(client.aclose())
             except Exception:  # noqa: BLE001
                 pass
+
+    # ── Verdict cache ─────────────────────────────────────────────────
+
+    def _cache_key(self, body: dict[str, Any]) -> str:
+        """Fingerprint the judge question.
+
+        Covers every input the verdict depends on — prompt text, the
+        intent list, and the threshold — and nothing else. ``body`` is
+        exactly ``_prepare``'s output, so the key can never drift out
+        of sync with what gets posted. Sorted keys make the digest
+        stable across dict ordering.
+        """
+        return hashlib.sha256(
+            json.dumps(body, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+
+    def _cache_get(self, key: str) -> tuple[SemanticMatch | None, bool]:
+        """Return ``(verdict, found)``.
+
+        The two-value shape is load-bearing: ``None`` is a perfectly
+        good cached verdict ("the judge saw this and did not match"),
+        so it cannot double as the sentinel for a miss.
+        """
+        if self._judge_cache_ttl_secs <= 0:
+            return None, False
+        now = time.monotonic()
+        with self._cache_lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None, False
+            expires_at, verdict = entry
+            if expires_at <= now:
+                self._cache.pop(key, None)
+                return None, False
+            return verdict, True
+
+    def _cache_put(self, key: str, verdict: SemanticMatch | None) -> None:
+        """Memoize a genuine judge verdict."""
+        if self._judge_cache_ttl_secs <= 0:
+            return
+        with self._cache_lock:
+            if len(self._cache) >= _JUDGE_CACHE_MAX:
+                self._cache.clear()
+            self._cache[key] = (
+                time.monotonic() + self._judge_cache_ttl_secs,
+                verdict,
+            )
 
     # ── Internals ─────────────────────────────────────────────────────
 
