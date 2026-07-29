@@ -13,6 +13,21 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _legacy_engine_baseline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the suite to the legacy Phase-2 walk unless a test opts in.
+
+    Fast governance became the production DEFAULT in 0.50.0, but most
+    engine tests assert legacy-walk mechanics (one judge call per
+    policy, per-policy payloads, fan-out counts). Pinning ``off`` here
+    keeps those assertions meaningful; the fast path has its own
+    dedicated suite (``test_fast_governance.py``) whose tests set
+    ``on`` / ``shadow`` explicitly — including the equivalence sweep
+    that proves the two walks agree.
+    """
+    monkeypatch.setenv("EGISAI_FAST_GOVERNANCE", "off")
+
+
+@pytest.fixture(autouse=True)
 def reset_sdk() -> Iterator[None]:
     """Wipe the SDK between tests so they're independent."""
     # Make sure modules are loaded

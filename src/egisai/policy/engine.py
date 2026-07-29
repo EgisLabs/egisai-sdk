@@ -1257,6 +1257,50 @@ def _owning_policy(
     return group[0], intent
 
 
+# The platform's judge endpoint validates ``intents`` at
+# ``max_length=16`` (``backend/app/schemas/sdk.py`` — the AI Policy
+# Assistant's recommended list size; longer lists hurt judge accuracy
+# more than they help coverage). A merged question whose union exceeds
+# the cap would be rejected with a 422 and the fast path would fail
+# open — silently judging NOTHING (this happened: three real guards
+# with 5+8+10 intents merged to 23 and every fast-path call bounced).
+# Bin-packing below keeps every merged question at or under the cap.
+_MERGE_MAX_INTENTS = 16
+
+
+def _bin_pack_by_intents(group: list[PolicyRule]) -> list[list[PolicyRule]]:
+    """Split one threshold group into bins of ≤ ``_MERGE_MAX_INTENTS``.
+
+    Greedy, order-preserving first-fit: walk the policies in priority
+    order and start a new bin when the next policy's intents would
+    push the running total over the cap. A policy is never split
+    across bins — attribution (``_owning_policy``) works per bin, so
+    every intent must sit in the same question as its owner.
+
+    A single policy that alone exceeds the cap still gets its own bin:
+    that's byte-for-byte what the legacy walk sends for that policy
+    (per-policy intents, no merging), so fast mode inherits exactly
+    the legacy behavior for it rather than inventing a new failure
+    mode. The sum is computed on raw per-policy counts, not the
+    deduped union — conservative: dedupe can only shrink a bin's
+    final question, never grow it.
+    """
+    bins: list[list[PolicyRule]] = []
+    current: list[PolicyRule] = []
+    current_count = 0
+    for policy in group:
+        n = len(_semantic_intents(policy))
+        if current and current_count + n > _MERGE_MAX_INTENTS:
+            bins.append(current)
+            current = []
+            current_count = 0
+        current.append(policy)
+        current_count += n
+    if current:
+        bins.append(current)
+    return bins
+
+
 def _fast_judge_questions(
     active: list[PolicyRule],
     *,
@@ -1271,6 +1315,10 @@ def _fast_judge_questions(
     synthesized tool sentence per threshold group. Shared by the
     enforcement collector and the shadow DISAGREE diagnostics so the
     two can never drift apart on what was actually asked.
+
+    Groups are keyed by threshold and then bin-packed to the judge
+    endpoint's 16-intent cap (see ``_bin_pack_by_intents``), so a
+    "group" here is really "one askable question's worth of policies".
     """
     questions: list[tuple[str, str, list[PolicyRule], str, dict[str, Any]]] = []
 
@@ -1278,7 +1326,10 @@ def _fast_judge_questions(
         groups: dict[str, list[PolicyRule]] = {}
         for p in candidates:
             groups.setdefault(_threshold_group_key(p), []).append(p)
-        return list(groups.values())
+        packed: list[list[PolicyRule]] = []
+        for group in groups.values():
+            packed.extend(_bin_pack_by_intents(group))
+        return packed
 
     judge_text = fastpath.window_text(text) if text else ""
     text_policies = [

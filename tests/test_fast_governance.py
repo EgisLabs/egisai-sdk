@@ -137,13 +137,17 @@ def _body(request: httpx.Request) -> dict[str, Any]:
 # ── Knob parsing ─────────────────────────────────────────────────────
 
 
-def test_mode_defaults_to_off() -> None:
-    assert fastpath.mode() == "off"
+def test_mode_defaults_to_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fast governance is the production default since 0.50.0."""
+    monkeypatch.delenv(fastpath.MODE_ENV, raising=False)
+    assert fastpath.mode() == "on"
 
 
-def test_invalid_mode_is_off(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_invalid_mode_falls_back_to_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv(fastpath.MODE_ENV, "turbo")
-    assert fastpath.mode() == "off"
+    assert fastpath.mode() == "on"
 
 
 def test_mode_values(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -216,6 +220,7 @@ def test_normalized_keys_share_a_verdict_only_when_mode_is_on(
 
     cfg = {"intents": ["exfiltrate customer data"]}
 
+    monkeypatch.setenv(fastpath.MODE_ENV, "off")
     b = _blocker(handler)
     b.check("look up account CUST-1111 balance", cfg)
     b.check("look up account CUST-2222 balance", cfg)
@@ -382,9 +387,12 @@ def test_fast_mode_fails_open_and_closed_like_legacy(
     assert closed_decision.verdict == "block"
 
 
-def test_mode_off_still_runs_one_call_per_policy() -> None:
-    """No env var ⇒ the legacy walk, byte-identical to the previous
-    release: one judge question per guard."""
+def test_mode_off_still_runs_one_call_per_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The kill switch restores the legacy walk, byte-identical to the
+    pre-0.49 release: one judge question per guard."""
+    monkeypatch.setenv(fastpath.MODE_ENV, "off")
     bodies: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -436,8 +444,11 @@ def test_output_side_merges_and_dedupes_tool_calls(
         assert b["intents"] == ["intent a", "intent b", "intent c"]
 
 
-def test_legacy_output_side_cost_for_comparison() -> None:
+def test_legacy_output_side_cost_for_comparison(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Pin the pre-fast cost so the 15→4 claim in the docs stays honest."""
+    monkeypatch.setenv(fastpath.MODE_ENV, "off")
     calls: list[int] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -745,3 +756,145 @@ def test_agreement_never_triggers_diagnosis_calls(
     # 2 legacy + 1 merged shadow — and nothing more.
     assert len(calls) == 3
     assert "shadow-diagnosis" not in capsys.readouterr().err
+
+
+# ── Bin-packing at the judge endpoint's 16-intent cap ────────────────
+
+
+def _multi_guard(name: str, n_intents: int) -> PolicyRule:
+    return PolicyRule(
+        id=name,
+        name=name,
+        type="semantic_guard",
+        tenant=None,
+        config={
+            "intents": [f"{name} intent {i}" for i in range(n_intents)],
+            "threshold": 0.75,
+        },
+    )
+
+
+def test_merged_questions_never_exceed_the_backend_intent_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production bug: 5+8+10 = 23 intents merged into one question
+    is rejected by the platform's 16-intent schema cap. Bin-packing
+    must split it into questions of ≤16 intents covering all 23."""
+    monkeypatch.setenv(fastpath.MODE_ENV, "on")
+    seen: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        intents = _body(request)["intents"]
+        seen.append(intents)
+        if len(intents) > 16:
+            return httpx.Response(422, json={"detail": "too many intents"})
+        return _allow()
+
+    policies = [
+        _multi_guard("Suppress-audit", 5),
+        _multi_guard("Unverified beneficiary block", 8),
+        _multi_guard("Data exfiltration guard", 10),
+    ]
+    decision = evaluate_policies(policies, _ctx(), _blocker(handler))
+
+    assert decision.verdict == "allow"
+    assert all(len(intents) <= 16 for intents in seen)
+    covered = {i for intents in seen for i in intents}
+    assert len(covered) == 23, "every intent must still be asked"
+    assert len(seen) == 2, "5+8 fits one bin, 10 goes to the second"
+
+
+def test_block_attribution_survives_binning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A match in the second bin attributes to its owning policy."""
+    monkeypatch.setenv(fastpath.MODE_ENV, "on")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        intents = _body(request)["intents"]
+        target = "Data exfiltration guard intent 7"
+        if target in intents:
+            return _block(target)
+        return _allow()
+
+    policies = [
+        _multi_guard("Suppress-audit", 5),
+        _multi_guard("Unverified beneficiary block", 8),
+        _multi_guard("Data exfiltration guard", 10),
+    ]
+    decision = evaluate_policies(policies, _ctx(), _blocker(handler))
+
+    assert decision.verdict == "block"
+    assert decision.matched_policy == "Data exfiltration guard"
+
+
+def test_small_unions_stay_one_merged_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(fastpath.MODE_ENV, "on")
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(len(_body(request)["intents"]))
+        return _allow()
+
+    policies = [
+        _multi_guard("A", 4),
+        _multi_guard("B", 6),
+        _multi_guard("C", 6),
+    ]
+    evaluate_policies(policies, _ctx(), _blocker(handler))
+    assert calls == [16], "4+6+6 = 16 fits exactly in one question"
+
+
+def test_single_policy_over_the_cap_sits_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lone 20-intent policy gets its own question — identical to
+    what the legacy walk sends for it (no new failure mode)."""
+    monkeypatch.setenv(fastpath.MODE_ENV, "on")
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(len(_body(request)["intents"]))
+        return _allow()
+
+    policies = [_multi_guard("huge", 20), _multi_guard("small", 3)]
+    evaluate_policies(policies, _ctx(), _blocker(handler))
+    assert sorted(seen) == [3, 20]
+
+
+# ── 4xx judge rejections are loud, not "outages" ─────────────────────
+
+
+def test_judge_4xx_logs_the_status_code(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"detail": "rejected"})
+
+    b = _blocker(handler)
+    with caplog.at_level("ERROR", logger="egisai"):
+        result = b.check("text", {"intents": ["intent a"]})
+
+    assert result is None, "fail-open posture unchanged"
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "HTTP 422" in joined
+    assert "REJECTED" in joined
+
+
+def test_judge_5xx_stays_a_plain_outage(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    b = _blocker(handler)
+    with caplog.at_level("WARNING", logger="egisai"):
+        b.check("text", {"intents": ["intent a"]})
+
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "HTTP 503" in joined
+    assert "REJECTED" not in joined
