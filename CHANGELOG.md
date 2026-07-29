@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.49.1] — 2026-07-28
+
+### Added
+
+- **Shadow DISAGREE diagnostics.** When the fast-governance shadow
+  comparison disagrees, the harness re-asks each merged question on
+  the shadow thread and prints one `shadow-diagnosis` line per
+  question with the judge's raw confidence, the group's policy/intent
+  counts, and the question length — numbers only, never prompt text
+  or intent strings. A sub-threshold near-miss score points at
+  intent-list dilution; a hard 0.00 points at a structural issue.
+  Powered by a new `SemanticBlocker.diagnose()` (cache-skipping,
+  fail-quiet, no token booking) with a gateway twin on
+  `BackendSemanticBlocker`.
+
+---
+
 ## [0.49.0] — 2026-07-28
 
 ### Added

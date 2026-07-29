@@ -285,6 +285,37 @@ class SemanticBlocker:
         self._cache_put(key, match)
         return match
 
+    def diagnose(
+        self, prompt_text: str, config: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Raw judge verdict for one question — shadow diagnostics only.
+
+        Same wire call as ``check`` but returns the platform's full
+        decision dict (``match`` / ``intent`` / ``confidence`` /
+        usage) instead of collapsing it to ``SemanticMatch | None``.
+        The enforcement path throws the confidence away on a no-match;
+        the shadow harness needs it to distinguish a sub-threshold
+        near-miss (intent-list dilution) from a hard ALLOW (structural
+        bug). Deliberately skips the verdict cache — a diagnosis wants
+        the judge's answer *now* — and deliberately skips token
+        accounting: it only ever runs on the shadow thread, whose
+        spend is not booked to the governed call.
+
+        Fail-quiet: any error returns ``None``. This path must never
+        matter to enforcement.
+        """
+        prepared = self._prepare(prompt_text, config)
+        if prepared is None:
+            return None
+        try:
+            response = self._post_with_429_retry(prepared)
+            response.raise_for_status()
+            data = response.json()
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("judge diagnosis call failed", exc_info=True)
+            return None
+        return data if isinstance(data, dict) else None
+
     def close(self) -> None:
         """Close both HTTP clients. Idempotent."""
         try:
