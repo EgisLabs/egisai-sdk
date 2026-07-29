@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.50.0] — 2026-07-28
+
+### Changed
+
+- **Fast governance is now the production default.**
+  `EGISAI_FAST_GOVERNANCE` unset ⇒ `on` (was `off`). The fast path
+  was validated against the legacy walk via the shadow harness on
+  benign, adversarial, buried-attack, and block-lane traffic with
+  full verdict + attribution agreement. `off` remains the kill
+  switch (byte-identical legacy behavior); `shadow` remains the
+  validation tool for future engine changes. In `on` mode nothing is
+  printed — shadow's AGREE/DISAGREE lines only exist in `shadow`
+  mode.
+
+### Fixed
+
+- **Merged judge questions are bin-packed to the platform's
+  16-intent cap.** Previously, policies whose combined intent lists
+  exceeded 16 produced a merged question the judge endpoint rejected
+  (HTTP 422), and the fast path failed open — silently judging
+  nothing while shadow mode reported the disagreements. Threshold
+  groups are now split into order-preserving bins of ≤ 16 intents
+  (a policy is never split across bins, so attribution is unchanged);
+  e.g. guards with 5 + 8 + 10 intents become two questions (13 + 10)
+  instead of one rejected 23-intent question.
+- **4xx judge rejections are no longer logged as outages.** A 4xx
+  response now logs `HTTP <status>` at ERROR with an explicit
+  "REJECTED, not an outage" message (status code only — response
+  bodies never reach the log), so schema/auth problems can't hide
+  behind the fail-open path again. 5xx and transport errors keep the
+  existing outage wording and fail-open posture.
+
+---
+
 ## [0.49.1] — 2026-07-28
 
 ### Added

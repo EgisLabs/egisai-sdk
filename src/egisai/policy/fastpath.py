@@ -90,26 +90,37 @@ _MIN_WINDOW_CHARS = 1_000
 _warned_invalid_mode = False
 
 
+# Fast governance is the production default (since 0.50.0): merged
+# judge questions bin-packed to the platform's 16-intent cap, windowed
+# judge text, normalized cache keys. Validated against the legacy walk
+# via the shadow harness (verdict + attribution agreement on benign,
+# adversarial, and buried-attack traffic). ``off`` remains the
+# operator kill switch; ``shadow`` remains the rollout/validation
+# tool for future engine changes.
+_DEFAULT_MODE = "on"
+
+
 def mode() -> str:
-    """Resolve ``EGISAI_FAST_GOVERNANCE``. Unset/invalid ⇒ ``off``.
+    """Resolve ``EGISAI_FAST_GOVERNANCE``. Unset/invalid ⇒ ``on``.
 
     Read per evaluation (an ``os.environ`` lookup, sub-microsecond) so
-    an operator can flip a long-lived process between ``shadow`` and
-    ``on`` via a restartless config layer that rewrites the env.
+    an operator can flip a long-lived process between ``off``,
+    ``shadow`` and ``on`` via a restartless config layer that rewrites
+    the env.
     """
     raw = (os.environ.get(MODE_ENV) or "").strip().lower()
     if not raw:
-        return "off"
+        return _DEFAULT_MODE
     if raw in _VALID_MODES:
         return raw
     global _warned_invalid_mode
     if not _warned_invalid_mode:
         _warned_invalid_mode = True
         LOGGER.warning(
-            "%s=%r is not one of %s — treating as 'off'",
-            MODE_ENV, raw, "|".join(_VALID_MODES),
+            "%s=%r is not one of %s — treating as %r",
+            MODE_ENV, raw, "|".join(_VALID_MODES), _DEFAULT_MODE,
         )
-    return "off"
+    return _DEFAULT_MODE
 
 
 def window_chars() -> int:

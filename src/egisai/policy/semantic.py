@@ -469,17 +469,36 @@ class SemanticBlocker:
 
     def _on_outage_response(self, exc: BaseException) -> SemanticMatch | None:
         """Decide what to return when the judge call raised."""
+        detail = exc.__class__.__name__
+        if isinstance(exc, httpx.HTTPStatusError):
+            # A 4xx is NOT an outage — it's this client sending a
+            # request the platform rejects (schema validation, auth,
+            # payload size). Fail-open still applies (availability
+            # first), but the log must say exactly what bounced so a
+            # 422 can never masquerade as a transient blip. Status
+            # code only — the response body can echo request fields
+            # and never belongs in a log line.
+            status = exc.response.status_code
+            detail = f"HTTP {status}"
+            if 400 <= status < 500:
+                LOGGER.error(
+                    "semantic_guard: judge request REJECTED by the "
+                    "platform (%s) — this is a request problem, not an "
+                    "outage; the guard is silently not judging. Check "
+                    "SDK/backend version skew and policy config.",
+                    detail,
+                )
         if self._on_outage == "block":
             LOGGER.warning(
                 "semantic_guard: judge call failed (%s) — failing CLOSED "
                 "(semantic_on_outage='block'); call will be refused",
-                exc.__class__.__name__,
+                detail,
             )
             return _OUTAGE_MATCH
         LOGGER.warning(
             "semantic_guard: judge call failed (%s) — failing open "
             "(semantic_on_outage='allow')",
-            exc.__class__.__name__,
+            detail,
         )
         return None
 
