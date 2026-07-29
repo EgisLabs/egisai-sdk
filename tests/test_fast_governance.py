@@ -656,3 +656,92 @@ def test_on_and_off_agree_on_verdicts(
     assert fast.verdict == legacy.verdict
     if blocked_intent is not None:
         assert fast.matched_policy == legacy.matched_policy
+
+
+# ── Shadow DISAGREE diagnostics ──────────────────────────────────────
+
+
+def test_diagnose_returns_raw_verdict_and_skips_cache() -> None:
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return _block("intent a", confidence=0.55)
+
+    b = _blocker(handler)
+    cfg = {"intents": ["intent a"]}
+
+    first = b.diagnose("question", cfg)
+    assert b.diagnose("question", cfg) is not None
+
+    assert first is not None
+    assert first["match"] is True
+    assert first["confidence"] == 0.55
+    assert len(calls) == 2, "diagnosis always asks the judge NOW — no cache"
+
+
+def test_diagnose_fails_quiet() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("down")
+
+    b = _blocker(handler)
+    assert b.diagnose("question", {"intents": ["intent a"]}) is None
+    assert b.diagnose("", {"intents": ["intent a"]}) is None
+    assert b.diagnose("question", {"intents": []}) is None
+
+
+def test_disagreement_prints_per_question_diagnosis(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """After a DISAGREE, one shadow-diagnosis line per merged question,
+    carrying the judge's confidence — numbers and counts only."""
+    monkeypatch.setenv(fastpath.MODE_ENV, "shadow")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = _body(request)
+        if len(body["intents"]) > 1:
+            # Merged question: sub-threshold near-miss shape.
+            return httpx.Response(
+                200,
+                json={
+                    "match": False, "intent": "", "confidence": 0.62,
+                    "tokens_in": 10, "tokens_out": 2,
+                },
+            )
+        return _block("intent a")
+
+    policies = [_guard("A", "intent a"), _guard("B", "intent b")]
+    decision = evaluate_policies(policies, _ctx(), _blocker(handler))
+    fastpath.wait_for_shadow()
+
+    assert decision.verdict == "block", "legacy path stays the decider"
+    err = capsys.readouterr().err
+    assert "DISAGREE" in err
+    assert "shadow-diagnosis (prompt/text q0)" in err
+    assert "confidence=0.62" in err
+    assert "policies=2" in err
+    assert "intents=2" in err
+    # Compliance: neither the prompt nor any intent string is printed.
+    assert "intent a" not in err
+    assert "hello" not in err
+
+
+def test_agreement_never_triggers_diagnosis_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv(fastpath.MODE_ENV, "shadow")
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return _allow()
+
+    policies = [_guard("A", "intent a"), _guard("B", "intent b")]
+    evaluate_policies(policies, _ctx(), _blocker(handler))
+    fastpath.wait_for_shadow()
+
+    # 2 legacy + 1 merged shadow — and nothing more.
+    assert len(calls) == 3
+    assert "shadow-diagnosis" not in capsys.readouterr().err

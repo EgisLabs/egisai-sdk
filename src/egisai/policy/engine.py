@@ -1257,6 +1257,96 @@ def _owning_policy(
     return group[0], intent
 
 
+def _fast_judge_questions(
+    active: list[PolicyRule],
+    *,
+    text: str,
+    tool_calls: list[dict[str, Any]] | None,
+) -> list[tuple[str, str, list[PolicyRule], str, dict[str, Any]]]:
+    """The merged question inventory for one fast-mode evaluation.
+
+    Returns ``(kind, tool_name, group, question_text, merged_config)``
+    tuples — text questions first (windowed via
+    ``fastpath.window_text``), then one question per *unique*
+    synthesized tool sentence per threshold group. Shared by the
+    enforcement collector and the shadow DISAGREE diagnostics so the
+    two can never drift apart on what was actually asked.
+    """
+    questions: list[tuple[str, str, list[PolicyRule], str, dict[str, Any]]] = []
+
+    def _grouped(candidates: list[PolicyRule]) -> list[list[PolicyRule]]:
+        groups: dict[str, list[PolicyRule]] = {}
+        for p in candidates:
+            groups.setdefault(_threshold_group_key(p), []).append(p)
+        return list(groups.values())
+
+    judge_text = fastpath.window_text(text) if text else ""
+    text_policies = [
+        p for p in active if "text" in _semantic_targets(p)
+    ] if judge_text else []
+    for group in _grouped(text_policies):
+        questions.append(
+            ("text", "", group, judge_text, _merged_judge_config(group))
+        )
+
+    tool_policies = [
+        p for p in active if "tool_calls" in _semantic_targets(p)
+    ] if tool_calls else []
+    if tool_policies:
+        # Normalize + dedup by synthesized sentence. Two byte-equal
+        # questions have one answer; asking twice (per duplicate tool
+        # call, and again per policy) was pure latency. First tool
+        # name wins the audit label, matching the legacy walk's
+        # first-match-by-input-order semantics.
+        seen: dict[str, str] = {}
+        for tc in tool_calls or []:
+            if not isinstance(tc, dict):
+                continue
+            name = tc.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            args = tc.get("input")
+            if args is None:
+                args = tc.get("arguments")
+            synthesized = _synthesize_tool_call_text(name, args)
+            if synthesized and synthesized not in seen:
+                seen[synthesized] = name
+        for synthesized, name in seen.items():
+            for group in _grouped(tool_policies):
+                questions.append(
+                    ("tool", name, group, synthesized,
+                     _merged_judge_config(group))
+                )
+    return questions
+
+
+def _fast_active_policies(policies: list[PolicyRule]) -> list[PolicyRule]:
+    """Filter to the ``semantic_guard`` rules the fast path can merge."""
+    active: list[PolicyRule] = []
+    for policy in policies:
+        if policy.type != "semantic_guard":
+            # Callers split non-semantic phase-2 kinds off to the
+            # legacy walkers BEFORE calling the fast collector (see
+            # the dispatch sites in ``evaluate_policies`` /
+            # ``evaluate_output_policies``); a stray one here means a
+            # new LLM-backed kind was added without teaching either
+            # the dispatch or the collector about it. Say so loudly
+            # rather than guessing at its semantics.
+            LOGGER.warning(
+                "fast-governance: policy type %r is not mergeable and was "
+                "not routed to the legacy walker — rule %r did not run "
+                "this turn; route it at the dispatch site",
+                policy.type, policy.name,
+            )
+            continue
+        if not _semantic_intents(policy):
+            continue
+        if (policy.config.get("engine") or "").lower() == "embedding":
+            continue
+        active.append(policy)
+    return active
+
+
 def _collect_semantic_fast(
     policies: list[PolicyRule],
     *,
@@ -1287,91 +1377,24 @@ def _collect_semantic_fast(
     if semantic_blocker is None:
         return out
 
-    active: list[PolicyRule] = []
-    for policy in policies:
-        if policy.type != "semantic_guard":
-            # Callers split non-semantic phase-2 kinds off to the
-            # legacy walkers BEFORE calling this collector (see the
-            # dispatch sites in ``evaluate_policies`` /
-            # ``evaluate_output_policies``); a stray one here means a
-            # new LLM-backed kind was added without teaching either
-            # the dispatch or this collector about it. Say so loudly
-            # rather than guessing at its semantics.
-            LOGGER.warning(
-                "fast-governance: policy type %r is not mergeable and was "
-                "not routed to the legacy walker — rule %r did not run "
-                "this turn; route it at the dispatch site",
-                policy.type, policy.name,
-            )
-            continue
-        if not _semantic_intents(policy):
-            continue
-        if (policy.config.get("engine") or "").lower() == "embedding":
-            continue
-        active.append(policy)
-
+    active = _fast_active_policies(policies)
     if not active:
         return out
 
-    judge_text = fastpath.window_text(text) if text else ""
-
-    # ── Build the merged question set ──────────────────────────────
-    tasks: list[Callable[[], Any]] = []
-    # (kind, tool_name, group) per task, index-aligned with ``tasks``.
-    meta: list[tuple[str, str, list[PolicyRule]]] = []
-
-    def _grouped(candidates: list[PolicyRule]) -> list[list[PolicyRule]]:
-        groups: dict[str, list[PolicyRule]] = {}
-        for p in candidates:
-            groups.setdefault(_threshold_group_key(p), []).append(p)
-        return list(groups.values())
-
-    text_policies = [
-        p for p in active if "text" in _semantic_targets(p)
-    ] if judge_text else []
-    for group in _grouped(text_policies):
-        tasks.append(
-            _bind_tool_judge(
-                semantic_blocker, judge_text, _merged_judge_config(group)
-            )
-        )
-        meta.append(("text", "", group))
-
-    tool_policies = [
-        p for p in active if "tool_calls" in _semantic_targets(p)
-    ] if tool_calls else []
-    if tool_policies:
-        # Normalize + dedup by synthesized sentence. Two byte-equal
-        # questions have one answer; asking twice (per duplicate tool
-        # call, and again per policy) was pure latency. First tool
-        # name wins the audit label, matching the legacy walk's
-        # first-match-by-input-order semantics.
-        seen: dict[str, str] = {}
-        for tc in tool_calls or []:
-            if not isinstance(tc, dict):
-                continue
-            name = tc.get("name")
-            if not isinstance(name, str) or not name:
-                continue
-            args = tc.get("input")
-            if args is None:
-                args = tc.get("arguments")
-            synthesized = _synthesize_tool_call_text(name, args)
-            if synthesized and synthesized not in seen:
-                seen[synthesized] = name
-        for synthesized, name in seen.items():
-            for group in _grouped(tool_policies):
-                tasks.append(
-                    _bind_tool_judge(
-                        semantic_blocker,
-                        synthesized,
-                        _merged_judge_config(group),
-                    )
-                )
-                meta.append(("tool", name, group))
-
-    if not tasks:
+    questions = _fast_judge_questions(
+        active, text=text, tool_calls=tool_calls
+    )
+    if not questions:
         return out
+
+    tasks: list[Callable[[], Any]] = [
+        _bind_tool_judge(semantic_blocker, question_text, config)
+        for (_kind, _tool_name, _group, question_text, config) in questions
+    ]
+    meta = [
+        (kind, tool_name, group)
+        for (kind, tool_name, group, _question_text, _config) in questions
+    ]
 
     results = _fan_out(tasks, max_workers=_judge_budget.get())
 
@@ -1455,14 +1478,72 @@ def _spawn_semantic_shadow(
             semantic_blocker=semantic_blocker,
             side=side,
         )
-        fastpath.report_shadow(
+        agree = fastpath.report_shadow(
             side=side,
             legacy_records=legacy_snapshot,
             fast_records=fast.records,
             elapsed_ms=fastpath.now_ms() - started,
         )
+        if not agree:
+            _diagnose_shadow_disagreement(
+                policies,
+                text=text,
+                tool_calls=tools_snapshot,
+                semantic_blocker=semantic_blocker,
+                side=side,
+            )
 
     fastpath.spawn_shadow(_run)
+
+
+def _diagnose_shadow_disagreement(
+    policies: list[PolicyRule],
+    *,
+    text: str,
+    tool_calls: list[dict[str, Any]] | None,
+    semantic_blocker: SemanticBlocker,
+    side: str,
+) -> None:
+    """Re-ask each merged question and log its raw verdict + score.
+
+    A DISAGREE line alone can't be root-caused: the interesting datum
+    is the judge's *confidence* on the merged question (a sub-threshold
+    near-miss points at intent-list dilution; a hard ALLOW points at
+    something structural), and the enforcement path throws that number
+    away. This runs only on disagreement — rare by construction — and
+    only inside the shadow thread, so the governed call never pays
+    for it.
+
+    Compliance: the lines carry numbers and counts only (confidence,
+    intent-list size, question length). Never the prompt text, never
+    the intent strings.
+    """
+    diagnose = getattr(semantic_blocker, "diagnose", None)
+    if diagnose is None:
+        return
+    active = _fast_active_policies(policies)
+    questions = _fast_judge_questions(active, text=text, tool_calls=tool_calls)
+    for index, (kind, _tool_name, group, question_text, config) in enumerate(
+        questions
+    ):
+        try:
+            raw = diagnose(question_text, config)
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("shadow diagnosis call failed", exc_info=True)
+            continue
+        if not isinstance(raw, dict):
+            continue
+        fastpath.report_shadow_diagnosis(
+            side=side,
+            kind=kind,
+            question_index=index,
+            policy_count=len(group),
+            intent_count=len(config.get("intents") or []),
+            question_chars=len(question_text),
+            threshold=config.get("threshold"),
+            match=bool(raw.get("match")),
+            confidence=float(raw.get("confidence") or 0.0),
+        )
 
 
 # ── Shared per-type evaluators (phase-symmetric) ────────────────────────

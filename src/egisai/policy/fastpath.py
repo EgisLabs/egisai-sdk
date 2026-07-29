@@ -67,6 +67,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from typing import Any
 
 LOGGER = logging.getLogger("egisai.policy.fastpath")
 
@@ -286,7 +287,7 @@ def report_shadow(
     legacy_records: list,
     fast_records: list,
     elapsed_ms: float,
-) -> None:
+) -> bool:
     """Compare the two paths' Phase-2 outcomes and say so out loud.
 
     Compliance: names and verdicts only. No prompt text, no tool
@@ -335,6 +336,40 @@ def report_shadow(
             "fast=%s%s — keep EGISAI_FAST_GOVERNANCE=shadow until resolved",
             side, legacy_verdict, legacy_names, fast_verdict, fast_names,
         )
+    return agree
+
+
+def report_shadow_diagnosis(
+    *,
+    side: str,
+    kind: str,
+    question_index: int,
+    policy_count: int,
+    intent_count: int,
+    question_chars: int,
+    threshold: Any,
+    match: bool,
+    confidence: float,
+) -> None:
+    """One line per merged question after a DISAGREE, numbers only.
+
+    How to read it: ``confidence`` is the judge's calibrated score on
+    the re-asked merged question. A score just below the threshold
+    (e.g. 0.65 against 0.70) means the union intent list diluted an
+    otherwise-clear match — the mitigation conversation is about list
+    size or reasoning effort. A hard 0.00 means the judge answered a
+    plain ALLOW on content the per-policy questions blocked — a
+    structural problem worth a bug report, not a tuning knob.
+    """
+    print(
+        f"🔬 [egisai] shadow-diagnosis ({side}/{kind} q{question_index}): "
+        f"match={str(match).lower()} confidence={confidence:.2f} "
+        f"threshold={threshold if threshold is not None else 'default'} "
+        f"policies={policy_count} intents={intent_count} "
+        f"question_chars={question_chars}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def shadow_stats() -> tuple[int, int, int]:
