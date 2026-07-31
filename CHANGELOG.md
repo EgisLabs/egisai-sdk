@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.51.0] — 2026-07-30
+
+### Changed
+
+- **PII analysis is memoized, so identical text is never scanned
+  twice.** The spaCy NER pass is the most expensive step on the
+  governance path (~45 ms per 1,000 characters) and the call path was
+  asking it the same question repeatedly: every active `pii_scan`
+  policy scanned the same flattened prompt, a `sanitize` verdict
+  re-scanned to apply masks, and `label_redact` scanned again for the
+  audit preview. `analyzer.analyze()` is a pure function of its
+  inputs, so those are now served from one pass.
+
+  Measured on a 22,000-character transcript: nine `pii_scan` policies
+  went from 8,811 ms to 836 ms. In an agentic loop — where the
+  transcript is append-only and every turn re-sends the whole history
+  — per-turn `sanitize` cost stopped growing with the conversation and
+  flattened at ~160 ms (previously 293 ms at turn 2 rising to 1,204 ms
+  by turn 16).
+
+  This is de-duplication, not approximation: verdicts, sanitized
+  output, redacted previews and confidence scores are unchanged, and
+  the test suite asserts that equality directly.
+
+- **The spaCy dependency parser is disabled after load.** Presidio
+  reads named entities and token lemmas and never touches the parse
+  tree, so building one was pure cost. Entities and confidence scores
+  are byte-identical with it off; if a future Presidio or spaCy
+  release moves these internals, the full pipeline is kept instead
+  (slower, never wrong).
+
+### Added
+
+- `EGISAI_PII_CACHE_TTL_SECS` (default `300`, `0` disables the cache
+  outright) and `EGISAI_PII_CACHE_MAX` (default `512` entries) to tune
+  the analysis cache.
+
+### Security
+
+- The analysis cache is keyed by a SHA-256 of the text and stores only
+  entity labels, offsets and scores — never the text and never a
+  detected value — so it holds nothing sensitive despite being keyed
+  by PII-bearing input (compliance rule 1). Cached spans are frozen,
+  so no caller can alter what another caller receives, and the cache
+  is dropped whenever the analyzer is rebuilt.
+
+---
+
 ## [0.50.0] — 2026-07-28
 
 ### Changed
