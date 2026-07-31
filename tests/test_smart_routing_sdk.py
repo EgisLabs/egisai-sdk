@@ -19,6 +19,7 @@ Layers under test, bottom-up:
 from __future__ import annotations
 
 import sys
+import time
 import types
 from typing import Any
 
@@ -490,6 +491,111 @@ def test_e2e_dormant_org_sends_zero_route_calls(fake_backend) -> None:
 
 
 # ── google.genai adapter (same-provider Gemini → Gemini) ────────────
+
+
+class TestRoutingIsBookedOnThePolicyColumn:
+    """The routing decision is governance cost, on both ingest paths.
+
+    The inline Gateway has always folded its routing window into
+    ``policy_latency_ms``; the SDK left it out, so the dashboard's
+    "Policy" number meant "evaluation" for one caller and
+    "evaluation + routing" for the other. An operator comparing an SDK
+    row against a Gateway row was comparing two different quantities.
+    """
+
+    def _slow_route(self, seconds: float):
+        def _route(**kw: Any) -> None:
+            time.sleep(seconds)
+            return None
+
+        return _route
+
+    def test_decision_time_is_added_to_the_policy_column(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(_routing, "maybe_route", self._slow_route(0.05))
+        ev: dict[str, Any] = {"prompt_preview": "hi", "prompt_chars": 2}
+
+        _prepare_route(
+            ev=ev,
+            model="gpt-4o",
+            stream=False,
+            payload={},
+            routing_adapter=_FakeCall("gpt-4o").adapter(),
+        )
+
+        assert ev["policy_latency_ms"] >= 40
+
+    def test_it_accumulates_rather_than_overwrites(self, monkeypatch) -> None:
+        """The input phase stamped its number first; don't clobber it."""
+        monkeypatch.setattr(_routing, "maybe_route", self._slow_route(0.05))
+        ev: dict[str, Any] = {
+            "prompt_preview": "hi",
+            "prompt_chars": 2,
+            "policy_latency_ms": 7,
+        }
+
+        _prepare_route(
+            ev=ev,
+            model="gpt-4o",
+            stream=False,
+            payload={},
+            routing_adapter=_FakeCall("gpt-4o").adapter(),
+        )
+
+        assert ev["policy_latency_ms"] >= 47
+
+    def test_a_failing_decision_still_books_its_time(
+        self, monkeypatch
+    ) -> None:
+        """Fail-open hides the error, not the latency it cost."""
+
+        def _boom(**kw: Any) -> None:
+            time.sleep(0.05)
+            raise RuntimeError("decision service down")
+
+        monkeypatch.setattr(_routing, "maybe_route", _boom)
+        ev: dict[str, Any] = {"prompt_preview": "hi", "prompt_chars": 2}
+
+        assert (
+            _prepare_route(
+                ev=ev,
+                model="gpt-4o",
+                stream=False,
+                payload={},
+                routing_adapter=_FakeCall("gpt-4o").adapter(),
+            )
+            is None
+        )
+        assert ev["policy_latency_ms"] >= 40
+
+    def test_routing_off_books_nothing(self, monkeypatch) -> None:
+        """Disabled routing must not add even a stray millisecond."""
+        monkeypatch.setattr(_routing, "maybe_route", lambda **kw: None)
+        ev: dict[str, Any] = {"prompt_preview": "hi", "prompt_chars": 2}
+
+        _prepare_route(
+            ev=ev,
+            model="gpt-4o",
+            stream=False,
+            payload={},
+            routing_adapter=_FakeCall("gpt-4o").adapter(),
+        )
+
+        assert ev.get("policy_latency_ms", 0) == 0
+
+    def test_no_adapter_leaves_the_column_untouched(self) -> None:
+        ev: dict[str, Any] = {"policy_latency_ms": 3}
+
+        _prepare_route(
+            ev=ev,
+            model="gpt-4o",
+            stream=False,
+            payload={},
+            routing_adapter=None,
+        )
+
+        assert ev["policy_latency_ms"] == 3
 
 
 class TestGenaiAdapter:

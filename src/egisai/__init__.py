@@ -14,7 +14,7 @@ plus an httpx / requests fallback.
 
 from __future__ import annotations
 
-__version__ = "0.52.0"
+__version__ = "0.53.0"
 
 # Identity v2 helpers — public for advanced callers (and the
 # platform's gateway) that need to compute the same model-invariant
