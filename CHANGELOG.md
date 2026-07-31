@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.52.0] — 2026-07-31
+
+### Added
+
+- **Opt-in transformer NER engine (`EGISAI_NER_ENGINE=ettin`).** Swaps
+  spaCy's `en_core_web_lg` for an ONNX export of the Ettin-32M encoder
+  fine-tuned on Nvidia's Nemotron-PII corpus. Measured on real
+  payloads: source code goes from ~27 name/location false positives
+  per 27k characters (each corrupting the sanitized output — `Claude`
+  masked as a person, module paths as addresses) to **zero**, while
+  additionally catching lowercase names ("my name is maria sanchez"),
+  all-caps wire-transfer names, and non-English names (Portuguese,
+  French, German tested) that spaCy misses. Requires the new
+  `fast-ner` extra (`pip install 'egisai[fast-ner]'` — onnxruntime +
+  tokenizers, no torch); the model (~127 MB) downloads once from a
+  commit-pinned, content-immutable URL, or is read from
+  `EGISAI_ETTIN_MODEL_DIR`.
+
+  Safety properties, enforced in code rather than assumed:
+
+  - full-document coverage — the tokenizer's baked-in truncation is
+    force-disabled, documents are processed in overlapping windows,
+    and a startup self-check plants canary entities deep inside a
+    long document and refuses to bring the engine up if any are
+    missed (the loader then falls back to spaCy);
+  - any failure (missing extra, unreachable model host, failed
+    self-check) falls back to the spaCy engine with a warning — an
+    optional accelerator can never become a detection outage;
+  - spans snap to whole-word boundaries and window overlap regions
+    are unioned, so coverage merges can only widen, never shrink.
+
+  When active, Presidio's NLP pass runs on a blank English tokenizer
+  (no 750 MB spaCy download, ~1 ms per 1,000 chars instead of ~30) —
+  pattern recognizers, checksum validators and context-word boosting
+  are unchanged. spaCy remains the default engine: changing detection
+  behavior stays an explicit operator choice.
+
+- **Chunked PII analysis caching.** Long documents are split at
+  stable blank-line boundaries (~4k chars per chunk) and each chunk's
+  analysis is cached independently. Agentic transcripts and
+  coding-assistant payloads re-send almost identical documents every
+  call; with chunking the unchanged prefix is served from cache and
+  only new content is analyzed — per-call NER cost becomes
+  proportional to what changed, not to transcript length. Newline
+  cuts cannot split a single-line PII value, forced mid-line cuts
+  overlap by more than the longest detectable value, and duplicate
+  detections in overlaps are unioned. `EGISAI_PII_CHUNKING=off`
+  restores single-pass analysis; `EGISAI_PII_CHUNK_CHARS` tunes the
+  chunk size. The analysis cache default grew from 512 to 2048
+  entries to hold a large document's chunks without thrashing.
+
+- **Per-entity confidence floors for two noisy Presidio recognizers.**
+  `US_DRIVER_LICENSE` matches below 0.4 (the score its own context
+  enhancer assigns to context-confirmed hits) are dropped — this is
+  the pattern that tagged `v1`, `o3` and every version string as a
+  license. Scheme-less `URL` matches below 0.6 are dropped unless
+  they start with `www.` — this is the pattern that tagged
+  `app.services.pr` and `m.id` as URLs. Checksum-validated
+  recognizers are untouched (fail closed on PII). The
+  `UsLicenseRecognizer` context list is widened (`dl`, `licence`,
+  plural forms) so labelled licenses keep clearing the floor.
+  `EGISAI_PII_SCORE_FLOORS=off` restores raw behavior (only ever
+  adds detections).
+
+- New tuning env vars: `EGISAI_ETTIN_MODEL_DIR`, `EGISAI_ETTIN_REPO`,
+  `EGISAI_ETTIN_REVISION`, `EGISAI_ETTIN_THRESHOLD` (default 0.5),
+  `EGISAI_ETTIN_WINDOW` (default 512 tokens), `EGISAI_ETTIN_BATCH`
+  (default 8).
+
+### Security
+
+- The Ettin model download is pinned to a commit SHA, making the
+  URLs content-immutable. The engine refuses to start if a canary
+  entity planted deep in a long document is not detected, so a model
+  or tokenizer that silently truncates input can never go live —
+  this failure mode was observed in two upstream defaults during
+  development and is now structurally excluded.
+- Chunked caching stores the same non-sensitive shape as before
+  (entity labels, offsets, scores keyed by SHA-256 of the text) —
+  never text, never a detected value.
+
+---
+
 ## [0.51.0] — 2026-07-30
 
 ### Changed

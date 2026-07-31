@@ -472,3 +472,62 @@ def register_custom_recognizers(registry) -> None:  # type: ignore[no-untyped-de
         if getattr(rec, "name", "") in existing_names:
             continue
         registry.add_recognizer(rec)
+
+    _install_widened_license_recognizer(registry)
+
+
+# ── Driver's-license context widening ───────────────────────────────
+#
+# Presidio's ``UsLicenseRecognizer`` scores its alphanumeric pattern
+# at 0.3 and relies on nearby context words to lift that to something
+# believable. ``egisai.policy._pii_scores`` enforces exactly that
+# rule, which makes the context list load-bearing: a license number
+# whose label Presidio doesn't recognize now scores too low to act
+# on.
+#
+# The shipped list is ``driver, license, permit, lic, identification,
+# dls, cdls, lic#, driving``. It misses forms that are everywhere in
+# real prompts: the abbreviation ``DL``, the British spelling
+# ``licence``, and — because the fast NLP engine compares raw
+# lowercased tokens rather than lemmas — the common inflections
+# (``licenses``, ``permits``). Adding them restores detection for
+# ``DL C4455667`` without touching the floor; the alternative would
+# have been to trust *every* unlabelled 0.3 match, which is what
+# produced the ``v1`` / ``o3`` noise in the first place.
+
+_EXTRA_LICENSE_CONTEXT = (
+    "dl",
+    "dl#",
+    "licence",
+    "licences",
+    "licenses",
+    "permits",
+    "drivers",
+    "driver's",
+)
+
+
+def _install_widened_license_recognizer(registry) -> None:  # type: ignore[no-untyped-def]
+    """Swap in a ``UsLicenseRecognizer`` that knows more context words.
+
+    Replaces rather than supplements: two recognizers for the same
+    entity would both fire on a labelled license and the duplicate
+    span would be merged away anyway, so the extra work buys nothing.
+
+    Best-effort. If Presidio's class or registry API moves, the
+    shipped recognizer stays in place — detection is then narrower
+    than intended for abbreviations, never wrong.
+    """
+    try:
+        from presidio_analyzer.predefined_recognizers import UsLicenseRecognizer
+
+        default = UsLicenseRecognizer()
+        widened = UsLicenseRecognizer(
+            context=[*(default.context or []), *_EXTRA_LICENSE_CONTEXT]
+        )
+        # ``getattr`` for the same mypy ``has-type`` reason as in
+        # ``register_custom_recognizers`` above.
+        registry.remove_recognizer(getattr(default, "name", "UsLicenseRecognizer"))
+        registry.add_recognizer(widened)
+    except Exception:  # noqa: BLE001 — optional precision improvement
+        return

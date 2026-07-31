@@ -43,7 +43,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from egisai.policy import _pii_analysis_cache, _pii_loader, _pii_taxonomy
+from egisai.policy import (
+    _pii_analysis_cache,
+    _pii_loader,
+    _pii_scores,
+    _pii_taxonomy,
+)
 from egisai.policy._pii_helpers import (
     is_reserved_email_domain,
     luhn_check,
@@ -300,6 +305,12 @@ def _scan_with_presidio(
     )
     findings: list[PIIFinding] = []
     for r in results:
+        if not _pii_scores.is_believable(
+            r.entity_type, float(r.score), text[r.start : r.end]
+        ):
+            # Recognizer fired below the confidence its own design
+            # says is believable — see :mod:`egisai.policy._pii_scores`.
+            continue
         op_type = _pii_taxonomy.type_for_entity(r.entity_type)
         if op_type is None:
             # Recognizer fired for an entity we don't expose to the
@@ -386,6 +397,12 @@ def _apply_results(
     """
     selected: list[tuple[int, int, str, float]] = []
     for r in raw_results:
+        # Same test the reporting path applies, so a span that gets
+        # masked here is always one ``scan`` also reported.
+        if not _pii_scores.is_believable(
+            r.entity_type, float(r.score), text[r.start : r.end]
+        ):
+            continue
         op_type = _pii_taxonomy.type_for_entity(r.entity_type)
         if op_type is None:
             continue
