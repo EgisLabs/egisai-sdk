@@ -39,9 +39,11 @@ import logging
 import math
 import re
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
-from egisai.policy import _pii_loader, _pii_taxonomy
+from egisai.policy import _pii_analysis_cache, _pii_loader, _pii_taxonomy
 from egisai.policy._pii_helpers import (
     is_reserved_email_domain,
     luhn_check,
@@ -293,10 +295,8 @@ def _scan_with_presidio(
 ) -> list[PIIFinding]:
     """Run Presidio's analyze() and translate results into ``PIIFinding``."""
     entities = _entities_for_filter(type_filter)
-    results = analyzer.analyze(
-        text=text,
-        entities=entities,
-        language="en",
+    results = _pii_analysis_cache.analyze_cached(
+        analyzer, text=text, entities=entities
     )
     findings: list[PIIFinding] = []
     for r in results:
@@ -333,10 +333,8 @@ def _sanitize_with_presidio(
 ) -> tuple[str, list[Sanitization]]:
     """Apply shape-preserving masks driven by Presidio results."""
     entities = _entities_for_filter(type_filter)
-    raw_results = analyzer.analyze(
-        text=text,
-        entities=entities,
-        language="en",
+    raw_results = _pii_analysis_cache.analyze_cached(
+        analyzer, text=text, entities=entities
     )
     return _apply_results(
         text,
@@ -354,10 +352,8 @@ def _label_redact_with_presidio(
 ) -> str:
     """Replace spans with typed labels — shape doesn't matter."""
     entities = _entities_for_filter(type_filter)
-    raw_results = analyzer.analyze(
-        text=text,
-        entities=entities,
-        language="en",
+    raw_results = _pii_analysis_cache.analyze_cached(
+        analyzer, text=text, entities=entities
     )
     masked, _ = _apply_results(
         text,
@@ -371,7 +367,7 @@ def _label_redact_with_presidio(
 
 def _apply_results(
     text: str,
-    raw_results: list,  # type: ignore[type-arg]
+    raw_results: Sequence[Any],
     *,
     type_filter: list[str] | None,
     mask_char: str,

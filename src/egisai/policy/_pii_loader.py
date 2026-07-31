@@ -179,9 +179,16 @@ def reset_for_tests() -> None:
 
     Intended for the SDK test suite only — production callers should
     rely on ``prime_analyzer_async`` being idempotent.
+
+    Also drops the analysis cache: spans computed by the outgoing
+    analyzer must never be served for whatever replaces it.
     """
     global _state
+
+    from egisai.policy import _pii_analysis_cache
+
     _state = _AnalyzerState()
+    _pii_analysis_cache.clear()
 
 
 # ── Implementation ──────────────────────────────────────────────────
@@ -257,6 +264,7 @@ def _build_analyzer(*, quiet: bool) -> AnalyzerEngine:
         "models": [{"lang_code": "en", "model_name": _SPACY_MODEL_NAME}],
     }
     nlp_engine = NlpEngineProvider(nlp_configuration=nlp_configuration).create_engine()
+    _disable_unused_pipes(nlp_engine)
 
     analyzer = AnalyzerEngine(
         nlp_engine=nlp_engine,
@@ -272,6 +280,44 @@ def _build_analyzer(*, quiet: bool) -> AnalyzerEngine:
     # from ``_load_in_background`` when the daemon thread can't load
     # the analyzer) so misconfigurations remain visible.
     return analyzer
+
+
+# spaCy components Presidio never consults. The dependency parser
+# produces a parse tree nothing downstream reads: entities come from
+# ``ner`` and the context enhancer scores on token lemmas, which are
+# produced by ``tagger`` + ``attribute_ruler`` + ``lemmatizer``. Those
+# stay enabled — only the parse tree is dead weight, and it is one of
+# the most expensive components in the pipeline.
+_UNUSED_SPACY_PIPES = ("parser",)
+
+
+def _disable_unused_pipes(nlp_engine: Any) -> None:
+    """Switch off pipeline components that cost time and change nothing.
+
+    Presidio has no configuration hook for this, so we reach for
+    spaCy's public ``disable_pipe`` on the already-loaded pipeline —
+    cheaper than reloading the model, and it touches no Presidio
+    internals beyond ``nlp_engine.nlp`` being the standard
+    ``{lang: Language}`` mapping.
+
+    Purely an optimization: any failure here leaves the full pipeline
+    in place, which is slower but identical in output, so it is
+    swallowed rather than escalated.
+    """
+    try:
+        pipelines = getattr(nlp_engine, "nlp", None)
+        if not isinstance(pipelines, dict):
+            return
+        for pipeline in pipelines.values():
+            for name in _UNUSED_SPACY_PIPES:
+                if name in getattr(pipeline, "pipe_names", ()):
+                    pipeline.disable_pipe(name)
+    except Exception as exc:  # noqa: BLE001 — optimization only
+        LOGGER.debug(
+            "could not disable unused spaCy pipes (%s); "
+            "keeping the full pipeline",
+            exc.__class__.__name__,
+        )
 
 
 def _ensure_spacy_model_present(*, quiet: bool) -> None:
