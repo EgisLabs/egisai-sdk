@@ -781,9 +781,19 @@ def _prepare_route(
       the gate runs it instead of ``forward()``.
     * ``revert`` — undoes a same-provider ``kwargs`` rewrite so the
       fail-open retry can re-run on the requested model.
+
+    Wall-clock spent deciding is added to ``ev["policy_latency_ms"]``.
+    Choosing the model is a governance decision Egis made on the
+    caller's behalf, so it belongs in the same column as policy
+    evaluation — and it has to, for the dashboard's "Policy" number to
+    mean the same thing whether a call arrived through the SDK or
+    through the inline Gateway (which books its own routing window
+    there). When routing is off, ``maybe_route`` returns on a cached
+    flag and this contributes a hard zero.
     """
     if routing_adapter is None:
         return None
+    routing_started = time.monotonic()
     try:
         from egisai import _routing
 
@@ -832,6 +842,12 @@ def _prepare_route(
     except Exception:  # noqa: BLE001
         LOGGER.debug("routing prepare failed — keeping requested model", exc_info=True)
         return None
+    finally:
+        elapsed_ms = int((time.monotonic() - routing_started) * 1000)
+        if elapsed_ms:
+            ev["policy_latency_ms"] = (
+                int(ev.get("policy_latency_ms") or 0) + elapsed_ms
+            )
 
 
 def _routed_forward_sync(

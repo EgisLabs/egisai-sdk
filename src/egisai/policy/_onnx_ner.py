@@ -243,7 +243,7 @@ class OnnxNerEngine:
         Raises on any problem — never returns a half-working engine.
         """
         import onnxruntime as ort  # type: ignore[import-untyped]
-        from tokenizers import Tokenizer
+        from tokenizers import Tokenizer  # type: ignore[import-untyped]
 
         config = json.loads((model_dir / "config.json").read_text())
         id2label = {int(k): str(v) for k, v in config["id2label"].items()}

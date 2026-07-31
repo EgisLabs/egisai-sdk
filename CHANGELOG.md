@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.53.0] — 2026-07-31
+
+### Changed
+
+- **`policy_latency_ms` now covers the Smart Routing decision too.**
+  Previously the SDK booked only policy evaluation while the inline
+  Gateway booked evaluation *plus* routing into the same dashboard
+  column, so the "Policy" number on a request row meant two different
+  things depending on how the call arrived. Both paths now report the
+  same thing: time Egis spent making governance decisions — policy
+  evaluation (both phases, including a `semantic_guard` judge
+  round-trip) plus the routing decision. Calls with routing disabled
+  are unaffected: `maybe_route` returns on a cached flag and adds a
+  hard zero.
+
 ## [0.52.0] — 2026-07-31
 
 ### Added
