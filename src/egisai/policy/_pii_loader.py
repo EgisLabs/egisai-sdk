@@ -32,6 +32,7 @@ Lifetime:
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -47,6 +48,28 @@ LOGGER = logging.getLogger("egisai.pii")
 # customer per the runtime PII upgrade. The size is intentional: the
 # user explicitly chose "super strong by default from day one."
 _SPACY_MODEL_NAME = "en_core_web_lg"
+
+# ── NER engine selection ────────────────────────────────────────────
+#
+# ``EGISAI_NER_ENGINE=ettin`` swaps spaCy NER for the Ettin
+# Nemotron-PII ONNX model (see ``_onnx_ner``): zero false positives
+# on source code, catches lowercase and non-English names, and pairs
+# with a blank-tokenizer NLP engine so the 750 MB spaCy model is not
+# needed at all. Requires the ``fast-ner`` extra
+# (``pip install 'egisai[fast-ner]'``).
+#
+# spaCy stays the default: switching engines changes which spans are
+# detected, and per sdk-design-philosophy.mdc that kind of behavior
+# change must be an explicit operator choice, never a side effect of
+# which packages happen to be importable.
+_ENGINE_SPACY = "spacy"
+_ENGINE_ETTIN = "ettin"
+
+
+def _resolve_ner_engine() -> str:
+    """Which NER engine the operator asked for. spaCy unless told otherwise."""
+    raw = os.environ.get("EGISAI_NER_ENGINE", _ENGINE_SPACY).strip().lower()
+    return _ENGINE_ETTIN if raw == _ENGINE_ETTIN else _ENGINE_SPACY
 
 
 # ── Module-level state ─────────────────────────────────────────────
@@ -241,15 +264,37 @@ def _load_in_background(*, quiet: bool) -> None:
 def _build_analyzer(*, quiet: bool) -> AnalyzerEngine:
     """Construct a Presidio analyzer with our custom recognizers.
 
-    Performs three steps:
+    When ``EGISAI_NER_ENGINE=ettin`` is set, the ONNX transformer
+    path is attempted first; any failure there (missing extra,
+    unreachable model host, failed self-check) falls back to this
+    spaCy path, which is a working configuration — just the slower,
+    noisier one. Refusing to start over an optional accelerator
+    would trade a performance regression for a detection outage.
+
+    The spaCy path performs three steps:
       1. ensure ``en_core_web_lg`` is installed (download if missing);
       2. instantiate Presidio's ``AnalyzerEngine`` configured for that model;
-      3. register our four custom Egis recognizers on the analyzer's registry.
+      3. register our custom Egis recognizers on the analyzer's registry.
 
     Each step's failure is fatal for the loader (the daemon thread
     catches and swallows). The hot path then keeps using the regex
     fallback.
     """
+    if _resolve_ner_engine() == _ENGINE_ETTIN:
+        try:
+            return _build_ettin_analyzer()
+        except Exception as exc:  # noqa: BLE001 — fall back to spaCy
+            LOGGER.warning(
+                "[egisai] EGISAI_NER_ENGINE=ettin requested but the ONNX "
+                "NER engine could not start (%s: %s) — falling back to "
+                "spaCy NER. Install the extra with "
+                "pip install 'egisai[fast-ner]' and check network access "
+                "to huggingface.co (or set EGISAI_ETTIN_MODEL_DIR to a "
+                "local copy).",
+                exc.__class__.__name__,
+                exc,
+            )
+
     _ensure_spacy_model_present(quiet=quiet)
 
     # Imports are scoped here so the cost (~hundreds of ms of pyc
@@ -279,6 +324,51 @@ def _build_analyzer(*, quiet: bool) -> AnalyzerEngine:
     # on every process start. We still surface failures (a warning
     # from ``_load_in_background`` when the daemon thread can't load
     # the analyzer) so misconfigurations remain visible.
+    return analyzer
+
+
+def _build_ettin_analyzer() -> AnalyzerEngine:
+    """Analyzer with Ettin ONNX NER and a blank-tokenizer NLP engine.
+
+    Raises on any problem; the caller falls back to the spaCy path.
+    Success requires the engine to pass its own coverage self-check
+    (a canary entity planted deep inside a long document must be
+    found), so a model that silently truncates can never go live.
+    """
+    # Imports scoped here: the ``fast-ner`` extra (onnxruntime +
+    # tokenizers) is optional, and a default install must not pay
+    # for — or crash on — these imports.
+    from presidio_analyzer import AnalyzerEngine
+
+    from egisai.policy._ettin_recognizer import EttinRecognizer
+    from egisai.policy._fast_nlp import FastBlankNlpEngine
+    from egisai.policy._onnx_ner import (
+        OnnxNerEngine,
+        ensure_model_files,
+        resolve_model_dir,
+    )
+    from egisai.policy._pii_recognizers import register_custom_recognizers
+
+    model_dir = resolve_model_dir()
+    ensure_model_files(model_dir)
+
+    engine = OnnxNerEngine.from_dir(model_dir)
+    engine.self_check()
+
+    nlp_engine = FastBlankNlpEngine()
+    nlp_engine.load()
+
+    analyzer = AnalyzerEngine(
+        nlp_engine=nlp_engine,
+        supported_languages=["en"],
+    )
+
+    register_custom_recognizers(analyzer.registry)
+    analyzer.registry.add_recognizer(EttinRecognizer(engine))
+
+    LOGGER.info(
+        "[egisai] NER engine: Ettin ONNX (%s)", model_dir
+    )
     return analyzer
 
 

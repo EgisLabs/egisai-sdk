@@ -25,9 +25,20 @@ holds nothing sensitive even though it is keyed by PII-bearing input
 (security-and-compliance.mdc rule 1). Offsets are meaningless without
 the text, which only the caller that supplied it ever has.
 
+**Chunked reuse for long documents.** Whole-text keys can't help
+when a caller re-sends an *almost* identical document (an agentic
+transcript that grew by one turn, a Cursor payload whose system
+prompt never changes). Long texts are therefore split at stable
+newline boundaries by :mod:`egisai.policy._pii_chunker` and each
+chunk is cached independently — the unchanged prefix of an
+append-only document is served entirely from cache and only the new
+tail is analyzed. ``EGISAI_PII_CHUNKING=off`` restores single-pass
+analysis.
+
 **Tuning.** ``EGISAI_PII_CACHE_TTL_SECS`` (default 300, ``0``
 disables the cache entirely) and ``EGISAI_PII_CACHE_MAX`` (default
-512 entries).
+2048 entries — sized so a 200k-character document's ~50 chunks plus
+several whole-text entries never thrash).
 """
 
 from __future__ import annotations
@@ -39,6 +50,8 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
+
+from egisai.policy import _pii_chunker
 
 __all__ = ["Span", "analyze_cached", "clear", "stats"]
 
@@ -78,7 +91,7 @@ def _ttl_secs() -> float:
 
 
 def _max_entries() -> int:
-    return max(1, _env_int("EGISAI_PII_CACHE_MAX", 512))
+    return max(1, _env_int("EGISAI_PII_CACHE_MAX", 2048))
 
 
 _lock = threading.Lock()
@@ -137,7 +150,13 @@ def analyze_cached(
             del _cache[key]
         _misses += 1
 
-    spans = _analyze(analyzer, text=text, entities=entities)
+    if (
+        _pii_chunker.chunking_enabled()
+        and len(text) > _pii_chunker.min_chunkable_chars()
+    ):
+        spans = _analyze_chunked(analyzer, text=text, entities=entities)
+    else:
+        spans = _analyze(analyzer, text=text, entities=entities)
 
     with _lock:
         _cache[key] = (time.monotonic(), spans)
@@ -147,6 +166,61 @@ def analyze_cached(
             _cache.popitem(last=False)
 
     return spans
+
+
+def _analyze_chunked(
+    analyzer: Any,
+    *,
+    text: str,
+    entities: list[str] | None,
+) -> tuple[Span, ...]:
+    """Analyze a long document as independently cached chunks.
+
+    Each chunk recurses through :func:`analyze_cached`, so a chunk
+    that appeared in an earlier (shorter or edited) version of the
+    document is a cache hit — this is what turns an append-only
+    transcript from O(total length) per call into O(new content).
+
+    Chunk-local offsets are shifted back to document coordinates.
+    Where chunks overlap (only after a forced mid-line cut, see
+    ``_pii_chunker``), the same value may be detected twice; exact
+    duplicates and same-entity overlapping spans are unioned, which
+    can only widen coverage — the fail-closed direction.
+    """
+    collected: list[Span] = []
+    for start, end in _pii_chunker.chunk_ranges(text):
+        for span in analyze_cached(
+            analyzer, text=text[start:end], entities=entities
+        ):
+            collected.append(
+                Span(
+                    entity_type=span.entity_type,
+                    start=span.start + start,
+                    end=span.end + start,
+                    score=span.score,
+                )
+            )
+
+    collected.sort(key=lambda s: (s.start, s.end))
+    merged: list[Span] = []
+    for span in collected:
+        if merged:
+            last = merged[-1]
+            if (
+                span.entity_type == last.entity_type
+                and span.start < last.end
+            ):
+                # Same entity seen by both sides of an overlap:
+                # union the ranges, keep the stronger score.
+                merged[-1] = Span(
+                    entity_type=last.entity_type,
+                    start=last.start,
+                    end=max(last.end, span.end),
+                    score=max(last.score, span.score),
+                )
+                continue
+        merged.append(span)
+    return tuple(merged)
 
 
 def _analyze(

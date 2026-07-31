@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "egisai"
-version = "0.51.0"
+version = "0.52.0"
 description = "Native runtime governance SDK for AI agents — import egisai; egisai.init() and you're protected."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -94,6 +94,14 @@ anthropic = ["anthropic>=0.40.0"]
 # package. The two extras are independent and can be combined.
 google = ["google-genai>=1.0.0"]
 google-legacy = ["google-generativeai>=0.8.0"]
+# Enables ``EGISAI_NER_ENGINE=ettin``: swaps spaCy NER for an ONNX
+# transformer fine-tuned on Nvidia's Nemotron-PII corpus. Measured on
+# a 27k-character source file: 27 false positives (spaCy) → 0, and it
+# additionally catches lowercase and non-English names. Deliberately
+# an extra, not a runtime dependency — onnxruntime is ~60 MB and the
+# default install must stay lean; the engine is opt-in via env var
+# even when installed, per sdk-design-philosophy.mdc.
+fast-ner = ["onnxruntime>=1.17.0", "tokenizers>=0.15.0"]
 all = [
   "openai>=1.40.0",
   "anthropic>=0.40.0",
@@ -105,6 +113,11 @@ dev = [
   "ruff>=0.7.0",
   "mypy>=1.13.0",
   "respx>=0.21.1,<1.0",
+  # The fast-ner extra, so the test suite exercises the ONNX NER
+  # engine's logic (mock-session unit tests always run; real-model
+  # integration tests skip themselves when the weights are absent).
+  "onnxruntime>=1.17.0",
+  "tokenizers>=0.15.0",
   # Build / release tooling
   "build>=1.2.0",
   "twine>=5.1.0",
