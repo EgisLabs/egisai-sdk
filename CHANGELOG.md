@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.55.0] — 2026-08-01
+
+### Changed
+
+- **`policy_latency_ms` is policy evaluation only — the Smart Routing
+  decision no longer counts toward it.** 0.53.0 folded routing into the
+  column to match the inline Gateway, on the reasoning that choosing a
+  model is a governance decision like any other. In practice that made
+  the dashboard's "Policy" number unfalsifiable: an operator who
+  disabled every policy still saw tens of milliseconds there, with no
+  rule to open, name, or switch off. The column now tracks one thing —
+  time spent evaluating your policies across the request and response
+  phases, including any `semantic_guard` judge round-trip — so it reads
+  a hard zero when nothing is enabled, on both ingest paths. The
+  Gateway reports its routing window on the `X-Egis-Timing` response
+  header (`gate=…;policy=…;routing=…`) instead.
+
 ## [0.54.0] — 2026-07-31
 
 ### Changed
