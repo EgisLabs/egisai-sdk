@@ -493,14 +493,17 @@ def test_e2e_dormant_org_sends_zero_route_calls(fake_backend) -> None:
 # ── google.genai adapter (same-provider Gemini → Gemini) ────────────
 
 
-class TestRoutingIsBookedOnThePolicyColumn:
-    """The routing decision is governance cost, on both ingest paths.
+class TestRoutingIsNotBookedOnThePolicyColumn:
+    """The "Policy" number answers one question: what did my rules cost?
 
-    The inline Gateway has always folded its routing window into
-    ``policy_latency_ms``; the SDK left it out, so the dashboard's
-    "Policy" number meant "evaluation" for one caller and
-    "evaluation + routing" for the other. An operator comparing an SDK
-    row against a Gateway row was comparing two different quantities.
+    Choosing a model and evaluating a rule are both governance, so the
+    routing window briefly lived in ``policy_latency_ms`` alongside
+    evaluation. That conflation is exactly what sends operators hunting
+    for a bug: disable every policy, and the column still reports tens
+    of milliseconds with nothing they can name, open, or switch off.
+    The gateway keeps its own routing window out of the same column and
+    reports it on ``X-Egis-Timing``, so both ingest paths still agree on
+    what "Policy" means — they just agree on a narrower definition.
     """
 
     def _slow_route(self, seconds: float):
@@ -510,7 +513,7 @@ class TestRoutingIsBookedOnThePolicyColumn:
 
         return _route
 
-    def test_decision_time_is_added_to_the_policy_column(
+    def test_decision_time_is_kept_off_the_policy_column(
         self, monkeypatch
     ) -> None:
         monkeypatch.setattr(_routing, "maybe_route", self._slow_route(0.05))
@@ -524,10 +527,10 @@ class TestRoutingIsBookedOnThePolicyColumn:
             routing_adapter=_FakeCall("gpt-4o").adapter(),
         )
 
-        assert ev["policy_latency_ms"] >= 40
+        assert ev.get("policy_latency_ms", 0) == 0
 
-    def test_it_accumulates_rather_than_overwrites(self, monkeypatch) -> None:
-        """The input phase stamped its number first; don't clobber it."""
+    def test_it_leaves_an_existing_measurement_alone(self, monkeypatch) -> None:
+        """The input phase stamped what evaluation cost; don't add to it."""
         monkeypatch.setattr(_routing, "maybe_route", self._slow_route(0.05))
         ev: dict[str, Any] = {
             "prompt_preview": "hi",
@@ -543,12 +546,12 @@ class TestRoutingIsBookedOnThePolicyColumn:
             routing_adapter=_FakeCall("gpt-4o").adapter(),
         )
 
-        assert ev["policy_latency_ms"] >= 47
+        assert ev["policy_latency_ms"] == 7
 
-    def test_a_failing_decision_still_books_its_time(
+    def test_a_failing_decision_charges_nothing_either(
         self, monkeypatch
     ) -> None:
-        """Fail-open hides the error, not the latency it cost."""
+        """Fail-open costs real time, but still none of it is policy time."""
 
         def _boom(**kw: Any) -> None:
             time.sleep(0.05)
@@ -567,21 +570,6 @@ class TestRoutingIsBookedOnThePolicyColumn:
             )
             is None
         )
-        assert ev["policy_latency_ms"] >= 40
-
-    def test_routing_off_books_nothing(self, monkeypatch) -> None:
-        """Disabled routing must not add even a stray millisecond."""
-        monkeypatch.setattr(_routing, "maybe_route", lambda **kw: None)
-        ev: dict[str, Any] = {"prompt_preview": "hi", "prompt_chars": 2}
-
-        _prepare_route(
-            ev=ev,
-            model="gpt-4o",
-            stream=False,
-            payload={},
-            routing_adapter=_FakeCall("gpt-4o").adapter(),
-        )
-
         assert ev.get("policy_latency_ms", 0) == 0
 
     def test_no_adapter_leaves_the_column_untouched(self) -> None:
