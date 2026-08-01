@@ -41,6 +41,7 @@ Everything here is engine mechanics; wiring into Presidio lives in
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -117,10 +118,20 @@ def _threshold() -> float:
     return _env_float("EGISAI_ETTIN_THRESHOLD", 0.5)
 
 
+def threshold() -> float:
+    """Public read of the score threshold, for cache identity."""
+    return _threshold()
+
+
 def _window_tokens() -> int:
     # 512 was the fastest window in benchmarking (smaller windows →
     # better batch parallelism on CPU); the model itself accepts 8k.
     return max(64, _env_int("EGISAI_ETTIN_WINDOW", 512))
+
+
+def window_tokens() -> int:
+    """Public read of the window size, for cache identity."""
+    return _window_tokens()
 
 
 def _batch_size() -> int:
@@ -156,6 +167,37 @@ def resolve_model_dir() -> Path:
         Path.home() / ".cache" / "egisai" / "models"
     )
     return Path(cache_root) / "ettin" / revision
+
+
+def model_fingerprint(model_dir: Path) -> str:
+    """Content hash of the loaded weights, for the shared span cache.
+
+    Deliberately derived from the bytes rather than from
+    ``EGISAI_ETTIN_REVISION``: the gateway image pins
+    ``EGISAI_ETTIN_MODEL_DIR`` to a baked-in directory, so the
+    revision env var says nothing about what is actually in it, and
+    swapping the baked model without touching the constant would keep
+    the retired model's spans alive in the shared cache forever.
+
+    Content-addressing also gets the *other* direction right — an
+    unchanged model hashes identically on every deploy, so a routine
+    release doesn't throw away a warm cross-instance cache. That
+    property is the whole point of the L2, so a cheaper identity like
+    file mtime would be actively wrong here.
+
+    Returns ``"unknown"`` if the files can't be read, which the
+    caller treats as "don't use the shared cache".
+    """
+    digest = hashlib.sha256()
+    try:
+        for name in _MODEL_FILES:
+            path = model_dir / name
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+    except OSError:
+        return "unknown"
+    return digest.hexdigest()[:32]
 
 
 def ensure_model_files(model_dir: Path) -> None:

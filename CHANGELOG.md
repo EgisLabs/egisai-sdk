@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.58.0] — 2026-08-01
+
+### Added
+
+- **PII analysis can now be shared across processes.** The analysis
+  cache accepts an optional external span store via
+  `set_span_store()`, letting an embedder (the Egis gateway backs it
+  with Redis) reuse NER results across restarts and across instances.
+  Previously the cache died with the process, so a long context that
+  had already been analyzed was re-analyzed in full after any restart
+  or whenever a request landed on another instance — measured at
+  ~8.7 s against ~0.4 s for a 124k-character context. The store is
+  consulted at chunk granularity, so an append-only transcript reuses
+  every unchanged chunk and pays only for its new tail.
+- `set_engine_fingerprint()` declares which model produced the cached
+  spans. It is part of every shared-store key, so spans from a
+  retired NER model can never be served after an upgrade — the
+  in-process cache handles this by clearing on rebuild, but a shared
+  store outlives deploys. The fingerprint combines the SDK version,
+  a content hash of the model weights, and span-affecting tuning.
+- `_onnx_ner.model_fingerprint()`, `.window_tokens()`, `.threshold()`
+  expose the Ettin engine's cache identity.
+
+### Changed
+
+- `stats()` reports an additional `l2_hits` counter.
+
+Nothing changes for a default install: with no store installed the
+cache behaves exactly as before, and every shared-store failure mode
+(absent, slow, unreachable, corrupt entry) degrades to local
+analysis rather than failing a scan.
+
+---
+
+## [0.57.0] — 2026-08-01
+
+### Fixed
+
+- **Claude Agent SDK governance no longer runs on the caller's event
+  loop.** Every other async patch already routed policy evaluation
+  through `asyncio.to_thread`; `ClaudeSDKClient.query`, the module-level
+  `query()`, the PostToolUse sanitize path, and the legacy per-tool
+  advisory path did not. Because the input phase runs Presidio/spaCy NER
+  and can make a blocking `semantic_guard` round-trip, one slow judge
+  stalled the customer's whole async application rather than just the
+  turn being governed. Hook-gated tool steps — the common case on any
+  current Claude Agent SDK — still skip the thread hop entirely, so the
+  fast path costs nothing.
+
+## [0.56.0] — 2026-08-01
+
+### Changed
+
+- **Analyzer passes are now capped process-wide at the container's CPU
+  allowance.** Parallelism inside one document was already bounded, but
+  nothing bounded it across documents — and on a server that is the
+  number that decides whether the machine stays responsive. A host that
+  runs governance on a thread pool (the Egis gateway does) could start
+  one chunked analysis per worker, putting `workers x parallel_workers`
+  NER passes on the box at once: roughly sixteen CPU-saturating threads
+  over two cores. Nothing was blocked, but everything else in the
+  process — including the asyncio event loop serving unrelated requests
+  — stopped getting scheduled. A semaphore at the single point where
+  Presidio actually runs now caps concurrent passes regardless of how
+  many callers or pools sit above it. Findings are unchanged; this is a
+  throughput control, not a detection change. Tune with
+  `EGISAI_PII_MAX_CONCURRENCY` (default: available CPUs).
+
 ## [0.55.0] — 2026-08-01
 
 ### Changed

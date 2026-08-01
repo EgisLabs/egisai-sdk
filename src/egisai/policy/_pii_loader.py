@@ -65,11 +65,42 @@ _SPACY_MODEL_NAME = "en_core_web_lg"
 _ENGINE_SPACY = "spacy"
 _ENGINE_ETTIN = "ettin"
 
+#: Sentinel from the model-identity helpers when the version or the
+#: weights can't be read. Never becomes part of a cache key.
+_UNKNOWN_MODEL = "unknown"
+
 
 def _resolve_ner_engine() -> str:
     """Which NER engine the operator asked for. spaCy unless told otherwise."""
     raw = os.environ.get("EGISAI_NER_ENGINE", _ENGINE_SPACY).strip().lower()
     return _ENGINE_ETTIN if raw == _ENGINE_ETTIN else _ENGINE_SPACY
+
+
+def _engine_fingerprint(engine: str, *, model_id: str, tuning: str = "") -> str:
+    """An identity for "the thing that produces spans", for cache keys.
+
+    Only ever consumed by the shared L2 span store, which outlives
+    this process and every deploy — so anything that can change which
+    spans come back has to be in here, or an upgrade would keep
+    serving the old model's answers forever.
+
+    The SDK version covers the detection logic itself (recognizers,
+    score floors, taxonomy): ``sdk-versioning.mdc`` requires a bump on
+    every change under ``src/``, so a behavioural change always moves
+    the fingerprint even when the model does not. ``model_id`` covers
+    the NER weights, and ``tuning`` covers operator knobs that shift
+    span boundaries or confidence.
+
+    Returns ``""`` — which disables the shared cache — when the model
+    could not be identified. An unidentifiable model is exactly the
+    case where a stale entry is plausible, so the safe move is to pay
+    for the analysis rather than risk serving another model's spans.
+    """
+    from egisai import __version__
+
+    if not model_id or model_id == _UNKNOWN_MODEL:
+        return ""
+    return f"v{__version__}|{engine}|{model_id}|{tuning}"
 
 
 # ── Module-level state ─────────────────────────────────────────────
@@ -203,8 +234,10 @@ def reset_for_tests() -> None:
     Intended for the SDK test suite only — production callers should
     rely on ``prime_analyzer_async`` being idempotent.
 
-    Also drops the analysis cache: spans computed by the outgoing
-    analyzer must never be served for whatever replaces it.
+    Also drops the analysis cache and the engine fingerprint: spans
+    computed by the outgoing analyzer must never be served for
+    whatever replaces it, and until a new analyzer is built there is
+    no engine whose spans the shared store could legitimately key.
     """
     global _state
 
@@ -212,6 +245,7 @@ def reset_for_tests() -> None:
 
     _state = _AnalyzerState()
     _pii_analysis_cache.clear()
+    _pii_analysis_cache.set_engine_fingerprint("")
 
 
 # ── Implementation ──────────────────────────────────────────────────
@@ -318,6 +352,21 @@ def _build_analyzer(*, quiet: bool) -> AnalyzerEngine:
 
     register_custom_recognizers(analyzer.registry)
 
+    # Stamped from the engine we actually built, not the one that was
+    # requested — an ``ettin`` request that fell back to spaCy here
+    # must not key its spans as Ettin's.
+    spacy_version = _spacy_model_version()
+    _publish_engine_fingerprint(
+        _engine_fingerprint(
+            _ENGINE_SPACY,
+            model_id=(
+                _UNKNOWN_MODEL
+                if spacy_version == _UNKNOWN_MODEL
+                else f"{_SPACY_MODEL_NAME}@{spacy_version}"
+            ),
+        )
+    )
+
     # No success line here: the SDK's main ``✓ [egisai] active …``
     # banner already confirms the SDK is alive, and the PII engine
     # is an implementation detail the operator doesn't need to see
@@ -325,6 +374,31 @@ def _build_analyzer(*, quiet: bool) -> AnalyzerEngine:
     # from ``_load_in_background`` when the daemon thread can't load
     # the analyzer) so misconfigurations remain visible.
     return analyzer
+
+
+def _spacy_model_version() -> str:
+    """Version of the installed spaCy NER model, or ``unknown``.
+
+    Part of the L2 fingerprint: ``en_core_web_lg`` 3.7 and 3.8 detect
+    materially different spans, and a customer upgrading spaCy must
+    not inherit the previous model's cached answers.
+    """
+    import json
+
+    try:
+        import spacy
+
+        meta = spacy.util.get_package_path(_SPACY_MODEL_NAME) / "meta.json"
+        return str(json.loads(meta.read_text()).get("version") or _UNKNOWN_MODEL)
+    except Exception:  # noqa: BLE001 — a missing version is not fatal
+        return _UNKNOWN_MODEL
+
+
+def _publish_engine_fingerprint(fingerprint: str) -> None:
+    """Hand the analysis cache the identity of the live engine."""
+    from egisai.policy import _pii_analysis_cache
+
+    _pii_analysis_cache.set_engine_fingerprint(fingerprint)
 
 
 def _build_ettin_analyzer() -> AnalyzerEngine:
@@ -345,7 +419,10 @@ def _build_ettin_analyzer() -> AnalyzerEngine:
     from egisai.policy._onnx_ner import (
         OnnxNerEngine,
         ensure_model_files,
+        model_fingerprint,
         resolve_model_dir,
+        threshold,
+        window_tokens,
     )
     from egisai.policy._pii_recognizers import register_custom_recognizers
 
@@ -365,6 +442,17 @@ def _build_ettin_analyzer() -> AnalyzerEngine:
 
     register_custom_recognizers(analyzer.registry)
     analyzer.registry.add_recognizer(EttinRecognizer(engine))
+
+    # Window and threshold both move span boundaries and confidence,
+    # so they belong in the cache identity alongside the weights.
+    # Batch size does not — it only groups the same windows.
+    _publish_engine_fingerprint(
+        _engine_fingerprint(
+            _ENGINE_ETTIN,
+            model_id=model_fingerprint(model_dir),
+            tuning=f"w{window_tokens()}:t{threshold():.3f}",
+        )
+    )
 
     LOGGER.info(
         "[egisai] NER engine: Ettin ONNX (%s)", model_dir
