@@ -1152,7 +1152,10 @@ def _build_posttooluse_callback(
                 replacement_text: str
                 sanitizations_audit: list[dict[str, Any]] = []
                 if decision.verdict == "sanitize":
-                    masked, records = pii_sanitize(
+                    # Worker thread: applying masks re-runs the
+                    # detector, and this hook is on the caller's loop.
+                    masked, records = await asyncio.to_thread(
+                        pii_sanitize,
                         extracted_text,
                         types=decision.sanitize_types or None,
                         mask_char=decision.sanitize_mask_char,
@@ -1686,6 +1689,23 @@ def _build_denial_payload(
     )
 
 
+def _tool_step_already_shipped(
+    hook_decisions: dict[str, str] | None, tool_use_id: str | None
+) -> bool:
+    """Did the PreToolUse hook already emit this step row?
+
+    Exposed separately so async callers can answer it without paying a
+    thread hop: when the hook fired, dispatch is a no-op, and that is
+    the common case on any current Claude Agent SDK. Only the fallback
+    path below evaluates policies, and only that path needs offloading.
+    """
+    return (
+        hook_decisions is not None
+        and tool_use_id is not None
+        and tool_use_id in hook_decisions
+    )
+
+
 def _dispatch_tool_call_step(
     *,
     ev_template: dict[str, Any],
@@ -1722,11 +1742,7 @@ def _dispatch_tool_call_step(
     then see in the dashboard exactly which tool tripped the rule).
     """
     # Path 1 — the hook already shipped this step row. Skip.
-    if (
-        hook_decisions is not None
-        and tool_use_id is not None
-        and tool_use_id in hook_decisions
-    ):
+    if _tool_step_already_shipped(hook_decisions, tool_use_id):
         return
 
     # Path 2 — post-hoc advisory (old SDK or hook didn't fire).
@@ -2501,7 +2517,13 @@ def _wrap_client_query(orig: Any) -> Any:
                 set_policy_checked(True)
                 reset_policy_usage()
                 try:
-                    decision = _run_input_phase(
+                    # On a worker thread, never the caller's loop: the
+                    # input phase runs regex, Presidio/spaCy NER, and a
+                    # blocking ``semantic_guard`` round-trip. Inline, a
+                    # single slow judge would stall the customer's whole
+                    # async application, not just this turn.
+                    decision = await asyncio.to_thread(
+                        _run_input_phase,
                         source=SOURCE_NAME,
                         target=TARGET_DEFAULT,
                         model=model,
@@ -2730,14 +2752,24 @@ def _wrap_client_receive_messages(orig: Any) -> Any:
                         )
                         tool_uses = _iter_tool_uses(message)
                         for tname, tinp, tuid in tool_uses:
-                            _dispatch_tool_call_step(
-                                ev_template=ev,
-                                tool_name=tname,
-                                tool_input=tinp,
-                                tool_use_id=tuid,
-                                model=model,
-                                started_at=time.monotonic(),
-                                hook_decisions=hook_decisions,
+                            if _tool_step_already_shipped(
+                                hook_decisions, tuid
+                            ):
+                                continue
+                            # Fallback path only — it runs the output
+                            # policy engine per tool, so it goes to a
+                            # worker rather than the caller's loop.
+                            await asyncio.to_thread(
+                                functools.partial(
+                                    _dispatch_tool_call_step,
+                                    ev_template=ev,
+                                    tool_name=tname,
+                                    tool_input=tinp,
+                                    tool_use_id=tuid,
+                                    model=model,
+                                    started_at=time.monotonic(),
+                                    hook_decisions=hook_decisions,
+                                )
                             )
 
                     if _is_result_message(message):
@@ -2912,7 +2944,10 @@ def _wrap_module_query(orig: Any) -> Any:
                 set_policy_checked(True)
                 reset_policy_usage()
                 try:
-                    decision = _run_input_phase(
+                    # Worker thread — same reasoning as the client
+                    # ``query`` gate above.
+                    decision = await asyncio.to_thread(
+                        _run_input_phase,
                         source=SOURCE_NAME,
                         target="claude_agent_sdk.query",
                         model=model,
@@ -3066,14 +3101,25 @@ def _wrap_module_query(orig: Any) -> Any:
                             ):
                                 tool_uses = _iter_tool_uses(message)
                                 for tname, tinp, tuid in tool_uses:
-                                    _dispatch_tool_call_step(
-                                        ev_template=ev,
-                                        tool_name=tname,
-                                        tool_input=tinp,
-                                        tool_use_id=tuid,
-                                        model=model,
-                                        started_at=time.monotonic(),
-                                        hook_decisions=module_hook_decisions,
+                                    if _tool_step_already_shipped(
+                                        module_hook_decisions, tuid
+                                    ):
+                                        continue
+                                    # Worker thread — see the client
+                                    # ``receive_messages`` path.
+                                    await asyncio.to_thread(
+                                        functools.partial(
+                                            _dispatch_tool_call_step,
+                                            ev_template=ev,
+                                            tool_name=tname,
+                                            tool_input=tinp,
+                                            tool_use_id=tuid,
+                                            model=model,
+                                            started_at=time.monotonic(),
+                                            hook_decisions=(
+                                                module_hook_decisions
+                                            ),
+                                        )
                                     )
                             if _is_result_message(message):
                                 ev["latency_ms"] = int(
@@ -3084,7 +3130,12 @@ def _wrap_module_query(orig: Any) -> Any:
                                 module_hooks_active = _hooks_supported() and (
                                     options is not None
                                 )
-                                decision_out = _run_output_phase(
+                                # Worker thread, matching the client
+                                # ``receive_messages`` path — the output
+                                # phase is the same detector + judge
+                                # work as the input phase.
+                                decision_out = await asyncio.to_thread(
+                                    _run_output_phase,
                                     ev=ev,
                                     signals=signals,
                                     model=model,
