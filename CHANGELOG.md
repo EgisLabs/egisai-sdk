@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.54.0] — 2026-07-31
+
+### Changed
+
+- **Long-document PII analysis now uses several CPU cores.** A
+  `pii_scan` policy runs Presidio + spaCy NER over the whole prompt,
+  and coding-assistant payloads are hundreds of KB. The chunks a long
+  document is already split into are independent, and spaCy releases
+  the GIL during its matrix work, so they are now analyzed on a small
+  thread pool instead of one at a time. Measured 2.3–2.6x faster on
+  cold payloads of 100–550 KB, with findings identical to the
+  sequential path in every case. Tune or disable with
+  `EGISAI_PII_PARALLEL_WORKERS` (`1` restores the previous
+  behaviour).
+- **Thread-pool sizing now respects container CPU limits.**
+  `os.cpu_count()` reports the *host's* cores, which is the wrong
+  number under Cloud Run / Kubernetes / Docker, where CPU is capped by
+  cgroup quota rather than by hiding cores. A one-vCPU container on an
+  eight-core host reported eight, oversubscribing CPU-bound NER work
+  by 8x. The new `egisai.policy._cpu.available_cpus` reads the cgroup
+  v2/v1 quota, then CPU affinity, then falls back to `os.cpu_count()`.
+  Parallel chunk analysis derives its width from it, so a single-vCPU
+  deployment runs the sequential path unchanged.
+
 ## [0.53.0] — 2026-07-31
 
 ### Changed

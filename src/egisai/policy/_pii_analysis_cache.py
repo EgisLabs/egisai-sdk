@@ -35,10 +35,23 @@ append-only document is served entirely from cache and only the new
 tail is analyzed. ``EGISAI_PII_CHUNKING=off`` restores single-pass
 analysis.
 
+**Parallel chunks.** The chunks of one document are independent
+analyses of disjoint strings, and Presidio spends most of its time in
+spaCy's matrix ops, which release the GIL. Analyzing them on a small
+thread pool therefore gives real wall-clock speedup — measured ~2.4x
+at four threads, with returns going negative beyond that — which is
+what makes the *first* sight of a large payload affordable. Results
+are collected in chunk order, so output is identical to the
+sequential path either way. Worker count is derived from the
+container's true CPU allowance, so a single-vCPU deployment runs the
+sequential path unchanged.
+
 **Tuning.** ``EGISAI_PII_CACHE_TTL_SECS`` (default 300, ``0``
-disables the cache entirely) and ``EGISAI_PII_CACHE_MAX`` (default
+disables the cache entirely), ``EGISAI_PII_CACHE_MAX`` (default
 2048 entries — sized so a 200k-character document's ~50 chunks plus
-several whole-text entries never thrash).
+several whole-text entries never thrash), and
+``EGISAI_PII_PARALLEL_WORKERS`` (default ``min(4, cpus)``; ``1``
+forces sequential chunk analysis).
 """
 
 from __future__ import annotations
@@ -48,12 +61,19 @@ import os
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
-from egisai.policy import _pii_chunker
+from egisai.policy import _cpu, _pii_chunker
 
-__all__ = ["Span", "analyze_cached", "clear", "stats"]
+__all__ = ["Span", "analyze_cached", "clear", "parallel_workers", "stats"]
+
+#: Beyond this, GIL contention outweighs the added parallelism —
+#: measured on the spaCy ``en_core_web_lg`` path, where 8 threads is
+#: slower than 4. Also bounds thread creation inside SDK host
+#: processes, which did not ask us for a large pool.
+_MAX_PARALLEL_WORKERS = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +118,58 @@ _lock = threading.Lock()
 _cache: OrderedDict[str, tuple[float, tuple[Span, ...]]] = OrderedDict()
 _hits = 0
 _misses = 0
+
+_pool_lock = threading.Lock()
+_pool: ThreadPoolExecutor | None = None
+_pool_size = 0
+
+
+def parallel_workers() -> int:
+    """Threads to spread one document's chunks over. ``1`` = sequential."""
+    raw = os.environ.get("EGISAI_PII_PARALLEL_WORKERS")
+    if raw:
+        try:
+            explicit = int(raw)
+        except ValueError:
+            explicit = 0
+        if explicit > 0:
+            return min(explicit, _MAX_PARALLEL_WORKERS)
+    return max(1, min(_MAX_PARALLEL_WORKERS, _cpu.available_cpus()))
+
+
+def _get_pool(workers: int) -> ThreadPoolExecutor | None:
+    """Lazily build the shared chunk pool, or ``None`` to stay inline.
+
+    Built on first use rather than at import so a process that never
+    scans a long document never pays for the threads — the SDK runs
+    inside customer applications and must stay cheap when idle. The
+    pool is rebuilt if the requested width changes, which in practice
+    only happens when a test overrides the env var.
+    """
+    global _pool, _pool_size
+    if workers < 2:
+        return None
+    with _pool_lock:
+        if _pool is None or _pool_size != workers:
+            stale = _pool
+            _pool = ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="egis-pii-chunk"
+            )
+            _pool_size = workers
+            if stale is not None:
+                # Don't wait: in-flight chunk work belongs to another
+                # caller and will finish on its own threads.
+                stale.shutdown(wait=False)
+        return _pool
+
+
+def shutdown_pool_for_test() -> None:
+    """Drop the chunk pool so a test can start from a clean state."""
+    global _pool, _pool_size
+    with _pool_lock:
+        stale, _pool, _pool_size = _pool, None, 0
+    if stale is not None:
+        stale.shutdown(wait=True)
 
 
 def _key(text: str, entities: list[str] | None) -> str:
@@ -186,21 +258,43 @@ def _analyze_chunked(
     ``_pii_chunker``), the same value may be detected twice; exact
     duplicates and same-entity overlapping spans are unioned, which
     can only widen coverage — the fail-closed direction.
-    """
-    collected: list[Span] = []
-    for start, end in _pii_chunker.chunk_ranges(text):
-        for span in analyze_cached(
-            analyzer, text=text[start:end], entities=entities
-        ):
-            collected.append(
-                Span(
-                    entity_type=span.entity_type,
-                    start=span.start + start,
-                    end=span.end + start,
-                    score=span.score,
-                )
-            )
 
+    Chunks are analyzed on a small thread pool when the container has
+    the cores to use one. That is safe on three counts: the chunks are
+    disjoint strings, Presidio's analyzer holds no per-call state (a
+    shared analyzer returns identical spans under concurrency — see
+    ``tests/test_pii_parallel_chunks.py``), and results are gathered in
+    chunk order so the merge below sees exactly the sequence it would
+    have seen inline. Nesting is bounded: chunks are always smaller
+    than ``min_chunkable_chars``, so a chunk never re-enters this
+    function and the pool cannot deadlock waiting on itself.
+    """
+    ranges = _pii_chunker.chunk_ranges(text)
+
+    def analyze_range(bounds: tuple[int, int]) -> list[Span]:
+        start, end = bounds
+        return [
+            Span(
+                entity_type=span.entity_type,
+                start=span.start + start,
+                end=span.end + start,
+                score=span.score,
+            )
+            for span in analyze_cached(
+                analyzer, text=text[start:end], entities=entities
+            )
+        ]
+
+    pool = _get_pool(parallel_workers()) if len(ranges) > 1 else None
+    if pool is None:
+        per_chunk = [analyze_range(bounds) for bounds in ranges]
+    else:
+        # ``map`` yields in submission order and re-raises worker
+        # exceptions on iteration, so a Presidio failure surfaces to
+        # ``pii.scan``'s fail-closed handler exactly as it does inline.
+        per_chunk = list(pool.map(analyze_range, ranges))
+
+    collected: list[Span] = [span for chunk in per_chunk for span in chunk]
     collected.sort(key=lambda s: (s.start, s.end))
     merged: list[Span] = []
     for span in collected:
