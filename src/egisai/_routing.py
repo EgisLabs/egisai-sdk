@@ -281,9 +281,9 @@ def maybe_route(
     """Ask the platform for a best-fit model. Never raises.
 
     Returns the decision dict (``{"model", "provider", "direction",
-    "reason", "projected_savings_usd"}``) or ``None`` ("keep the
-    requested model"). ``prompt_preview`` MUST already be the
-    label-redacted audit preview.
+    "reason", "factors", "projected_savings_usd"}``) or ``None``
+    ("keep the requested model"). ``prompt_preview`` MUST already be
+    the label-redacted audit preview.
 
     ``shape`` carries the call's capability requirements (images,
     output ceiling, prompt caching). ``has_tools`` stays an explicit
@@ -340,11 +340,17 @@ def maybe_route(
 
         decision: dict[str, Any] | None = None
         if body.get("routed") and body.get("model"):
+            factors = body.get("factors")
             decision = {
                 "model": str(body["model"]),
                 "provider": str(body.get("provider") or ""),
                 "direction": str(body.get("direction") or ""),
                 "reason": str(body.get("reason") or ""),
+                # Structured decision factors — echoed onto the audit
+                # event verbatim; the backend re-validates at ingest.
+                # ``None`` from a pre-factors backend keeps the event
+                # shape stable.
+                "factors": factors if isinstance(factors, dict) else None,
                 "projected_savings_usd": float(
                     body.get("projected_savings_usd") or 0.0
                 ),

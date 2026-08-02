@@ -2421,6 +2421,7 @@ async def _route_client_turn(
             ev["routing_applied"] = True
             ev["routing_direction"] = decision.get("direction")
             ev["routing_reason"] = decision.get("reason")
+            ev["routing_factors"] = decision.get("factors")
             ev["model"] = target
             return target
 
@@ -3016,6 +3017,7 @@ def _wrap_module_query(orig: Any) -> Any:
                                     "direction"
                                 )
                                 ev["routing_reason"] = _route.get("reason")
+                                ev["routing_factors"] = _route.get("factors")
                                 model = options.model
                                 ev["model"] = model
                             except Exception:  # noqa: BLE001

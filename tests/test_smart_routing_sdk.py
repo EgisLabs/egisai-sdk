@@ -44,6 +44,7 @@ def _decision(**overrides: Any) -> dict[str, Any]:
         "provider": "openai",
         "direction": "downgrade",
         "reason": "trivial request",
+        "factors": {"complexity": 1, "confidence": 0.9},
         "projected_savings_usd": 0.01,
         "requested_provider": "openai",
     }
@@ -125,6 +126,7 @@ class TestMaybeRoute:
                 "provider": "openai",
                 "direction": "downgrade",
                 "reason": "trivial",
+                "factors": {"complexity": 1, "confidence": 0.9},
                 "projected_savings_usd": 0.01,
             }
 
@@ -134,6 +136,10 @@ class TestMaybeRoute:
         assert first is not None
         assert first["model"] == "gpt-4o-mini"
         assert first["requested_provider"] == "openai"
+        # The structured decision factors ride through verbatim —
+        # they end up on the audit event as ``routing_factors`` for
+        # the dashboard's "Why this model?" panel.
+        assert first["factors"] == {"complexity": 1, "confidence": 0.9}
         assert second == first
         assert len(calls) == 1  # cache absorbed the repeat
 
@@ -308,6 +314,7 @@ class TestGatePlumbing:
         assert ev["requested_provider"] == "openai"
         assert ev["routing_applied"] is True
         assert ev["routing_direction"] == "downgrade"
+        assert ev["routing_factors"] == {"complexity": 1, "confidence": 0.9}
 
     def test_cross_decision_without_cross_support_not_applied(
         self, monkeypatch
