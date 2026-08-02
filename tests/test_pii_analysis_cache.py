@@ -1,4 +1,4 @@
-"""The PII analysis cache must be a pure speed-up — never a behaviour change.
+"""The PII analysis cache must be a pure speed-up — never a behavior change.
 
 Everything here is about proving one claim: memoizing
 ``analyzer.analyze()`` changes *when* work happens and nothing about
@@ -201,7 +201,7 @@ def test_cache_is_bounded_and_evicts_oldest_first(
 def test_ttl_zero_disables_caching_entirely(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An operator must be able to switch the behaviour off outright."""
+    """An operator must be able to switch the behavior off outright."""
     monkeypatch.setenv("EGISAI_PII_CACHE_TTL_SECS", "0")
     analyzer = _CountingAnalyzer([EMAIL])
 

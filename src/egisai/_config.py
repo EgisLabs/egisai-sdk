@@ -56,7 +56,7 @@ class EgisaiConfig:
     # generate a human description + business function in the
     # background. When False, no excerpt ever leaves the process — the
     # agent keeps the local "Auto-detected by SDK …" placeholder and
-    # its business function is filled later by the behavioural class
+    # its business function is filled later by the behavioral class
     # judge. Set via ``init(auto_describe=False)`` or the
     # ``EGISAI_AUTO_DESCRIBE=0`` env var for privacy-sensitive
     # deployments that don't want prompt text (even sanitised) to

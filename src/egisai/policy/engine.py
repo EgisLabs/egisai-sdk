@@ -1408,7 +1408,7 @@ def _collect_semantic_fast(
 ) -> _PhaseMatches:
     """Merged-question Phase-2 walk. Enforcement path of fast mode.
 
-    Behaviour contract relative to the legacy walk:
+    Behavior contract relative to the legacy walk:
 
     * Same verdict inputs. Every question carries the threshold the
       per-policy call would have carried, and the union intent list

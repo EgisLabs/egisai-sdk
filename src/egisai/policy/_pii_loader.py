@@ -86,7 +86,7 @@ def _engine_fingerprint(engine: str, *, model_id: str, tuning: str = "") -> str:
 
     The SDK version covers the detection logic itself (recognizers,
     score floors, taxonomy): ``sdk-versioning.mdc`` requires a bump on
-    every change under ``src/``, so a behavioural change always moves
+    every change under ``src/``, so a behavioral change always moves
     the fingerprint even when the model does not. ``model_id`` covers
     the NER weights, and ``tuning`` covers operator knobs that shift
     span boundaries or confidence.

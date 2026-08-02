@@ -38,7 +38,7 @@ def _ok_no_match_handler(_request: httpx.Request) -> httpx.Response:
     )
 
 
-def test_default_outage_behaviour_is_allow() -> None:
+def test_default_outage_behavior_is_allow() -> None:
     blocker = _make_blocker(_outage_handler)  # default: on_outage="allow"
     match = blocker.check(
         "Delete all users",

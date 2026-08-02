@@ -324,7 +324,7 @@ def test_disabling_the_cache_disables_the_shared_layer_too(
     assert store.puts == []
 
 
-def test_removing_the_store_restores_process_local_behaviour(
+def test_removing_the_store_restores_process_local_behavior(
     store: _FakeStore,
 ) -> None:
     cache.set_span_store(None)

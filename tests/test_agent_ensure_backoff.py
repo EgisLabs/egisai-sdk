@@ -190,7 +190,7 @@ def test_zero_backoff_disables_negative_caching(
     counting_backend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Escape hatch for anyone who wants the old retry-every-call
-    behaviour (e.g. a short-lived job that must register or bust)."""
+    behavior (e.g. a short-lived job that must register or bust)."""
     monkeypatch.setenv(_auto_agent._ENSURE_BACKOFF_ENV, "0")
     _config.set_config(_cfg())
     backend = counting_backend(httpx.ConnectError("refused"))

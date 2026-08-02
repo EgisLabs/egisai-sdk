@@ -105,7 +105,7 @@ issue and we want to know within hours.
 The SDK never breaks your call path. Every EgisAI dependency
 degrades instead of failing:
 
-| Dependency unreachable | Behaviour |
+| Dependency unreachable | Behavior |
 |---|---|
 | Handshake / policy refresh at `init()` | Offline mode — the SDK keeps running with the last-known-good policy cache (empty on a cold start). |
 | Audit log ingest | Events buffer in a bounded queue and drain later; oldest are dropped past the cap. Never blocks a call. |
@@ -153,7 +153,7 @@ responses) leaves the process, and it is tightly bounded:
 5. **Opt-out.** `init(auto_describe=False)` or
    `EGISAI_AUTO_DESCRIBE=0` disables it entirely — no excerpt ever
    leaves the process; the placeholder description stays and the
-   business function is inferred from anonymised behavioural
+   business function is inferred from anonymised behavioral
    telemetry instead.
 
 If you find the excerpt being transmitted **unsanitised**, exceeding

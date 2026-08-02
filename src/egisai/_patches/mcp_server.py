@@ -12,7 +12,7 @@ Design contract (``sdk-design-philosophy.mdc`` + the add-on spec):
   ``init()``'s handshake reported the org has the ``mcp_servers``
   add-on enabled (``config.mcp_servers_enabled``). A customer without
   the add-on — i.e. everyone today — gets byte-for-byte the same
-  behaviour as before this module existed.
+  behavior as before this module existed.
 * **Auto-detect + auto-register.** On first sight of a server we
   fingerprint it (name + sorted tool schema + transport), register it
   via ``POST /v1/sdk/mcp-servers/ensure`` (cached forever after), and

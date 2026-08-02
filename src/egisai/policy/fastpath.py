@@ -33,7 +33,7 @@ Fast mode makes three changes, all confined to Phase 2 semantics:
 
 Rollout contract — ``EGISAI_FAST_GOVERNANCE``:
 
-* ``off`` (default) — nothing changes. Byte-identical behaviour to
+* ``off`` (default) — nothing changes. Byte-identical behavior to
   the previous release.
 * ``shadow`` — the legacy path keeps making every enforcement
   decision; the fast path additionally runs on a background daemon

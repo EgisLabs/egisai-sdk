@@ -72,7 +72,7 @@ async def test_input_phase_runs_off_the_loop_for_module_query(
 async def test_a_slow_input_phase_does_not_stall_the_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The behaviour the operator actually feels.
+    """The behavior the operator actually feels.
 
     A blocking judge holds a worker thread for as long as it likes; the
     customer's other coroutines must keep making progress meanwhile.

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.58.1] — 2026-08-01
+
+### Changed
+
+- Documentation/comment-only sweep: standardized "behaviour" /
+  "behavioural" to American English ("behavior" / "behavioral")
+  across docstrings and comments. No runtime behavior change.
+
+---
+
 ## [0.58.0] — 2026-08-01
 
 ### Added
@@ -105,7 +115,7 @@ analysis rather than failing a scan.
   cold payloads of 100–550 KB, with findings identical to the
   sequential path in every case. Tune or disable with
   `EGISAI_PII_PARALLEL_WORKERS` (`1` restores the previous
-  behaviour).
+  behavior).
 - **Thread-pool sizing now respects container CPU limits.**
   `os.cpu_count()` reports the *host's* cores, which is the wrong
   number under Cloud Run / Kubernetes / Docker, where CPU is capped by
@@ -452,7 +462,7 @@ analysis rather than failing a scan.
 
   - A failed registration now backs that identity off for 60 s
     (`EGISAI_AGENT_ENSURE_BACKOFF_SECS`; `0` restores the old
-    retry-every-call behaviour). Attempts scale with the number of
+    retry-every-call behavior). Attempts scale with the number of
     distinct agent identities, never with request volume.
   - The hop has its own 2 s budget
     (`EGISAI_AGENT_ENSURE_TIMEOUT_SECS`) instead of the shared 10 s
@@ -461,7 +471,7 @@ analysis rather than failing a scan.
     skipped and retried after the backoff rather than slept through
     on the hot path.
 
-  Behaviour is unchanged: the call proceeds unattributed-but-governed,
+  Behavior is unchanged: the call proceeds unattributed-but-governed,
   exactly as it did before, and registers on a later call.
 
 - A server-supplied `Retry-After` is now clamped to 5 s
@@ -974,7 +984,7 @@ analysis rather than failing a scan.
   dormant unless the handshake reports the add-on is enabled — it
   never wraps the customer's server, registers anything, or emits
   events. Customers without the add-on get byte-for-byte the same
-  behaviour as 0.30.0.
+  behavior as 0.30.0.
 - **Fail-open.** Any unexpected error in the MCP gate falls through to
   the original tool handler so a hosted MCP server keeps serving even
   when egisai is unhappy.
@@ -998,7 +1008,7 @@ analysis rather than failing a scan.
   `EGISAI_AUTO_DESCRIBE=0`) disables the excerpt entirely: no prompt
   text, even sanitised, leaves the process. The agent keeps the local
   placeholder description and its business function is inferred from
-  anonymised behavioural telemetry instead.
+  anonymised behavioral telemetry instead.
 
 ### Security
 
@@ -1073,7 +1083,7 @@ unbounded retry sleeps, and a one-shot library cold-start
 silently bundled into per-call governance time. All five ship
 fixed here. Combined effect on the worst-case turn that
 prompted the report: ~12 s → ~1 s. Steady-state cost on the
-common no-match path drops from O(N × P50) to O(P50). Behaviour
+common no-match path drops from O(N × P50) to O(P50). Behavior
 is fully backwards-compatible — every fix is internal to the
 SDK and no public API or wire-shape changed.
 
@@ -2911,7 +2921,7 @@ axes:
    signal at fleet scale rather than an essay-length echo of
    the prompt.
 
-No behavioural change for callers; the audit shape is additive
+No behavioral change for callers; the audit shape is additive
 and older backends ingest 0.19 events cleanly (every field has
 a backend-side `server_default`).
 
@@ -3623,7 +3633,7 @@ Stress / coverage:
   sub-agent could each walk `importlib.metadata` and write the
   cache concurrently. The cache is now guarded by a lock with a
   double-checked-read on the hot path, so steady-state lookups stay
-  lock-free while the first miss is serialized. No behavioural
+  lock-free while the first miss is serialized. No behavioral
   change for single-threaded apps.
 
 ---

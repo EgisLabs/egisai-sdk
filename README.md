@@ -206,7 +206,7 @@ egisai.init(..., on_block="stub")
 | `EGISAI_API_KEY` | SDK API key if not passed as `api_key=`. |
 | `EGISAI_BASE_URL` | Control plane base URL override when supplied by EgisAI. |
 | `EGISAI_GATEWAY` | Set `1` to enable Gateway mode without a code change. |
-| `EGISAI_GATEWAY_ON_OUTAGE` | `local` or `fail` — Gateway-mode behaviour when the Gateway is unreachable (see "Gateway mode"). |
+| `EGISAI_GATEWAY_ON_OUTAGE` | `local` or `fail` — Gateway-mode behavior when the Gateway is unreachable (see "Gateway mode"). |
 | `EGISAI_STAMP_IDENTITY` | Set `1` to enable identity stamping (`stamp_identity`) without a code change. |
 | `EGISAI_USAGE_SYNC_SECONDS` | How often the SDK refreshes the usage snapshot backing `rate_limit` / `budget_limit` rules (default `15`). |
 
@@ -263,7 +263,7 @@ What changes and what doesn't:
 
 Rerouting puts the Gateway inline on your call path, so its availability becomes yours. `gateway_on_outage` decides what happens when it can't be reached:
 
-| Setting | Behaviour |
+| Setting | Behavior |
 |---------|-----------|
 | `"local"` (default) | Re-run the call against your own provider client and govern it **in-process** from the last-known-good policy cache. Your traffic keeps flowing; governance degrades from server-side to client-side. |
 | `"fail"` | Let the error propagate. Choose this when the Gateway must remain a hard enforcement boundary and a refused call is preferable to a locally governed one. |

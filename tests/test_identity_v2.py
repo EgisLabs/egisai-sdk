@@ -147,7 +147,7 @@ def test_simhash_locality_light_edit_within_threshold() -> None:
     )
     unrelated = (
         "You are the Fraud Monitoring Agent. Score transaction risk "
-        "and compare behaviour to historical baselines. Raise alerts "
+        "and compare behavior to historical baselines. Raise alerts "
         "with evidence and freeze suspect activity."
     )
     s_base = simhash64_hex(canonicalize_identity_text(base))
