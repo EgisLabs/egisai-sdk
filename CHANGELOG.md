@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.59.0] — 2026-08-02
+
+### Added
+
+- **Smart Model Routing decisions are now fully explainable.** When
+  the platform swaps a model, `/v1/sdk/route` returns a structured
+  `factors` object (task complexity 1–5, capability flags, classifier
+  confidence, and the two models' quality tiers) and the SDK echoes it
+  onto the audit event as `routing_factors`. The dashboard's request
+  drawer renders it as a "Why this model?" transparency panel. Fully
+  backward-compatible: older backends simply omit the field and the
+  event shape is unchanged apart from the additive key.
+
+---
+
 ## [0.58.1] — 2026-08-01
 
 ### Changed

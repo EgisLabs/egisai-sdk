@@ -922,6 +922,10 @@ def _stamp_route(ev: dict[str, Any], state: dict[str, Any]) -> None:
     ev["routing_applied"] = True
     ev["routing_direction"] = decision.get("direction")
     ev["routing_reason"] = decision.get("reason")
+    # Structured decision factors from /v1/sdk/route — echoed
+    # verbatim; the backend whitelist-validates at ingest. Powers
+    # the dashboard's "Why this model?" transparency panel.
+    ev["routing_factors"] = decision.get("factors")
 
 
 def _resolve_and_scope_identity(payload: Any) -> Any:
