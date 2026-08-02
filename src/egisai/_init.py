@@ -133,7 +133,7 @@ def init(
         identity card you see on the dashboard. When disabled, no
         prompt text — even sanitised — leaves the process: the agent
         keeps the local placeholder description and its business
-        function is inferred later from anonymised behavioural
+        function is inferred later from anonymised behavioral
         telemetry instead. Defaults to ``True``; override with
         ``auto_describe=False`` or ``EGISAI_AUTO_DESCRIBE=0``.
     gateway

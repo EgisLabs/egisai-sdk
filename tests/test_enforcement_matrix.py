@@ -233,7 +233,7 @@ def test_security_md_documents_bedrock_agent_advisory_limitation() -> None:
     )
 
 
-# ── Behavioural lock-in: where the heavy enforcement guarantees live ──
+# ── Behavioral lock-in: where the heavy enforcement guarantees live ──
 
 
 def test_gate_call_default_enforcement_is_enforced() -> None:

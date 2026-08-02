@@ -28,7 +28,7 @@ matrix cell and fail on another depending on the allocator's
 particular id-reuse pattern.
 
 This test anchors the fix structurally — neither patch module may
-re-introduce a module-level id tracker. The behavioural coverage
+re-introduce a module-level id tracker. The behavioral coverage
 lives in ``tests/test_smoke_provider_battery.py::test_bedrock_*``
 and ``tests/test_before_after_each_llm_and_tool.py::test_bedrock_*``,
 which are themselves the canonical reproductions of the flake.
