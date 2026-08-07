@@ -10,6 +10,17 @@ from typing import Literal
 
 OnBlock = Literal["raise", "stub"]
 OnOutage = Literal["allow", "block"]
+# In-process availability posture: what the SDK does when it cannot
+# confirm policy from the control plane (it never completed a
+# successful policy sync AND has no cached rules to fall back on).
+# "allow" — fail open (default; the SDK's core availability contract
+#           — never break the customer's call path). "block" — fail
+#           closed; refuse governed calls until the SDK syncs policy
+#           at least once. The symmetric opposite of the Gateway's
+#           ``gateway_degraded_mode="refuse"`` posture, for customers
+#           who want an ungoverned SDK to stop traffic rather than
+#           run blind.
+InProcessOnOutage = Literal["allow", "block"]
 # Behavior when the inline Gateway itself is unreachable in gateway
 # mode. "local" — re-run the call on the customer's own provider
 # client under in-process governance. "fail" — let the transport
@@ -34,7 +45,7 @@ class EgisaiConfig:
     flush_batch_size: int = 50
     enable_sse: bool = True
     enable_http_fallback: bool = True
-    sdk_version: str = "0.12.5"
+    sdk_version: str = "0.60.0"
     timeout_seconds: float = 10.0
     org_id: str | None = None
     agent_id: str | None = None
@@ -44,6 +55,27 @@ class EgisaiConfig:
     #            rule fired. Use when the operator considers Phase 2
     #            checks the primary defense for that workload.
     semantic_on_outage: OnOutage = "allow"
+    # In-process availability posture (``init(on_outage=…)`` /
+    # ``EGISAI_ON_OUTAGE``). Governs the core local-governance path
+    # when the SDK has never synced policy from the control plane and
+    # has nothing cached to enforce — the in-process equivalent of the
+    # Gateway's ``gateway_degraded_mode``.
+    #
+    # "allow" (default) — fail open. An org with genuinely zero
+    #     policies, and an SDK that couldn't reach Egis at startup, both
+    #     let calls through. This is the SDK's core contract: it runs
+    #     inside the customer's process and must never break their call
+    #     path (``sdk-design-philosophy.mdc`` rule 5).
+    # "block" — fail closed. Until the SDK confirms policy from the
+    #     control plane at least once, governed calls are refused with
+    #     ``egis_unavailable``. Once any sync succeeds (even one that
+    #     returns zero rules), this posture stops firing — a healthy
+    #     org with no policies still allows. Pick this only when a
+    #     refused call is genuinely preferable to an ungoverned one.
+    #
+    # Never affects PII: PII detection is local and always runs
+    # regardless of this posture. See ``egisai._evaluator``.
+    on_outage: InProcessOnOutage = "allow"
     # Stack-frame inspection mode for Agent Identity v1 Tier 3 — see
     # ``egisai._auto_agent._try_stack_identity``. The default "loose"
     # mode picks up the common ``agent_name`` / ``__egisai_agent__``
@@ -154,6 +186,7 @@ def update_config(**fields: object) -> EgisaiConfig:
         "org_id": _CONFIG.org_id,
         "agent_id": _CONFIG.agent_id,
         "semantic_on_outage": _CONFIG.semantic_on_outage,
+        "on_outage": _CONFIG.on_outage,
         "auto_stack_hints": _CONFIG.auto_stack_hints,
         "auto_describe": _CONFIG.auto_describe,
         "mcp_servers_enabled": _CONFIG.mcp_servers_enabled,

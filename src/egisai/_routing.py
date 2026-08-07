@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import random
 import threading
 import time
 from collections.abc import Callable
@@ -58,6 +59,45 @@ _decision_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 _disabled_until: float = 0.0
 #: ``None`` → unknown (ask the backend); True/False → handshake answer.
 _enabled_hint: bool | None = None
+#: Fraction (0.0–1.0) of routed downgrades whose answer is sent to the
+#: quality judge. Seeded from the handshake; ``0.0`` (the default) keeps
+#: the probe fully dormant — no extra HTTP, no judge cost.
+_quality_sample: float = 0.0
+
+
+def set_quality_sample(rate: float | None) -> None:
+    """Record the handshake's routing-quality sample rate.
+
+    ``0.0`` (the default every current backend sends) is a hard off
+    switch. ``None`` (older backends omit the field) and any malformed
+    value degrade to off. Clamped to [0, 1].
+    """
+    global _quality_sample
+    if rate is None:
+        clamped = 0.0
+    else:
+        try:
+            clamped = max(0.0, min(1.0, float(rate)))
+        except (TypeError, ValueError):
+            clamped = 0.0
+    with _lock:
+        _quality_sample = clamped
+
+
+def should_sample_quality() -> bool:
+    """Whether to probe THIS routed downgrade's quality, per the rate.
+
+    Called only after a routed downgrade actually happened, off the
+    hot path. ``0.0`` → never; ``1.0`` → always; else a fair draw.
+    """
+    with _lock:
+        rate = _quality_sample
+    if rate <= 0.0:
+        return False
+    if rate >= 1.0:
+        return True
+    # Sampling only — not a security decision (S311 is a crypto lint).
+    return random.random() < rate  # noqa: S311
 
 
 def set_enabled_hint(value: bool | None) -> None:
@@ -87,11 +127,12 @@ def invalidate() -> None:
 
 def reset() -> None:
     """Test / shutdown hook — restore pristine module state."""
-    global _disabled_until, _enabled_hint
+    global _disabled_until, _enabled_hint, _quality_sample
     with _lock:
         _decision_cache.clear()
         _disabled_until = 0.0
         _enabled_hint = None
+        _quality_sample = 0.0
 
 
 # ── Provider detection ───────────────────────────────────────────────

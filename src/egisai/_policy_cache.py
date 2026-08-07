@@ -40,6 +40,16 @@ _paused_agent_ids: frozenset[str] = frozenset()
 # turned policy enforcement off; monitoring stays on). Same
 # frozenset rationale as the paused set.
 _ungoverned_agent_ids: frozenset[str] = frozenset()
+# True once this process has completed *any* successful policy sync
+# from the control plane — including one that returned zero rules
+# (a healthy org with no policies) and a 304 (nothing changed since a
+# prior successful load). It NEVER flips back to False on a later
+# failed refresh: a transient outage after a good load leaves the
+# last-known-good rules in place, so we are still "known-good". Used
+# by ``_evaluator`` to tell "healthy org, zero policies" (allow) apart
+# from "never reached Egis" (which the ``on_outage="block"`` posture
+# refuses). Only ``clear()`` resets it.
+_synced_ok: bool = False
 
 
 # Canonical phase vocabulary (0.32.0): call-relative names that
@@ -134,6 +144,24 @@ def get_etag() -> str | None:
         return _etag
 
 
+def has_synced() -> bool:
+    """True once any policy sync from the control plane has succeeded.
+
+    See ``_synced_ok``. Read by ``_evaluator`` to decide whether an
+    empty rule set means "healthy org with no policies" (allow) or
+    "never reached Egis" (honour ``on_outage``).
+    """
+    with _lock:
+        return _synced_ok
+
+
+def mark_synced() -> None:
+    """Record that a control-plane policy sync has succeeded."""
+    global _synced_ok
+    with _lock:
+        _synced_ok = True
+
+
 def get_paused_agent_ids() -> frozenset[str]:
     """Snapshot of the operator-paused agent ID set.
 
@@ -210,6 +238,11 @@ def refresh_now() -> bool:
     """Hit the platform once. Returns ``True`` iff the cache was updated."""
     current_etag = get_etag()
     new_etag, rules, paused, ungoverned = fetch_policies(etag=current_etag)
+    # The HTTP call returned without raising — whether it shipped a new
+    # rule list, zero rules, or a 304. Either way we have now heard from
+    # the control plane, so mark the process as synced (fail-closed
+    # posture stops firing from here on).
+    mark_synced()
     if rules is None:
         # 304 — nothing changed since ``current_etag``. The rule
         # list AND both agent-state sets stay as-is, in lockstep
@@ -227,10 +260,12 @@ def refresh_now() -> bool:
 def clear() -> None:
     with _lock:
         global _etag, _rules, _paused_agent_ids, _ungoverned_agent_ids
+        global _synced_ok
         _etag = None
         _rules = []
         _paused_agent_ids = frozenset()
         _ungoverned_agent_ids = frozenset()
+        _synced_ok = False
     # No rules ⇒ no limit rules ⇒ the usage-sync worker can stop.
     try:
         from egisai.policy import limits

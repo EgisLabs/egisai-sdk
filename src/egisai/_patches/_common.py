@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from collections.abc import Callable
 from typing import Any
@@ -928,6 +929,111 @@ def _stamp_route(ev: dict[str, Any], state: dict[str, Any]) -> None:
     ev["routing_factors"] = decision.get("factors")
 
 
+def _run_route_quality_probe(
+    *,
+    trace_id: str,
+    requested_model: str,
+    served_model: str,
+    requested_tier: int | None,
+    served_tier: int | None,
+    prompt_preview: str,
+    answer_text: str,
+) -> None:
+    """Score a routed downgrade's answer and land the verdict. Never raises.
+
+    Runs on a daemon thread — the customer's call has already returned,
+    so nothing here touches their latency. The raw answer is
+    label-redacted HERE (off the hot path) before it leaves the
+    process; the platform's judge only ever sees the redacted preview
+    (compliance rule 1). The verdict is enqueued as a ``routing.quality``
+    event that the backend stamps onto the matching row by ``trace_id``.
+    """
+    try:
+        from egisai import _backend
+
+        answer_preview = _safe_text_preview(answer_text) or ""
+        if not answer_preview.strip():
+            return
+        resp = _backend.route_quality(
+            requested_model=requested_model,
+            served_model=served_model,
+            prompt_preview=prompt_preview,
+            answer_preview=answer_preview,
+            requested_tier=requested_tier,
+            served_tier=served_tier,
+        )
+        if not resp:
+            return
+        quality = resp.get("quality")
+        if not quality:
+            return
+        enqueue(
+            {
+                "kind": "routing.quality",
+                "trace_id": trace_id,
+                "routing_quality": quality,
+                "routing_quality_score": resp.get("score"),
+            }
+        )
+    except Exception:  # noqa: BLE001 — measuring quality never breaks
+        LOGGER.debug("route quality probe failed", exc_info=True)
+
+
+def _maybe_probe_route_quality(
+    *,
+    ev: dict[str, Any],
+    route_state: dict[str, Any],
+    response: Any,
+    payload: Any,
+    extract_output_signals: ExtractOutputSignals | None,
+) -> None:
+    """Spawn an off-hot-path quality probe for a routed downgrade.
+
+    Sampled per the handshake rate (``_routing.should_sample_quality``)
+    so the feature is free until an operator opts in. Only downgrades
+    are probed — an upgrade already spent more for quality, so there's
+    nothing to second-guess. Best-effort and fully fail-open: any
+    problem here leaves the row's quality columns NULL.
+    """
+    try:
+        if extract_output_signals is None:
+            return
+        decision = route_state.get("decision") or {}
+        if decision.get("direction") != "downgrade":
+            return
+        trace_id = ev.get("trace_id")
+        if not trace_id:
+            return
+        from egisai import _routing
+
+        if not _routing.should_sample_quality():
+            return
+        try:
+            signals = extract_output_signals(response, payload)
+            answer_text = signals[0] if signals else ""
+        except Exception:  # noqa: BLE001
+            answer_text = ""
+        if not answer_text or not answer_text.strip():
+            return
+        factors = decision.get("factors") or {}
+        threading.Thread(
+            target=_run_route_quality_probe,
+            kwargs={
+                "trace_id": str(trace_id),
+                "requested_model": route_state["requested_model"],
+                "served_model": str(decision.get("model") or ""),
+                "requested_tier": factors.get("requested_tier"),
+                "served_tier": factors.get("served_tier"),
+                "prompt_preview": ev.get("prompt_preview") or "",
+                "answer_text": answer_text,
+            },
+            daemon=True,
+            name="egisai-route-quality",
+        ).start()
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("route quality scheduling failed", exc_info=True)
+
+
 def _resolve_and_scope_identity(payload: Any) -> Any:
     """Resolve the agent identity and (if non-stack) push it.
 
@@ -1140,6 +1246,18 @@ def _gate_call_inner(
         ev.setdefault("enforcement_status", ENFORCEMENT_ENFORCED)
         _dispatch_step(ev, started_at=step_started, kind="model_call")
 
+        # Post-hoc routing quality — off-hot-path score of a routed
+        # downgrade's answer. Sampled + best-effort; lands on the row
+        # just dispatched, matched by trace_id.
+        if route_state is not None and route_state.get("applied"):
+            _maybe_probe_route_quality(
+                ev=ev,
+                route_state=route_state,
+                response=response,
+                payload=payload,
+                extract_output_signals=extract_output_signals,
+            )
+
         # Multi-step waterfall: if the framework opted in and the
         # model returned tool calls, append one ``tool_call`` step
         # per tool so the timeline reads ``model -> tool -> ...``
@@ -1348,6 +1466,18 @@ async def _async_gate_call_inner(
 
         ev.setdefault("enforcement_status", ENFORCEMENT_ENFORCED)
         _dispatch_step(ev, started_at=step_started, kind="model_call")
+
+        # Post-hoc routing quality — async sibling of the sync path.
+        # The probe itself runs on its own daemon thread, so there's
+        # no event-loop cost here beyond the sampling check.
+        if route_state is not None and route_state.get("applied"):
+            _maybe_probe_route_quality(
+                ev=ev,
+                route_state=route_state,
+                response=response,
+                payload=payload,
+                extract_output_signals=extract_output_signals,
+            )
 
         # Multi-step waterfall — async sibling of the same per-tool
         # emission the sync path runs. See ``_gate_call_inner``.

@@ -489,6 +489,47 @@ def route(
         return None
 
 
+def route_quality(
+    *,
+    requested_model: str,
+    served_model: str,
+    prompt_preview: str,
+    answer_preview: str,
+    requested_tier: int | None = None,
+    served_tier: int | None = None,
+    timeout_s: float = 4.0,
+) -> dict[str, Any] | None:
+    """Ask the platform to score a routed downgrade's answer. Never raises.
+
+    Off-hot-path call (the SDK runs it on a background thread), so it
+    tolerates a slightly longer timeout than ``/route`` but still fails
+    open: any non-200, malformed body, or transport error returns
+    ``None`` and the caller records no quality signal. Both previews
+    MUST be post-sanitization, label-redacted text — never raw output.
+    """
+    payload: dict[str, Any] = {
+        "requested_model": requested_model,
+        "served_model": served_model,
+        "prompt_preview": prompt_preview,
+        "answer_preview": answer_preview,
+    }
+    if requested_tier is not None:
+        payload["requested_tier"] = requested_tier
+    if served_tier is not None:
+        payload["served_tier"] = served_tier
+    try:
+        r = get_client().post(
+            "/v1/sdk/route/quality", json=payload, timeout=timeout_s
+        )
+        if r.status_code != 200:
+            return None
+        body = r.json()
+        return body if isinstance(body, dict) else None
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("route quality request failed", exc_info=True)
+        return None
+
+
 def post_events(events: list[dict[str, Any]]) -> None:
     if not events:
         return

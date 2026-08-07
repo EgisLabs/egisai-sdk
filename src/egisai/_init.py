@@ -56,6 +56,7 @@ def init(
     base_url: str | None = None,
     on_block: str = "raise",
     semantic_on_outage: str = "allow",
+    on_outage: str | None = None,
     refresh_interval_seconds: float = 10.0,
     enable_sse: bool = True,
     enable_http_fallback: bool = True,
@@ -100,6 +101,25 @@ def init(
         (fail-closed) refuses the call when the judge is unreachable —
         appropriate when an operator considers Phase 2 their primary
         defense for that workload.
+    on_outage
+        In-process availability posture — what the SDK does when it has
+        never confirmed policy from the control plane (handshake or the
+        first policy fetch failed) and has nothing cached to enforce.
+        The client-side counterpart of the Gateway's
+        ``gateway_degraded_mode``.
+
+        * ``"allow"`` (default, fail-open) — run the call ungoverned.
+          This is the SDK's core contract: it lives inside your process
+          and must never break your call path. A genuinely policy-free
+          org lands here too.
+        * ``"block"`` — fail closed. Governed calls are refused with
+          ``egis_unavailable`` until the SDK reaches Egis at least once
+          (even a sync that returns zero rules clears it). Choose this
+          only when a refused call beats an ungoverned one.
+
+        Never affects PII: PII detection is fully local and always runs
+        regardless of this setting. Also settable via
+        ``EGISAI_ON_OUTAGE``.
     refresh_interval_seconds
         How often to poll for policy changes if SSE is unavailable.
     enable_sse
@@ -200,6 +220,19 @@ def init(
                 f"semantic_on_outage must be 'allow' or 'block', "
                 f"got {semantic_on_outage!r}"
             )
+        # ``on_outage`` resolves explicit kwarg → env var → default
+        # "allow" (fail open). Validated at init() so a typo can't
+        # silently leave the in-process posture in an unintended state.
+        resolved_on_outage = (
+            on_outage
+            or os.getenv("EGISAI_ON_OUTAGE")
+            or "allow"
+        ).strip().lower()
+        if resolved_on_outage not in ("allow", "block"):
+            raise ValueError(
+                f"on_outage must be 'allow' or 'block', "
+                f"got {resolved_on_outage!r}"
+            )
         if auto_stack_hints not in ("strict", "loose", "off"):
             raise ValueError(
                 f"auto_stack_hints must be 'strict', 'loose', or 'off', "
@@ -267,6 +300,7 @@ def init(
             or "https://app.egisai.co",
             on_block=on_block,  # type: ignore[arg-type]
             semantic_on_outage=semantic_on_outage,  # type: ignore[arg-type]
+            on_outage=resolved_on_outage,  # type: ignore[arg-type]
             refresh_interval_seconds=refresh_interval_seconds,
             enable_sse=enable_sse,
             enable_http_fallback=enable_http_fallback,
@@ -325,6 +359,10 @@ def init(
             _routing_mod.set_enabled_hint(
                 bool(features.get("smart_model_routing"))
             )
+            # Seed the routing-quality sample rate. ``0.0`` (the value
+            # every current backend sends) keeps the post-hoc quality
+            # probe fully dormant — no extra HTTP, no judge cost.
+            _routing_mod.set_quality_sample(hs.get("routing_quality_sample"))
             handshake_ok = True
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning(
@@ -341,6 +379,13 @@ def init(
 
             _routing_mod.reset()
             _routing_mod.set_enabled_hint(False)
+            if resolved_on_outage == "block":
+                LOGGER.warning(
+                    "[egisai] on_outage='block' and Egis is unreachable "
+                    "— governed calls will be REFUSED until the SDK "
+                    "reaches the control plane. Set on_outage='allow' "
+                    "to fail open instead."
+                )
 
         rules_count = 0
         if handshake_ok:
@@ -427,9 +472,16 @@ def init(
                 if cfg.gateway_mode
                 else ""
             )
+            # Surface a fail-closed in-process posture on the banner —
+            # it changes what happens on an Egis outage, so an operator
+            # should see it without reading diagnostics().
+            outage = (
+                " on_outage=block" if cfg.on_outage == "block" else ""
+            )
             print(
                 f"✓ [egisai] active — app={cfg.app} env={cfg.env} "
-                f"on_block={cfg.on_block}{mode} integrations=[{integrations}] "
+                f"on_block={cfg.on_block}{outage}{mode} "
+                f"integrations=[{integrations}] "
                 f"policies={rules_count}",
                 flush=True,
             )
@@ -484,6 +536,11 @@ def diagnostics() -> dict[str, object]:
     * ``initialized`` — whether ``init()`` has run.
     * ``sdk_version`` — version string of this SDK install.
     * ``app`` / ``env`` — process-wide config.
+    * ``on_outage`` — in-process availability posture (``allow`` /
+      ``block``).
+    * ``policy_synced`` — whether the SDK has completed at least one
+      successful policy sync from the control plane. ``False`` with
+      ``on_outage="block"`` means governed calls are being refused.
     * ``policy_etag`` — opaque cache version of the current rule set.
     * ``policy_rule_count`` — number of cached rules currently active.
     * ``audit_queue_size`` — pending audit events not yet flushed.
@@ -499,7 +556,7 @@ def diagnostics() -> dict[str, object]:
 
     try:
         from egisai._logger import get_dropped_total, queue_size
-        from egisai._policy_cache import get_etag, get_rules
+        from egisai._policy_cache import get_etag, get_rules, has_synced
 
         return {
             "initialized": True,
@@ -512,6 +569,8 @@ def diagnostics() -> dict[str, object]:
             "gateway_on_outage": cfg.gateway_on_outage,
             "gateway_fallback_total": _gateway_mod.fallback_total(),
             "semantic_on_outage": cfg.semantic_on_outage,
+            "on_outage": cfg.on_outage,
+            "policy_synced": has_synced(),
             "policy_etag": get_etag(),
             "policy_rule_count": len(get_rules()),
             "audit_queue_size": queue_size(),
