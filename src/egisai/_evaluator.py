@@ -22,6 +22,7 @@ from egisai._policy_cache import (
     get_paused_agent_ids,
     get_rules,
     get_ungoverned_agent_ids,
+    has_synced,
 )
 from egisai.policy import (
     OutputPolicyContext,
@@ -366,6 +367,56 @@ def _agent_paused_decision() -> PolicyDecision:
     )
 
 
+def _outage_block_decision() -> PolicyDecision:
+    """Build the fail-closed ``block`` decision for ``on_outage="block"``.
+
+    Returned in place of the default allow when there are no rules to
+    enforce *and* the SDK has never confirmed policy from the control
+    plane. It is an availability refusal, not a policy match — the
+    ``egis_unavailable`` reason mirrors the Gateway's degraded-mode
+    503 so downstream handling reads identically in both modes.
+    """
+    from egisai.policy.engine import MatchedPolicyRecord
+
+    message = (
+        "Egis could not load this organization's policies and is "
+        "configured to fail closed (on_outage='block'). This is an "
+        "availability failure, not a policy decision — the call was "
+        "refused rather than run ungoverned. It will clear once the "
+        "SDK reaches the control plane; set on_outage='allow' to fail "
+        "open instead."
+    )
+    record = MatchedPolicyRecord(
+        name="Egis unavailable",
+        type="egis_unavailable",
+        verdict="block",
+        reason_code="egis_unavailable",
+        message=message,
+    )
+    return PolicyDecision.deny(
+        reason_code="egis_unavailable",
+        message=message,
+        matched_policy="Egis unavailable",
+        matched_policies=(record,),
+    )
+
+
+def _no_rules_decision() -> PolicyDecision:
+    """Decide what to do when the cache holds no rules for this call.
+
+    Default is fail-open (``allow``) — a genuinely policy-free org and
+    the SDK's core availability contract both land here. Only when the
+    operator opted into ``on_outage="block"`` AND the SDK has never
+    synced policy from the control plane do we fail closed: that is the
+    "running blind, refuse rather than run ungoverned" case. A healthy
+    org with zero policies has ``has_synced()`` True and still allows.
+    """
+    cfg = get_config_optional()
+    if cfg is not None and cfg.on_outage == "block" and not has_synced():
+        return _outage_block_decision()
+    return PolicyDecision.allow()
+
+
 def _is_agent_paused(agent_id: str) -> bool:
     """Quick lookup against the cached paused-agent set.
 
@@ -454,9 +505,13 @@ def evaluate(call: InputCall) -> PolicyDecision:
         return PolicyDecision.allow()
     rules = get_rules()
     if not rules:
-        return PolicyDecision.allow()
+        # No rules cached: either a healthy policy-free org (allow) or
+        # a control-plane we never reached (honour ``on_outage``).
+        return _no_rules_decision()
     rules = _scope_filter(rules, agent_id)
     if not rules:
+        # Org HAS policies, just none scoped to this agent — a real,
+        # synced state. Always allow; never the outage path.
         return PolicyDecision.allow()
     # First-call gate: if the analyzer is still warming and a
     # ``pii_scan`` rule is scoped to this call, briefly wait. After
@@ -500,7 +555,10 @@ def evaluate_output(call: OutputCall) -> PolicyDecision:
         return PolicyDecision.allow()
     rules = get_rules()
     if not rules:
-        return PolicyDecision.allow()
+        # Mirror ``evaluate``: honour the fail-closed posture on the
+        # response side too, for frameworks whose first governed entry
+        # point is the output / tool-result hook.
+        return _no_rules_decision()
     rules = _scope_filter(rules, agent_id)
     if not rules:
         return PolicyDecision.allow()

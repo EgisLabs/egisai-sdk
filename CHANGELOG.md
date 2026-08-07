@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.61.0] — 2026-08-06
+
+### Added
+
+- **Smart Model Routing quality signal.** Routed *downgrades* can now
+  be scored for whether the cheaper model's answer held up, so the
+  savings number gains a quality counterpart. On a sampled slice of
+  downgrades (rate set server-side; `0` and fully dormant by default),
+  the SDK — entirely off your call's hot path, on a background thread —
+  label-redacts the served answer, asks the platform to judge it via
+  `POST /v1/sdk/route/quality`, and lands the verdict
+  (`adequate` / `degraded` + a confidence score) on the matching audit
+  row. Never blocks or slows the governed call, sends only redacted
+  previews (never raw output), and fails open: any problem simply
+  leaves the row's quality columns empty. Mirrors the inline Gateway,
+  which scores its routed downgrades the same way.
+
+---
+
+## [0.60.0] — 2026-08-06
+
+### Added
+
+- **In-process fail-open / fail-closed posture (`on_outage`).** The SDK
+  now takes `init(on_outage="allow"|"block")` (or `EGISAI_ON_OUTAGE`),
+  the client-side counterpart of the Gateway's `gateway_degraded_mode`.
+  `"allow"` (default) keeps the existing behavior — the SDK never breaks
+  your call path, and a genuinely policy-free org still lets calls
+  through. `"block"` fails closed: governed calls are refused with
+  `egis_unavailable` until the SDK confirms policy from the control
+  plane at least once (a sync returning zero rules clears it). This only
+  fires when the SDK has *never* reached Egis and has nothing cached; a
+  healthy org with zero policies, or a transient outage after a good
+  load, is unaffected. PII detection is local and always runs regardless
+  of this setting. Surfaced on the startup banner (when `block`) and via
+  `diagnostics()` as `on_outage` + `policy_synced`.
+
+---
+
 ## [0.59.0] — 2026-08-02
 
 ### Added

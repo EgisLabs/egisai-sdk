@@ -107,7 +107,7 @@ degrades instead of failing:
 
 | Dependency unreachable | Behavior |
 |---|---|
-| Handshake / policy refresh at `init()` | Offline mode — the SDK keeps running with the last-known-good policy cache (empty on a cold start). |
+| Handshake / policy refresh at `init()` | Governed by `on_outage` — `"allow"` (default) runs offline with the last-known-good policy cache (empty on a cold start, so calls pass ungoverned); `"block"` fails closed, refusing governed calls with `egis_unavailable` until the SDK reaches the control plane once. |
 | Audit log ingest | Events buffer in a bounded queue and drain later; oldest are dropped past the cap. Never blocks a call. |
 | Agent registration | The call proceeds unattributed-but-governed. The identity is backed off and retried later, so an outage costs one attempt per window, not one per call. |
 | `semantic_guard` judge | Governed by `semantic_on_outage` — `"allow"` (default) or `"block"`. |
@@ -123,10 +123,15 @@ Two invariants hold regardless:
   block. Nothing in the availability path converts a refusal into
   an allowed call.
 
-Choosing `semantic_on_outage="block"` and `gateway_on_outage="fail"`
-makes the SDK fail closed on both network-dependent checks — the
-right choice when a refused call is preferable to a call governed
-by local, possibly stale policy.
+Choosing `on_outage="block"` (control-plane unreachable),
+`semantic_on_outage="block"` (judge unreachable), and
+`gateway_on_outage="fail"` (Gateway unreachable, gateway mode) makes
+the SDK fail closed on every network-dependent path — the right choice
+when a refused call is preferable to one governed by local, possibly
+stale policy, or to none at all. `on_outage="block"` is the in-process
+mirror of the Gateway's `gateway_degraded_mode="refuse"`, so a
+policy-strict org can pin the same posture whichever path its traffic
+takes. All three default to fail-open to preserve availability.
 
 ## Agent descriptor (system-prompt excerpt)
 
