@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.63.0] — 2026-08-08
+
+### Added
+
+- **Outbound MCP tool calls are now governed.** A new patch wraps
+  `ClientSession.call_tool` from the official `mcp` package, so
+  policies run on the tool arguments *before* the request leaves your
+  process. A `deny_mcp_call` or `semantic_guard` block stops the call
+  and returns an `isError` result the model can read and recover from;
+  a `pii_scan` set to `sanitize` masks the arguments so the third-party
+  server never receives the raw value.
+
+  This closes the last blind spot on the tool path. Until now the SDK
+  could see everything an agent said to the model and nothing it said
+  to Slack, Drive, or GitHub. Nothing to configure — `init()` picks it
+  up automatically, and it is a no-op if `mcp` isn't installed.
+
+  Unlike the inbound MCP Server patch, this needs no add-on: governing
+  the tools your own agent reaches for is ordinary agent governance.
+
+- **Observed MCP servers land on the Access inventory.** The first
+  call to a given server reports it, and the tool used, to the
+  dashboard. Previously the Access tab only knew what an agent had
+  *declared*; now it also shows what the agent actually reached.
+
+## [0.62.0] — 2026-08-07
+
+### Added
+
+- **Cloud identity reporting.** The SDK now reports which cloud
+  principal the process runs as — AWS role ARN, GCP service account
+  email, `AZURE_CLIENT_ID`, and OAuth client ids already present in
+  the environment. The platform uses it to link the OAuth grants and
+  service principals it inventories from your SaaS tenants to the
+  specific agent using them, so "some app has standing access to
+  Drive" becomes "this agent does".
+
+  Identity strings only: no credential, token, or private key is ever
+  read, including from the instance metadata service (IMDSv2, one
+  field out of `iam/info`). The probe runs in a daemon thread with a
+  200 ms budget and only makes a network hop when the environment
+  already looks like that cloud, so it never delays a model call and
+  costs a laptop nothing. Opt out with `init(cloud_identity=False)` or
+  `EGISAI_CLOUD_IDENTITY=0`. Full contract in `SECURITY.md`.
+
 ## [0.61.0] — 2026-08-06
 
 ### Added
