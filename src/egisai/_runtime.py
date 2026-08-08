@@ -182,21 +182,46 @@ _CACHED_SDK_VERSION: str | None = None
 _CACHE_LOCK = threading.Lock()
 
 
+def _with_cloud_identity(blob: dict[str, Any]) -> dict[str, Any]:
+    """Overlay the cloud identity probe's answer, if it has one yet.
+
+    Deliberately outside the cache. Everything else in the blob is
+    fixed for the life of the process, but the identity probe runs in a
+    background thread and may not have answered when the first call
+    goes out — caching an empty result would mean the identity never
+    shipped at all. Reading it fresh each time costs a dict copy and
+    makes the second ``ensure`` carry what the first one couldn't.
+    """
+    try:
+        from egisai import _cloud_identity
+
+        found = _cloud_identity.snapshot()
+    except Exception:  # noqa: BLE001 — provenance is never worth a crash
+        return blob
+    if found:
+        blob["cloud_identity"] = found
+    return blob
+
+
 def collect_runtime_fingerprint(*, sdk_version: str) -> dict[str, Any]:
     """Return the JSON-friendly runtime blob shipped to the backend.
 
     Cached for the lifetime of the SDK process. Subsequent calls
     return the same dict (defensively copied so callers can't mutate
     the cache).
+
+    The one exception is ``cloud_identity``, which is layered on after
+    the cache because the probe that produces it finishes on its own
+    schedule. See :func:`_with_cloud_identity`.
     """
     cached = _CACHED
     if cached is not None and _CACHED_SDK_VERSION == sdk_version:
-        return dict(cached)
+        return _with_cloud_identity(dict(cached))
     with _CACHE_LOCK:
         # Double-check after acquiring the lock — another thread may
         # have populated the cache while we were waiting.
         if _CACHED is not None and _CACHED_SDK_VERSION == sdk_version:
-            return dict(_CACHED)
+            return _with_cloud_identity(dict(_CACHED))
 
         framework_versions: dict[str, str] = {}
         for name in (
@@ -229,7 +254,7 @@ def collect_runtime_fingerprint(*, sdk_version: str) -> dict[str, Any]:
             "frameworks": framework_versions,
         }
         _set_cache(blob, sdk_version)
-        return dict(blob)
+        return _with_cloud_identity(dict(blob))
 
 
 def _set_cache(blob: dict[str, Any], sdk_version: str) -> None:

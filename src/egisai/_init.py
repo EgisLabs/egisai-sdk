@@ -31,6 +31,7 @@ from egisai._patches import http as patch_http
 from egisai._patches import langchain as patch_langchain
 from egisai._patches import langgraph as patch_langgraph
 from egisai._patches import llamaindex as patch_llamaindex
+from egisai._patches import mcp_client as patch_mcp_client
 from egisai._patches import mcp_server as patch_mcp_server
 from egisai._patches import openai as patch_openai
 from egisai._patches import openai_agents as patch_openai_agents
@@ -65,6 +66,7 @@ def init(
     gateway: bool | None = None,
     gateway_on_outage: str | None = None,
     stamp_identity: bool | None = None,
+    cloud_identity: bool | None = None,
     quiet: bool = False,
 ) -> None:
     """Activate egisai for the current process.
@@ -199,6 +201,19 @@ def init(
         embedded — never prompt text or PII. Defaults to ``False``
         (nothing is touched); also settable via the
         ``EGISAI_STAMP_IDENTITY`` env var.
+    cloud_identity
+        Report which cloud principal this process runs as — the AWS
+        role ARN, GCP service account email, Azure client id, or OAuth
+        client ids already present in the environment. The platform
+        uses it to link the OAuth grants and service principals it
+        inventories from your SaaS tenants to the specific agent using
+        them, turning "some app has standing access to Drive" into
+        "this agent does". Identity strings only: no credential, token,
+        or key is ever read, including from the instance metadata
+        service. The probe runs in a background thread with a 200 ms
+        budget, so it never delays your first model call. Defaults to
+        ``True``; disable with ``cloud_identity=False`` or
+        ``EGISAI_CLOUD_IDENTITY=0``.
     quiet
         Suppress the one-line "egisai active" startup log.
     """
@@ -291,6 +306,24 @@ def init(
         else:
             resolved_stamp_identity = bool(stamp_identity)
 
+        # ``cloud_identity`` resolves explicit kwarg → env var →
+        # default True, mirroring ``auto_describe``. Default-on because
+        # the join it enables is the whole point of the feature and the
+        # data is metadata the environment already asserts about
+        # itself; opting out is one flag away for anyone who'd rather
+        # their role ARNs stay put.
+        if cloud_identity is None:
+            env_cloud_identity = os.getenv("EGISAI_CLOUD_IDENTITY")
+            if env_cloud_identity is None:
+                resolved_cloud_identity = True
+            else:
+                resolved_cloud_identity = (
+                    env_cloud_identity.strip().lower()
+                    not in ("0", "false", "no", "off", "")
+                )
+        else:
+            resolved_cloud_identity = bool(cloud_identity)
+
         cfg = EgisaiConfig(
             api_key=api_key,
             app=app,
@@ -316,6 +349,15 @@ def init(
         # describes this process's current gateway health, not a
         # previous config's.
         _gateway_mod.reset_fallback_total()
+
+        # Started before the handshake so the probe overlaps the round
+        # trip it would otherwise delay. Whatever it has found by the
+        # time the first ``ensure`` goes out ships with it; anything
+        # slower rides the next one.
+        if resolved_cloud_identity:
+            from egisai import _cloud_identity as _cloud_identity_mod
+
+            _cloud_identity_mod.prime_async()
 
         handshake_ok = False
         try:
@@ -446,6 +488,13 @@ def init(
             enabled.append("pydantic-ai")
         if enable_http_fallback and patch_http.apply():
             enabled.append("httpx/requests")
+        # Outbound MCP — the agent calling somebody else's server.
+        # Ordinary agent governance (same shape as the claude_agent_sdk
+        # tool hooks), so unlike the server-side patch below it is not
+        # gated on an add-on. No-op unless the ``mcp`` package is
+        # installed.
+        if patch_mcp_client.apply():
+            enabled.append("mcp-client")
         # MCP Servers add-on — dormant unless the handshake reported
         # the org is entitled. Patches FastMCP / the official mcp SDK
         # to govern inbound tools/call. No-op for every non-add-on org.

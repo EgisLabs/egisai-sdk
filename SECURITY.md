@@ -199,6 +199,47 @@ value, an unsanitised description, or MCP connection material
 (command / URL / credentials), that's a Critical-severity issue and
 we want to know within hours.
 
+## Cloud identity (which principal the agent runs as)
+
+To link the OAuth grants and service principals the platform
+inventories from your SaaS tenants to the agent actually using them,
+the SDK reports the cloud principal this process runs as. Without it
+that link is guesswork; with it, it's a string compare.
+
+1. **Identity strings only — never credentials.** The AWS role ARN,
+   the GCP service account email, `AZURE_CLIENT_ID`, and OAuth client
+   ids present in the environment. **Nothing reads a credential, a
+   token, or a private key**, including from the instance metadata
+   service, which will hand out temporary access keys to anyone who
+   asks it. The probe asks IMDS for `iam/info` and reads one field
+   from it. There is no code path that fetches
+   `iam/security-credentials`.
+2. **IMDSv2 only.** The token is fetched with a `PUT` and the metadata
+   address is a hard-coded constant, not read from the environment —
+   so an attacker who can set env vars in the agent's process cannot
+   redirect the probe at a host of their choosing.
+3. **The GCP key file is read for one field.** When
+   `GOOGLE_APPLICATION_CREDENTIALS` is the only signal, the SDK reads
+   `client_email` out of that file. `private_key` is never touched.
+4. **Bounded and off the hot path.** Values over 512 characters are
+   discarded (an identifier that long is a token or a paste accident).
+   The whole probe runs in a daemon thread with a 200 ms per-request
+   budget and never delays a model call — a firewalled metadata
+   endpoint costs you nothing.
+5. **No probe without a signal.** The network hop only happens when
+   the environment already looks like that cloud, so a laptop or an
+   on-prem host makes no metadata requests at all.
+6. **Opt-out.** `init(cloud_identity=False)` or
+   `EGISAI_CLOUD_IDENTITY=0` disables it entirely; no identity leaves
+   the process and grant-to-agent linking falls back to operator
+   assignment on the dashboard.
+
+A role ARN is infrastructure metadata about your environment, which is
+why this is documented rather than silent. If you find this path
+transmitting anything that could authenticate as you — an access key,
+a session token, a private key — that's a Critical-severity issue and
+we want to know within hours.
+
 ## Tool / MCP enforcement guarantees
 
 `egisai` distinguishes two states on every audit row:
@@ -220,6 +261,17 @@ There are THREE enforcement surfaces the SDK documents for auditors:
    `semantic_guard` on the call itself. Blocks dangerous
    actions (drop tables, send funds, exec arbitrary shell)
    before they run.
+
+   Since 0.63.0 this also covers your agent acting as an **MCP
+   client** against a third-party server. The patch wraps
+   `ClientSession.call_tool`, so the gate runs in your process before
+   any bytes go out. A `pii_scan` set to `sanitize` masks the tool
+   arguments locally — the remote server receives the mask, never the
+   original — which is the same §1 guarantee that applies to prompts.
+   A block returns an MCP `isError` result rather than raising, so a
+   policy decision about one tool doesn't take down the whole agent
+   run; the audit row is still `verdict="block"` and
+   `enforcement_status="enforced"` because the call did not happen.
 2. **Tool result content** — `pii_scan`, `deny_output_regex`,
    `semantic_guard` on the data the tool returned. Blocks
    leaks of PII / secrets / proprietary identifiers that
