@@ -24,6 +24,7 @@ from egisai._patches import bedrock_agent as patch_bedrock_agent
 from egisai._patches import bedrock_runtime as patch_bedrock_runtime
 from egisai._patches import claude_agent_sdk as patch_claude_agent_sdk
 from egisai._patches import crewai as patch_crewai
+from egisai._patches import decision as patch_decision
 from egisai._patches import genai as patch_genai
 from egisai._patches import google as patch_google
 from egisai._patches import google_adk as patch_google_adk
@@ -488,6 +489,11 @@ def init(
             enabled.append("pydantic-ai")
         if enable_http_fallback and patch_http.apply():
             enabled.append("httpx/requests")
+        # Marks calls this process already decided, so an egress node
+        # in front of the workload doesn't govern — or log — the same
+        # call a second time. No-op without httpx, and invisible
+        # unless a node is actually deployed.
+        patch_decision.apply()
         # Outbound MCP — the agent calling somebody else's server.
         # Ordinary agent governance (same shape as the claude_agent_sdk
         # tool hooks), so unlike the server-side patch below it is not

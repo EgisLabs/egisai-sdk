@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-from egisai.policy import fastpath
+from egisai.policy import fastpath, injection
 from egisai.policy import pii as pii_scanner
 from egisai.policy._regex_safe import safe_search
 from egisai.policy.semantic import SemanticBlocker
@@ -185,12 +185,25 @@ class PolicyDecision:
         return self.sanitize_types
 
     @classmethod
-    def allow(cls) -> PolicyDecision:
+    def allow(
+        cls,
+        *,
+        matched_policies: tuple[MatchedPolicyRecord, ...] = (),
+    ) -> PolicyDecision:
+        """The call proceeds.
+
+        ``matched_policies`` may still be non-empty: an *advisory*
+        rule (today, ``injection_scan`` with ``action="flag"``) records
+        what it saw without changing the verdict. ``matched_policy``
+        stays ``None`` on purpose — that field names the rule whose
+        verdict the call took, and on an allow no rule did.
+        """
         return cls(
             verdict="allow",
             reason_code=None,
             message=None,
             matched_policy=None,
+            matched_policies=matched_policies,
         )
 
     @classmethod
@@ -267,6 +280,11 @@ _DETERMINISTIC_KINDS = frozenset(
         "deny_mcp_call",
         "deny_db_query",
         "deny_financial_action",
+        # Prompt-injection shapes (0.65.0). Compiled regex + two
+        # character-class counts over the text — no model, no network,
+        # and no ONNX bundle, which is why it is allowed to run on
+        # every call. See ``egisai.policy.injection``.
+        "injection_scan",
         # Per-agent runtime limits (0.46.1). Pure in-memory counter
         # compares against the backend-synced usage snapshot — no
         # network on the hot path (see ``egisai.policy.limits``).
@@ -640,6 +658,13 @@ def _evaluate_one_input_policy(
             block_reason_code="pii_detected",
         )
 
+    if policy.type == "injection_scan":
+        return _injection_scan_match(
+            policy,
+            text=context.prompt_text,
+            reason_code="injection_detected",
+        )
+
     if policy.type == "semantic_guard":
         return _semantic_guard_match(
             policy=policy,
@@ -798,6 +823,13 @@ def _synthesize_decision(
     Verdict precedence is ``block > sanitize > allow``. The first
     record at the winning precedence is the primary; the full list
     is carried on ``matched_policies``.
+
+    A record whose own verdict is neither ``block`` nor ``sanitize``
+    is *advisory* — it saw something worth recording but is not asking
+    for the call to change. Those ride along on ``matched_policies``
+    of an allow decision so the finding reaches the audit row, which
+    is the only reason an operator would set a rule to flag rather
+    than block.
     """
     if not records:
         return PolicyDecision.allow()
@@ -829,7 +861,7 @@ def _synthesize_decision(
             matched_policies=tuple(records),
         )
 
-    return PolicyDecision.allow()
+    return PolicyDecision.allow(matched_policies=tuple(records))
 
 
 def _semantic_guard_match(
@@ -1653,6 +1685,92 @@ def _deny_pattern_match(
     )
 
 
+#: What ``injection_scan`` does when the score clears the threshold.
+#: ``flag`` is the default and the recommended starting posture — it
+#: writes the finding to the audit row and lets the call through, so an
+#: operator can watch a week of real traffic before deciding to refuse
+#: anything. A detector that blocks on day one gets turned off on day
+#: two.
+_INJECTION_ACTIONS = ("flag", "block")
+
+#: Default bar. Chosen so a single unambiguous pattern (weight ≥ 0.75)
+#: clears it alone while a lone corroborating hint does not.
+_INJECTION_DEFAULT_THRESHOLD = 0.75
+
+
+def _injection_scan_match(
+    policy: PolicyRule,
+    *,
+    text: str,
+    reason_code: str,
+) -> MatchedPolicyRecord | None:
+    """Score ``text`` for prompt-injection shapes and apply the action.
+
+    Config:
+
+    ``threshold`` (float, default 0.75)
+        The bar. Below it the rule is silent.
+    ``action`` (``"flag"`` | ``"block"``, default ``"flag"``)
+        ``flag`` writes the finding to the audit row and lets the call
+        through; ``block`` refuses it.
+    ``classes`` (list of class ids)
+        Narrow the scan. Omit to run all six.
+    ``message`` (str)
+        Overrides the operator-facing text, same as every other kind.
+
+    A ``flag`` returns a record whose own ``verdict`` is ``"flag"``.
+    That is a fourth value in ``MatchedPolicyRecord.verdict``, and it
+    is safe by construction: every consumer of that field tests it
+    against ``"block"`` or ``"sanitize"`` explicitly, so an unknown
+    value is inert everywhere the call's verdict is computed. The
+    record still rides along on ``PolicyDecision.matched_policies``,
+    which is what puts the finding in front of an operator — the whole
+    point of a flag. Returning ``None`` instead would have made the
+    default action do nothing at all.
+    """
+    config = policy.config or {}
+
+    action = str(config.get("action") or "flag").strip().lower()
+    if action not in _INJECTION_ACTIONS:
+        action = "flag"
+
+    try:
+        threshold = float(config.get("threshold", _INJECTION_DEFAULT_THRESHOLD))
+    except (TypeError, ValueError):
+        threshold = _INJECTION_DEFAULT_THRESHOLD
+    # A threshold outside 0–1 is a typo, not an intent. Clamping keeps
+    # a fat-fingered ``7.5`` from silently disabling the rule forever.
+    threshold = min(1.0, max(0.0, threshold))
+
+    raw_classes = config.get("classes")
+    wanted: tuple[str, ...] | None = None
+    if isinstance(raw_classes, (list, tuple)):
+        picked = tuple(
+            str(c).strip() for c in raw_classes if str(c).strip() in injection.CLASSES
+        )
+        wanted = picked or None
+
+    result = injection.scan(text, classes=wanted)
+    if result.score < threshold or not result.findings:
+        return None
+
+    primary = result.primary
+    label = (primary.cls if primary else "prompt injection").replace("_", " ")
+    detail = f"{label}, confidence {result.score:.2f}"
+    default_message = (
+        f"Content matched a prompt-injection shape ({detail})."
+        if action == "block"
+        else f"Possible prompt injection in this content ({detail})."
+    )
+    return MatchedPolicyRecord(
+        name=policy.name,
+        type="injection_scan",
+        verdict="block" if action == "block" else "flag",
+        reason_code=reason_code,
+        message=str(config.get("message") or "").strip() or default_message,
+    )
+
+
 def _max_chars_match(
     policy: PolicyRule,
     *,
@@ -2000,6 +2118,19 @@ def _evaluate_one_output_policy(
 
     if policy.type == "deny_financial_action":
         return _deny_financial_action_match(policy, context)
+
+    if policy.type == "injection_scan":
+        # The response side is where this earns its keep. A tool
+        # result — a fetched web page, a Jira comment, a PDF the agent
+        # just read — comes back through here on its way to the next
+        # turn, and that is the text an attacker actually controls.
+        # The prompt side catches the user typing an override; this
+        # catches the document that types it for them.
+        return _injection_scan_match(
+            policy,
+            text=context.text,
+            reason_code="injection_in_output",
+        )
 
     if policy.type == "semantic_guard":
         return _semantic_guard_match(
