@@ -296,6 +296,65 @@ def ensure_trace_id() -> str:
     return tid
 
 
+# ── Ambient OpenTelemetry correlation ───────────────────────────────
+#
+# If the customer already runs OpenTelemetry, their traces are where
+# they debug. An audit row that can't be lined up against the span it
+# happened inside forces them to correlate by wall-clock, which is
+# guesswork under any real concurrency.
+#
+# So: on every governed call, read the active span's ids and ship them
+# alongside our own ``trace_id``. Cheap (two ContextVar reads),
+# entirely optional, and never authoritative — our ``trace_id`` stays
+# the grouping key for a run, because collapsing two agents that share
+# a distributed trace into one run would be a regression in the
+# dashboard's most-used view.
+
+#: Tri-state cache of whether ``opentelemetry`` is importable.
+#: ``None`` = not yet checked. Cached because the miss path — an
+#: ``ImportError`` raised and caught on every model call — is the
+#: expensive one, and most installs will never have OTel.
+_otel_trace_mod: object | None = None
+_otel_checked = False
+
+
+def ambient_otel_ids() -> tuple[str | None, str | None]:
+    """``(trace_id, span_id)`` of the active OTel span, as lowercase hex.
+
+    Returns ``(None, None)`` when opentelemetry-api isn't installed,
+    no span is active, or the span context is invalid — all of which
+    are the common case, and none of which is an error.
+
+    Never raises. This runs on the hot path of every governed call, so
+    a broken or unusual OTel setup must degrade to "no correlation
+    ids" rather than to a failed model call.
+    """
+    global _otel_trace_mod, _otel_checked
+    if not _otel_checked:
+        _otel_checked = True
+        try:
+            from opentelemetry import trace  # type: ignore[import-not-found]
+
+            _otel_trace_mod = trace
+        except Exception:  # noqa: BLE001
+            _otel_trace_mod = None
+    if _otel_trace_mod is None:
+        return (None, None)
+    try:
+        span = _otel_trace_mod.get_current_span()  # type: ignore[attr-defined]
+        if span is None:
+            return (None, None)
+        sc = span.get_span_context()
+        # ``INVALID_SPAN`` is what OTel hands back when nothing is
+        # active; its ids are all zeroes, which would be worse than
+        # nothing in an audit row.
+        if sc is None or not sc.is_valid:
+            return (None, None)
+        return (format(sc.trace_id, "032x"), format(sc.span_id, "016x"))
+    except Exception:  # noqa: BLE001
+        return (None, None)
+
+
 def reset_trace() -> str:
     tid = uuid.uuid4().hex
     _trace_id.set(tid)

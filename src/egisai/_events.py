@@ -7,7 +7,7 @@ import uuid
 from typing import Any
 
 from egisai._config import get_config
-from egisai._context import ensure_trace_id, get_context
+from egisai._context import ambient_otel_ids, ensure_trace_id, get_context
 
 
 def now_iso() -> str:
@@ -77,9 +77,15 @@ def build_event(
     cfg = get_config()
     ctx = get_context()
     trace = ensure_trace_id()
+    # Correlation with the customer's own tracing, when they have it.
+    # Additive to ``trace_id``, never a replacement — see
+    # ``_context.ambient_otel_ids``.
+    otel_trace_id, otel_span_id = ambient_otel_ids()
     return {
         "event_id": uuid.uuid4().hex,
         "trace_id": trace,
+        "otel_trace_id": otel_trace_id,
+        "otel_span_id": otel_span_id,
         "timestamp": now_iso(),
         "app": ctx.agent_name or cfg.app,
         "env": cfg.env,

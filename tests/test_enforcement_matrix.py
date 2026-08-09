@@ -92,6 +92,25 @@ MATRIX: list[tuple[str, str, str, str]] = [
 ]
 
 
+#: Patch modules that are not framework integrations and therefore make
+#: no enforcement claim to document.
+#:
+#: The matrix is a promise about what the SDK stops for a given
+#: framework. A module that governs nothing has no row to occupy, and
+#: inventing one — "decision: n/a" — would put a line in README and
+#: SECURITY that a reader has to work out is meaningless.
+#:
+#: Every entry needs a reason, because the default answer to "may I add
+#: my patch here instead of to the matrix" is no.
+NON_FRAMEWORK_PATCHES: dict[str, str] = {
+    # Stamps ``X-Egis-Decision`` on calls the SDK already governed so an
+    # egress node in the same path skips them. Changes no verdict and
+    # blocks nothing; it exists so one call produces one audit row
+    # rather than two.
+    "decision": "Deduplication signal to the egress node — governs nothing.",
+}
+
+
 @pytest.mark.parametrize(
     "module_name,_label,_tier,_doc",
     list(MATRIX),
@@ -146,14 +165,15 @@ def test_patch_apply_is_noop_when_framework_not_installed(
 
 
 def test_matrix_covers_every_patch_module() -> None:
-    """Every ``.py`` file in ``egisai/_patches`` (except internals)
-    MUST appear in the matrix above. Catches a new framework patch
-    being added without updating the matrix / docs."""
+    """Every ``.py`` file in ``egisai/_patches`` (except internals and
+    the explicitly listed non-framework patches) MUST appear in the
+    matrix above. Catches a new framework patch being added without
+    updating the matrix / docs."""
     patches_dir = Path(__file__).resolve().parents[1] / "src" / "egisai" / "_patches"
     on_disk: set[str] = set()
     for path in patches_dir.glob("*.py"):
         name = path.stem
-        if name.startswith("_"):
+        if name.startswith("_") or name in NON_FRAMEWORK_PATCHES:
             continue
         on_disk.add(name)
 
@@ -167,6 +187,24 @@ def test_matrix_covers_every_patch_module() -> None:
     assert not extra, (
         f"matrix references missing patch modules: {sorted(extra)}"
     )
+
+
+@pytest.mark.parametrize("module_name", sorted(NON_FRAMEWORK_PATCHES))
+def test_non_framework_patches_keep_the_same_import_contract(
+    module_name: str,
+) -> None:
+    """Exempt from the matrix, not from the fail-open guarantee.
+
+    These modules make no enforcement claim, so they have no row to
+    document — but they still run inside ``init()`` on every customer's
+    process, and one that raises on import or on ``apply()`` bricks an
+    app just as thoroughly as a framework patch would.
+    """
+    mod = importlib.import_module(f"egisai._patches.{module_name}")
+    apply_fn = getattr(mod, "apply", None)
+    assert callable(apply_fn), f"{module_name}.apply must be callable"
+    assert not inspect.signature(apply_fn).parameters
+    assert isinstance(apply_fn(), bool)
 
 
 def test_readme_matches_matrix() -> None:

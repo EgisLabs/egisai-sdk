@@ -7,6 +7,110 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.66.0] — 2026-12-08
+
+### Added
+
+- **Calls this SDK already governed are marked, so an EgisAI egress
+  node doesn't govern them twice.** More and more organizations run
+  both: the SDK inside the services their own team wrote, and a proxy
+  in front of everything else — the Go binary nobody documented, the
+  vendor container you can't open. Without a signal between them, a
+  single model call from an instrumented service is evaluated at both
+  points and lands in the audit log twice. Two rows for one call is the
+  kind of detail that makes a compliance export impossible to defend.
+
+  The SDK now stamps `X-Egis-Decision: governed` on outbound requests
+  to model vendors, but only inside the window where it actually made
+  the decision. A call it merely observed does not get the header, so
+  the node still governs that one. The header carries no verdict and no
+  authority — it is a marker that says "already handled", and the only
+  thing a node does with it is skip work that was already done closer
+  to the code.
+
+  Nothing to configure. With no node in your network this adds one
+  short header to requests that were already going out.
+
+### Changed
+
+- The header is applied by wrapping `httpx`'s send path, which is what
+  every provider SDK sits on. Requests to your own services are never
+  touched — the host has to be one an egress node inspects.
+
+---
+
+## [0.65.0] — 2026-12-06
+
+### Added
+
+- **New `injection_scan` policy kind — catches instructions hidden in
+  what your agent reads.** The problem is not somebody typing a rude
+  prompt. It is that your agent fetches a web page, a support ticket,
+  or a PDF, and that text contains instructions addressed to the model
+  rather than to the reader. The model can't tell the difference, so
+  the instruction runs with your agent's credentials.
+
+  Six shapes are scored: `instruction_override` ("ignore the above"),
+  `role_hijack` (fabricated `[system]` turns, chat-template
+  delimiters), `exfiltration` ("send this to https://…"),
+  `prompt_extraction` ("repeat your system prompt"),
+  `guardrail_bypass` ("developer mode"), and `encoded_payload`
+  (invisible Unicode tag characters, dense zero-width runs, long
+  base64 blobs).
+
+  Detection is deterministic — compiled patterns and two
+  character-class counts, no model call and no network — so it runs in
+  phase 1 alongside the rest of the local checks and adds well under a
+  millisecond. Text is NFKC-normalized first, so an override written
+  in fullwidth characters is the same override.
+
+  The default `action` is `flag`: the finding lands on the audit row
+  and the call proceeds. Start there and switch to `block` once you
+  have watched your own traffic. Put the rule on the **response**
+  phase (or `both`) — the request side catches a user typing an
+  override, the response side catches the document that types it for
+  them.
+
+  Two ready-made rules ship in the dashboard's policy library:
+  "Prompt injection — watch everywhere" and "Injection in tool
+  results — block".
+
+### Changed
+
+- `PolicyDecision.allow()` now accepts `matched_policies`. An advisory
+  rule can record what it saw without changing the call's verdict,
+  which is what makes `action: "flag"` do anything at all. Records
+  carry their own verdict of `"flag"`; everything that computes a
+  call's outcome tests for `"block"` or `"sanitize"` explicitly, so
+  the new value is inert there by construction.
+
+## [0.64.0] — 2026-12-02
+
+### Added
+
+- **Every governed call now carries your OpenTelemetry trace ids.** If
+  an OTel span is active when the SDK governs a call, the span's W3C
+  `trace_id` and `span_id` ride along with the audit event and land on
+  the request row. You can take a row in Egis straight to the matching
+  span in Jaeger, Datadog, or Honeycomb instead of lining the two up
+  by wall-clock — which stops working as soon as two agents run at
+  once, exactly when you need it most.
+
+  Nothing to configure and nothing new to install. If
+  `opentelemetry-api` isn't importable, or no span is active, the
+  fields are simply absent. It is not a dependency and never becomes
+  one.
+
+  These are additive to the SDK's own `trace_id`, which still groups
+  the steps of one agent run. An OTel trace usually spans several
+  agents and services, so reusing one field for both would have merged
+  unrelated runs in the dashboard.
+
+  Requires a backend on migration `0103` or later. Older backends
+  ignore the two extra fields.
+
+---
+
 ## [0.63.0] — 2026-08-08
 
 ### Added
