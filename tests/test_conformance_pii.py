@@ -26,15 +26,20 @@ additive on top of it and is covered by the tests in
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import CONFORMANCE_ROOT, skip_without_corpus
 
 from egisai.policy import pii as pii_module
 
-CORPUS_ROOT = Path(__file__).resolve().parents[2] / "conformance"
+CORPUS_ROOT = CONFORMANCE_ROOT
 PII_CORPUS = CORPUS_ROOT / "pii-corpus"
+
+# See the sibling policy-corpus module and the ``IN_MONOREPO`` note in
+# ``conftest.py``: absent on the mirror is expected, absent here is a
+# broken gate.
+pytestmark = skip_without_corpus
 
 
 def _load_cases() -> list[tuple[str, dict[str, Any]]]:
