@@ -45,6 +45,7 @@ from typing import Any
 
 from egisai.policy import (
     _pii_analysis_cache,
+    _pii_custom,
     _pii_loader,
     _pii_scores,
     _pii_taxonomy,
@@ -154,26 +155,58 @@ def _resolve_types(
 # ── Top-level entry points ─────────────────────────────────────────
 
 
+def _scan_custom(text: str) -> list[PIIFinding]:
+    """Findings for the operator's own patterns.
+
+    Confidence is fixed at 0.9 rather than scored. There is nothing to
+    score: the operator asserted this shape is sensitive in their data,
+    and unlike a checksum-backed detector there is no independent
+    signal to weigh that assertion against. Treating it as near-certain
+    is the honest reading — and it keeps a single match above the
+    default risk threshold, which is what an operator who typed a
+    pattern in expects to happen.
+    """
+    findings: list[PIIFinding] = []
+    for pattern, value in _pii_custom.find(text):
+        findings.append(
+            PIIFinding(
+                type=pattern.type_id,
+                value_redacted=_pii_custom.mask_value(value, "*"),
+                confidence=0.9,
+                method="custom_pattern",
+            )
+        )
+    return findings
+
+
 def scan(text: str) -> list[PIIFinding]:
     """Run every detector and return validated findings.
 
     Hot-path-safe: tries Presidio if warm, falls back to the regex
     chain otherwise. Always NFKC-normalises before detection.
+
+    Operator-defined patterns run in addition to the built-ins, never
+    instead of them — a custom rule adds a shape the taxonomy doesn't
+    cover, it does not narrow what Egis looks for.
     """
     if not text:
         return []
     text = _normalize_for_pii(text)
     analyzer = _pii_loader.try_get_analyzer()
+    built_in: list[PIIFinding] = []
     if analyzer is not None:
         try:
-            return _scan_with_presidio(text, analyzer, type_filter=None)
+            built_in = _scan_with_presidio(text, analyzer, type_filter=None)
         except Exception as exc:  # noqa: BLE001 — fail closed on PII errors
             LOGGER.warning(
                 "[egisai] Presidio scan raised %s: %s — falling back to regex.",
                 exc.__class__.__name__,
                 exc,
             )
-    return _scan_with_fallback(text, type_filter=None)
+            built_in = _scan_with_fallback(text, type_filter=None)
+    else:
+        built_in = _scan_with_fallback(text, type_filter=None)
+    return built_in + _scan_custom(text)
 
 
 def sanitize(
@@ -197,7 +230,11 @@ def sanitize(
     text = _normalize_for_pii(text)
     type_filter = _resolve_types(types, kinds)
     if type_filter is not None:
-        unknown = _pii_taxonomy.unknown_types(type_filter)
+        # Custom ids are namespaced and by definition absent from the
+        # canonical taxonomy, so they must not be reported as unknown.
+        unknown = _pii_taxonomy.unknown_types(
+            [t for t in type_filter if not _pii_custom.is_custom(t)]
+        )
         if unknown:
             # Mirror the Behavior the operator wants: a clear log
             # at policy-evaluation time so misconfigurations surface
@@ -209,9 +246,11 @@ def sanitize(
             )
 
     analyzer = _pii_loader.try_get_analyzer()
+    masked = text
+    records: list[Sanitization] = []
     if analyzer is not None:
         try:
-            return _sanitize_with_presidio(
+            masked, records = _sanitize_with_presidio(
                 text,
                 analyzer,
                 type_filter=type_filter,
@@ -224,7 +263,21 @@ def sanitize(
                 exc.__class__.__name__,
                 exc,
             )
-    return _sanitize_with_fallback(text, type_filter=type_filter, mask_char=mask_char)
+            masked, records = _sanitize_with_fallback(
+                text, type_filter=type_filter, mask_char=mask_char
+            )
+    else:
+        masked, records = _sanitize_with_fallback(
+            text, type_filter=type_filter, mask_char=mask_char
+        )
+
+    # Custom patterns run last, over the already-masked text. Running
+    # them first would let a built-in mask (``###-##-####``) be re-read
+    # as a custom match, double-counting one value in the audit record.
+    masked, custom_tally = _pii_custom.apply(masked, type_filter, mask_char)
+    for type_id, (count, shape) in custom_tally.items():
+        records.append(Sanitization(type=type_id, count=count, pattern=shape))
+    return masked, records
 
 
 def label_redact(
@@ -245,9 +298,10 @@ def label_redact(
     type_filter = _resolve_types(types, kinds)
 
     analyzer = _pii_loader.try_get_analyzer()
+    redacted = text
     if analyzer is not None:
         try:
-            return _label_redact_with_presidio(
+            redacted = _label_redact_with_presidio(
                 text, analyzer, type_filter=type_filter
             )
         except Exception as exc:  # noqa: BLE001
@@ -257,7 +311,12 @@ def label_redact(
                 exc.__class__.__name__,
                 exc,
             )
-    return _label_redact_with_fallback(text, type_filter=type_filter)
+            redacted = _label_redact_with_fallback(
+                text, type_filter=type_filter
+            )
+    else:
+        redacted = _label_redact_with_fallback(text, type_filter=type_filter)
+    return _pii_custom.redact_labels(redacted, type_filter)
 
 
 def compute_risk_score(findings: list[PIIFinding]) -> float:
