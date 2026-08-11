@@ -231,6 +231,15 @@ def replace_rules(
         limits.notify_rules(rules_snapshot)
     except Exception:  # noqa: BLE001
         pass
+    # Same contract for operator-defined PII patterns: compile them
+    # once per policy change so they are already in place when a
+    # decision asks for them by id. See ``_pii_custom.notify_rules``.
+    try:
+        from egisai.policy import _pii_custom
+
+        _pii_custom.notify_rules(rules_snapshot)
+    except Exception:  # noqa: BLE001
+        pass
     return count
 
 

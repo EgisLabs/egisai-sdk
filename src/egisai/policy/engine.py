@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-from egisai.policy import fastpath, injection
+from egisai.policy import _pii_custom, fastpath, injection
 from egisai.policy import pii as pii_scanner
 from egisai.policy._regex_safe import safe_search
 from egisai.policy.semantic import SemanticBlocker
@@ -1860,6 +1860,13 @@ def _pii_scan_match(
     if risk < threshold:
         return None
     detected_types = sorted({f.type for f in findings})
+    # ``custom:employee_id`` is the wire id; "Employee ID" is what the
+    # operator typed. Messages are read by people, so they get the
+    # latter — the id still travels in ``sanitize_types``.
+    detected_labels = [
+        _pii_custom.label_for(t) if _pii_custom.is_custom(t) else t
+        for t in detected_types
+    ]
     if action == "sanitize" and allow_sanitize:
         return MatchedPolicyRecord(
             name=policy.name,
@@ -1868,7 +1875,7 @@ def _pii_scan_match(
             reason_code="pii_sanitized",
             message=policy.config.get(
                 "message",
-                f"PII redacted before forwarding ({', '.join(detected_types)}).",
+                f"PII redacted before forwarding ({', '.join(detected_labels)}).",
             ),
             sanitize_types=tuple(detected_types),
             sanitize_mask_char=mask_char,

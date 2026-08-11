@@ -6,10 +6,37 @@ Every test resets the global SDK config + cache so they don't leak.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+
+#: Where the shared conformance corpus lives, when it is reachable.
+#:
+#: The corpus deliberately sits outside every implementation of the
+#: policy engine so no single one becomes the definition of correct.
+#: That also means it sits outside this package — and this package is
+#: published to PyPI from a standalone mirror repo that contains only
+#: ``egisai/``. There, the corpus is genuinely absent.
+#:
+#: The distinction that matters is *why* it is absent. Missing because
+#: we are on the mirror is expected. Missing because someone renamed or
+#: moved the directory in the monorepo is a broken gate wearing a green
+#: badge, and the corpus tests fail loudly on it. So the check below
+#: asks a question the corpus path cannot answer for itself: are the
+#: monorepo's other trees here?
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+IN_MONOREPO = (_REPO_ROOT / "backend").is_dir() and (
+    _REPO_ROOT / "frontend"
+).is_dir()
+CONFORMANCE_ROOT = _REPO_ROOT / "conformance"
+
+#: Applied by the corpus modules. Skips only off the monorepo.
+skip_without_corpus = pytest.mark.skipif(
+    not IN_MONOREPO,
+    reason="conformance corpus lives in the monorepo, not the SDK mirror",
+)
 
 
 @pytest.fixture(autouse=True)

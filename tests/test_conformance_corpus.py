@@ -24,10 +24,10 @@ ML-tier PII detectors, neither of which is reproducible).
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import CONFORMANCE_ROOT, skip_without_corpus
 
 from egisai.policy.engine import (
     OutputPolicyContext,
@@ -37,8 +37,14 @@ from egisai.policy.engine import (
     evaluate_policies,
 )
 
-CORPUS_ROOT = Path(__file__).resolve().parents[2] / "conformance"
+CORPUS_ROOT = CONFORMANCE_ROOT
 POLICY_CORPUS = CORPUS_ROOT / "policy-corpus"
+
+# Off the monorepo — on the public mirror this package is published
+# from — the corpus is not there to run against. See the note on
+# ``IN_MONOREPO`` in ``conftest.py`` for why this is a skip rather
+# than a silent pass.
+pytestmark = skip_without_corpus
 
 
 # ── Judge stubs ─────────────────────────────────────────────────────

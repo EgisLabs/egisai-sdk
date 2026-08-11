@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.67.0] — 2026-08-10
+
+### Added
+
+- **PII types you define yourself, running beside the built-in
+  detectors.** The 21 canonical types cover the shapes that are the
+  same at every company — an IBAN is an IBAN whether you are a bank or
+  a bakery. The shapes that actually leak often aren't: `EMP-004182`,
+  an internal case reference, a customer number that means nothing
+  outside one org's systems but is exactly what an auditor asks about.
+  Those can never ship in the taxonomy, because the pattern is a fact
+  about one customer's data rather than about the world.
+
+  A `pii_scan` policy now accepts `config.custom_types`:
+
+  ```json
+  {
+    "action": "sanitize",
+    "types": ["ssn", "credit_card"],
+    "custom_types": [
+      { "label": "Employee ID", "pattern": "EMP-\\d{6}" }
+    ]
+  }
+  ```
+
+  They are addressed as `custom:<id>` — a namespace no canonical id can
+  ever collide with, so naming your pattern "ssn" cannot shadow the
+  checksum-backed detector of the same name. From there they behave
+  like any other type: they appear in `sanitize_types`, they mask
+  shape-preservingly (`EMP-004182` → `###-######`), they are counted in
+  the audit record, and the record carries the count and mask shape
+  only — never the value.
+
+  What they are not is a detector with a false-positive rate. The
+  built-in types are backed by Luhn, mod-97, Verhoeff, or a named-
+  entity model. A custom pattern is backed by whatever you wrote. That
+  is the right trade for `EMP-\d{6}`, which is unambiguous by
+  construction, and the wrong one for "names of our customers" — that
+  is what `person_name` and the semantic judge are for.
+
+  Every pattern is compiled through the same ReDoS guards as
+  `deny_regex`, and one that fails to compile is dropped with a warning
+  rather than raising: a single bad regex must not take PII detection
+  down for every other type configured alongside it.
+
+---
+
 ## [0.66.0] — 2026-12-08
 
 ### Added
