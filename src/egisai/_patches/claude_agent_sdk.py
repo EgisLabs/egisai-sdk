@@ -130,6 +130,7 @@ from egisai._run import (
     close_run,
     current_run,
     finalize_or_append_model_call_step,
+    finalize_run_in_place,
     open_run,
 )
 from egisai.policy import PolicyDecision
@@ -144,6 +145,16 @@ INFLIGHT_ATTR = "__egisai_inflight_event__"
 INFLIGHT_SIGNALS_ATTR = "__egisai_inflight_signals__"
 INFLIGHT_STARTED_ATTR = "__egisai_inflight_started__"
 INFLIGHT_IDENTITY_ATTR = "__egisai_inflight_identity__"
+# The ``RunContext`` THIS client's ``query()`` opened for the turn in
+# flight, or ``None`` when the turn rode along on a Run somebody else
+# owns (same-identity re-entry — see ``_open_turn_run``). Every
+# ``close_run`` site downstream is gated on this handle: a turn must
+# only ever close the Run it opened. Closing an enclosing Run — which
+# is what an ungated ``if current_run() is not None: close_run()``
+# does when an agent spawns a sub-agent — truncates the parent
+# mid-flight and orphans every later event of the parent turn into
+# run-less rows the backend has to synthesize a one-step Run for.
+INFLIGHT_RUN_ATTR = "__egisai_inflight_run__"
 # Per-turn dict mapping ``tool_use_id`` → ``"allow" | "block"``.
 # Populated by our PreToolUse hook callback the moment a tool dispatch
 # is gated (pre-execution); read by ``receive_messages`` so it does
@@ -2204,6 +2215,74 @@ def _run_output_phase(
     return decision
 
 
+def _open_turn_run(
+    record: IdentityRecord | None,
+    *,
+    prompt_text: str | None = None,
+) -> RunContext | None:
+    """Open this turn's Run, or ride along on one that's already open.
+
+    Mirrors ``_framework._RunScope.__enter__`` so every patch in the
+    SDK agrees on one nesting contract:
+
+    * **No Run open** — open one. The ordinary single-agent case.
+    * **A Run is open for the SAME logical agent** (equal
+      ``identity_hash``) — ride along. This is framework re-entry:
+      an outer wrap already opened the Run for this very turn, and a
+      second Run would leave a duplicate empty row that skews the
+      dashboard's step-count tile and the billing roll-up.
+    * **A Run is open for a DIFFERENT agent** — open a CHILD Run.
+      ``open_run`` wires ``parent_run_id`` from the ContextVar, which
+      is the sub-agent / handoff topology the dashboard renders (see
+      ``RunTimelineModal``'s ``sub_agent_spawn`` branch).
+
+    Returns the ``RunContext`` this call opened, or ``None`` when it
+    rode along. Callers MUST stash the return value and pass it to
+    :func:`_close_owned_run`; a turn that closes a Run it did not open
+    truncates the enclosing turn mid-flight.
+    """
+    parent = current_run()
+    if parent is not None and not parent.closed:
+        if record is None:
+            # Nothing to compare identities on — never steal or
+            # duplicate an enclosing Run on a guess.
+            return None
+        if (
+            parent.identity is not None
+            and parent.identity.identity_hash == record.identity_hash
+        ):
+            return None
+    return open_run(
+        framework=SOURCE_NAME,
+        identity=record,
+        prompt_text=prompt_text,
+    )
+
+
+def _close_owned_run(
+    owned: RunContext | None, *, error: str | None = None
+) -> None:
+    """Close a Run this turn opened — and never anybody else's.
+
+    When the ContextVar still points at ``owned`` we use
+    :func:`close_run`, which also restores the parent pointer for this
+    task so an enclosing turn keeps working. When it points elsewhere
+    (a nested turn that hasn't unwound, or a different asyncio task
+    entirely) we finalize ``owned`` in place instead: flip its
+    ``closed`` flag and emit ``run.end`` for that specific Run without
+    stealing the ContextVar from whoever holds it now.
+
+    No-op for ``None`` (the turn rode along on someone else's Run) and
+    for an already-closed Run.
+    """
+    if owned is None or owned.closed:
+        return
+    if current_run() is owned:
+        close_run(error=error)
+    else:
+        finalize_run_in_place(owned, error=error)
+
+
 def _safe_enqueue(ev: dict[str, Any] | None) -> None:
     """Dispatch the audit event — as a step under the current Run when
     one is open, or as a legacy single-row event otherwise.
@@ -2239,25 +2318,28 @@ def _flush_stale_inflight(self_obj: Any) -> None:
     that ``t1`` was sent, just with no response side. Better an
     incomplete row than a silent drop.
 
-    Also closes any Run that was opened by the previous ``query()``
-    so a fresh Run can be opened cleanly.
+    Also closes the Run that THIS client's previous ``query()``
+    opened, so a fresh Run can be opened cleanly. A Run this client
+    never opened is left strictly alone — when an agent spawns a
+    sub-agent, the sub-agent's brand-new client runs inside the
+    parent's Run scope, and closing "whatever is current" here would
+    end the parent's Run before the sub-agent had done any work.
     """
+    owned = getattr(self_obj, INFLIGHT_RUN_ATTR, None)
     ev = getattr(self_obj, INFLIGHT_ATTR, None)
     if ev is None:
-        # Even when there's no inflight, a Run may still be open if
-        # the previous turn's receive_messages never reached
-        # ResultMessage. Close it so the next query() opens a fresh
-        # one. ``close_run`` is idempotent.
-        if current_run() is not None:
-            close_run(error="never_consumed")
+        # Even with no inflight event, this client's Run may still be
+        # open if the previous turn's receive_messages never reached
+        # ResultMessage. ``_close_owned_run`` is idempotent.
+        _close_owned_run(owned, error="never_consumed")
+        _clear_inflight(self_obj)
         return
     started = getattr(self_obj, INFLIGHT_STARTED_ATTR, None) or time.monotonic()
     ev["latency_ms"] = int(max(0, (time.monotonic() - started) * 1000))
     ev["error"] = "never_consumed"
     _safe_enqueue(ev)
     _clear_inflight(self_obj)
-    if current_run() is not None:
-        close_run(error="never_consumed")
+    _close_owned_run(owned, error="never_consumed")
 
 
 def _clear_inflight(self_obj: Any) -> None:
@@ -2266,6 +2348,7 @@ def _clear_inflight(self_obj: Any) -> None:
         INFLIGHT_SIGNALS_ATTR,
         INFLIGHT_STARTED_ATTR,
         INFLIGHT_IDENTITY_ATTR,
+        INFLIGHT_RUN_ATTR,
         INFLIGHT_HOOK_DECISIONS_ATTR,
         INFLIGHT_HOOKS_ACTIVE_ATTR,
         INFLIGHT_POST_HOOKS_ACTIVE_ATTR,
@@ -2482,23 +2565,24 @@ def _wrap_client_query(orig: Any) -> Any:
             with scope_cm:
                 # Open the Run upfront — even input-side blocks ship
                 # as a complete (failed) Run so the dashboard never
-                # leaves a turn invisible. ``close_run`` is called on
-                # every exit path below.
-                opened_run_here = current_run() is None
-                if opened_run_here:
-                    # Compliance rule #5 (audit before persist): the
-                    # raw prompt has NOT been sanitized yet — it could
-                    # contain PII the input policy will redact in the
-                    # next phase. We open the Run with prompt_text=None
-                    # so the streaming ``run.start`` event ships no
-                    # preview. The backend pulls prompt_text from the
-                    # FIRST step's post-sanitize ``prompt_preview``,
-                    # which is the canonical post-redaction snapshot.
-                    open_run(
-                        framework="claude_agent_sdk",
-                        identity=record,
-                        prompt_text=None,
-                    )
+                # leaves a turn invisible. ``_close_owned_run`` is
+                # called on every exit path below, and only ever
+                # closes the Run this turn actually opened.
+                #
+                # Compliance rule #5 (audit before persist): the raw
+                # prompt has NOT been sanitized yet — it could contain
+                # PII the input policy will redact in the next phase.
+                # We open the Run with prompt_text=None so the
+                # streaming ``run.start`` event ships no preview. The
+                # backend pulls prompt_text from the FIRST step's
+                # post-sanitize ``prompt_preview``, which is the
+                # canonical post-redaction snapshot.
+                owned_run = _open_turn_run(record, prompt_text=None)
+                opened_run_here = owned_run is not None
+                # Stash before the input phase so every failure path
+                # below (block, policy crash, subprocess error) can
+                # find and close this turn's Run.
+                setattr(self, INFLIGHT_RUN_ATTR, owned_run)
 
                 ev = _build_input_event(
                     source=SOURCE_NAME,
@@ -2541,8 +2625,11 @@ def _wrap_client_query(orig: Any) -> Any:
                         # enforcement — record it as such.
                         ev["enforcement_status"] = ENFORCEMENT_ENFORCED
                         _safe_enqueue(ev)
-                        if opened_run_here and current_run() is not None:
-                            close_run(error="input policy block")
+                        if opened_run_here:
+                            _close_owned_run(
+                                owned_run, error="input policy block"
+                            )
+                        setattr(self, INFLIGHT_RUN_ATTR, None)
                         msg = (
                             f"[egisai] {decision.message or 'blocked by policy'} "
                             f"(matched={decision.matched_policy})"
@@ -2698,6 +2785,17 @@ def _wrap_client_receive_messages(orig: Any) -> Any:
         )
         scope_cm = identity_scope(record) if record is not None else nullcontext()
 
+        # The turn this generator was started for. ``receive_response``
+        # returns the moment a ResultMessage arrives, which leaves the
+        # inner ``receive_messages`` generator suspended; the event
+        # loop finalizes it later by throwing GeneratorExit — and
+        # "later" is typically the middle of the NEXT turn's query().
+        # Comparing this handle against the client's live one on the
+        # teardown path is how we tell "my turn crashed" (finalize it)
+        # from "I'm a leftover from a turn that already ended"
+        # (touch nothing — the newer turn owns the client's state).
+        entry_run = getattr(self, INFLIGHT_RUN_ATTR, None)
+
         ctx = copy_context()
         async_gen = orig(self, *args, **kwargs)
 
@@ -2826,10 +2924,14 @@ def _wrap_client_receive_messages(orig: Any) -> Any:
                             # query() opened. After the step lands,
                             # close the Run so the dashboard sees
                             # ONE complete run row for this turn.
+                            # Read the handle BEFORE _clear_inflight
+                            # drops it — and close ONLY that Run, so
+                            # a turn nested inside a parent agent's
+                            # Run leaves the parent's Run open.
+                            owned_run = getattr(self, INFLIGHT_RUN_ATTR, None)
                             _safe_enqueue(ev)
                             _clear_inflight(self)
-                            if current_run() is not None:
-                                close_run(error=ev.get("error"))
+                            _close_owned_run(owned_run, error=ev.get("error"))
                             # Reset for the next turn — same
                             # ``receive_messages`` call may span
                             # multiple ``query()`` turns.
@@ -2862,6 +2964,11 @@ def _wrap_client_receive_messages(orig: Any) -> Any:
 
                     yield message
         except BaseException:
+            owned_run = getattr(self, INFLIGHT_RUN_ATTR, None)
+            if owned_run is not entry_run:
+                # Leftover generator being finalized while the client
+                # is mid-flight on a newer turn — see ``entry_run``.
+                raise
             ev = getattr(self, INFLIGHT_ATTR, None)
             if ev is not None:
                 started = getattr(self, INFLIGHT_STARTED_ATTR, time.monotonic())
@@ -2872,8 +2979,7 @@ def _wrap_client_receive_messages(orig: Any) -> Any:
                     ev["error"] = "stream failed"
                 _safe_enqueue(ev)
                 _clear_inflight(self)
-            if current_run() is not None:
-                close_run(error="stream failed")
+            _close_owned_run(owned_run, error="stream failed")
             raise
 
     wrapped.__egisai_wrapped__ = True  # type: ignore[attr-defined]
@@ -3030,14 +3136,11 @@ def _wrap_module_query(orig: Any) -> Any:
                     # Run spans the iterator's lifetime and closes
                     # when the result arrives (or the generator is
                     # aclosed early).
-                    run_opened = False
-                    if current_run() is None:
-                        open_run(
-                            framework="claude_agent_sdk",
-                            identity=record,
-                            prompt_text=ev.get("prompt_preview"),
-                        )
-                        run_opened = True
+                    owned_run = _open_turn_run(
+                        record, prompt_text=ev.get("prompt_preview")
+                    )
+                    run_opened = owned_run is not None
+                    if run_opened:
                         ev.setdefault("enforcement_status", ENFORCEMENT_ENFORCED)
                         try:
                             append_initial_model_call_step(
@@ -3154,8 +3257,10 @@ def _wrap_module_query(orig: Any) -> Any:
                                 )
                                 _safe_enqueue(ev)
                                 enqueued = True
-                                if run_opened and current_run() is not None:
-                                    close_run(error=ev.get("error"))
+                                if run_opened:
+                                    _close_owned_run(
+                                        owned_run, error=ev.get("error")
+                                    )
                                     run_opened = False
                                 if (
                                     decision_out is not None
@@ -3185,15 +3290,15 @@ def _wrap_module_query(orig: Any) -> Any:
                             if "error" not in ev:
                                 ev["error"] = "stream failed"
                             _safe_enqueue(ev)
-                        if run_opened and current_run() is not None:
-                            close_run(error="stream failed")
+                        if run_opened:
+                            _close_owned_run(owned_run, error="stream failed")
                             run_opened = False
                         raise
                     finally:
-                        if run_opened and current_run() is not None:
+                        if run_opened:
                             # Generator exhausted without a
                             # ResultMessage — close the run anyway.
-                            close_run()
+                            _close_owned_run(owned_run)
                             run_opened = False
                 finally:
                     set_policy_checked(prev_checked)
