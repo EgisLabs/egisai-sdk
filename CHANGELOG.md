@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.68.0] — 2026-08-11
+
+### Fixed
+
+- **An agent that spawns a sub-agent no longer cuts its own run short.**
+  With the Claude Agent SDK, delegation means a tool handler builds a
+  second `ClaudeSDKClient` and drives it while the orchestrator's turn
+  is still running. The patch treated "a run is open" as "the run is
+  mine", so the child client ended the *parent's* run the moment it
+  started. What you saw on the dashboard: the orchestrator's timeline
+  stopped at the delegation, everything it did afterwards showed up as
+  separate one-step runs with no tools and no tokens, and the
+  sub-agents appeared as unrelated top-level runs instead of children.
+
+  Each turn now closes only the run it opened. The parent's timeline
+  stays whole — tool calls, sub-agent spawns, and the final answer all
+  land on it — and a sub-agent's run carries `parent_run_id`, so the
+  dashboard folds it under the parent that spawned it. This holds for
+  sub-agents fanned out in parallel with `asyncio.gather`, and a
+  sub-agent that crashes ends its own run with the error while the
+  orchestrator's run stays clean.
+
+  Nothing to change in your code. If you delegate, the runs you were
+  already producing become correct.
+
+### Changed
+
+- A nested Claude Agent SDK turn for a **different** agent now opens a
+  child run rather than appending its steps to the enclosing run. A
+  nested turn for the **same** agent still rides along on the open run,
+  so re-entrant framework wrappers don't produce an empty duplicate.
+  This is the nesting contract the other framework patches have always
+  followed; the Claude Agent SDK patch was the one that hand-rolled its
+  own run lifecycle and diverged.
+
+---
+
 ## [0.67.0] — 2026-08-10
 
 ### Added
