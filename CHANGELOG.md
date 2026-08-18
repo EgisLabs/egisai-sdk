@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.69.0] — 2026-08-17
+
+### Added
+
+- **Optional remote PII engine for server-side CPU offload.** A trusted
+  caller (e.g. our own control plane) can now install a drop-in engine
+  via `egisai.policy.pii.set_remote_engine(...)`, sending the heavy
+  Presidio + spaCy pass to an in-network service it owns instead of
+  running it in-process. `scan`, `sanitize`, and `label_redact` delegate
+  to it when installed. Default is unchanged: with no engine set, all
+  detection runs locally on-device, which is what every `pip install`
+  user gets. Custom operator patterns always run locally regardless, so
+  offloading never drops a customer's own `custom:*` types.
+- Fail-open on availability: if the remote engine raises for any reason
+  (cold service, network blip, malformed reply) the SDK falls back to
+  its local engine, so a remote outage degrades detection to local — it
+  never turns into an error on the user's call path, and never lets raw
+  PII through unscanned.
+
 ## [0.68.0] — 2026-08-11
 
 ### Fixed

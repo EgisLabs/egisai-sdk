@@ -41,7 +41,7 @@ import re
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from egisai.policy import (
     _pii_analysis_cache,
@@ -108,6 +108,75 @@ class Sanitization:
     def kind(self) -> str:
         """Deprecated alias for ``type``. Removed in a future release."""
         return self.type
+
+
+# ── Optional remote engine (server-side CPU offload) ────────────────
+#
+# By default the SDK runs every detection locally, on-device — that is
+# the contract for `pip install egisai` users and must never regress
+# (security-and-compliance.mdc rule 1: PII never leaves the SDK
+# boundary in raw form). The one supported exception is a caller that
+# runs *its own* trusted, in-network engine — e.g. our control plane
+# offloading the CPU-heavy spaCy NER pass to a private internal
+# service it fully controls. Such a caller may install an engine here;
+# the raw text then travels only to that operator-owned service, never
+# to a third party.
+#
+# When an engine is installed, `scan`/`sanitize`/`label_redact`
+# delegate to it. If the engine raises for any reason (network blip,
+# service cold, malformed reply) we fall back to the local path — a
+# remote outage degrades detection to the local engine, it never turns
+# into an error on the user's call path (sdk-design-philosophy.mdc
+# rule 5: fail open on availability, never break the call path). Note
+# the fall-back is still fully local PII detection, so this fail-open
+# never lets raw PII slip through unscanned.
+
+
+class RemotePIIEngine(Protocol):
+    """Structural type for a drop-in replacement of the local engine.
+
+    Return values MUST match the local functions exactly so callers
+    can't tell the work ran elsewhere.
+    """
+
+    def scan(self, text: str) -> list[PIIFinding]: ...
+
+    def sanitize(
+        self,
+        text: str,
+        types: list[str] | None = None,
+        mask_char: str = "#",
+    ) -> tuple[str, list[Sanitization]]: ...
+
+    def label_redact(
+        self,
+        text: str,
+        types: list[str] | None = None,
+    ) -> str: ...
+
+
+_remote_engine: RemotePIIEngine | None = None
+
+
+def set_remote_engine(engine: RemotePIIEngine | None) -> None:
+    """Install (or clear, with ``None``) the remote PII engine.
+
+    Call once at process start-up, before any governance traffic. Not
+    part of the public `pip install` contract — this is for a trusted
+    caller (our control plane) that offloads detection to an engine it
+    owns. Passing ``None`` restores the fully-local behavior.
+    """
+    global _remote_engine
+    _remote_engine = engine
+    if engine is not None:
+        LOGGER.info("[egisai] remote PII engine installed: %r", type(engine).__name__)
+    else:
+        LOGGER.info("[egisai] remote PII engine cleared — using local detection.")
+
+
+def get_remote_engine() -> RemotePIIEngine | None:
+    """Return the installed remote engine, or ``None`` when local."""
+    return _remote_engine
 
 
 # ── Normalisation ──────────────────────────────────────────────────
@@ -191,6 +260,24 @@ def scan(text: str) -> list[PIIFinding]:
     """
     if not text:
         return []
+    engine = _remote_engine
+    if engine is not None:
+        try:
+            remote_built_in = engine.scan(text)
+        except Exception as exc:  # noqa: BLE001 — fail open to local engine
+            LOGGER.warning(
+                "[egisai] remote PII scan failed (%s: %s) — running the "
+                "local engine instead.",
+                exc.__class__.__name__,
+                exc,
+            )
+        else:
+            # The worker only knows the built-in detectors — custom
+            # operator patterns are published into THIS process's
+            # policy cache (see ``_pii_custom.notify_rules``), never
+            # the worker's — so overlay them here. Same union the
+            # local path returns, just with the heavy pass offloaded.
+            return remote_built_in + _scan_custom(_normalize_for_pii(text))
     text = _normalize_for_pii(text)
     analyzer = _pii_loader.try_get_analyzer()
     built_in: list[PIIFinding] = []
@@ -227,8 +314,35 @@ def sanitize(
     if not mask_char:
         mask_char = "#"
 
-    text = _normalize_for_pii(text)
     type_filter = _resolve_types(types, kinds)
+
+    engine = _remote_engine
+    if engine is not None:
+        try:
+            masked, records = engine.sanitize(text, type_filter, mask_char)
+        except Exception as exc:  # noqa: BLE001 — fail open to local engine
+            LOGGER.warning(
+                "[egisai] remote PII sanitize failed (%s: %s) — running the "
+                "local engine instead.",
+                exc.__class__.__name__,
+                exc,
+            )
+        else:
+            # Overlay custom operator patterns locally, over the
+            # worker's already-masked text — same order the local path
+            # uses (built-ins first, custom last) so an audit record
+            # never double-counts one value. The worker never sees the
+            # custom patterns, so this is the only place they run.
+            masked, custom_tally = _pii_custom.apply(
+                masked, type_filter, mask_char
+            )
+            for type_id, (count, shape) in custom_tally.items():
+                records.append(
+                    Sanitization(type=type_id, count=count, pattern=shape)
+                )
+            return masked, records
+
+    text = _normalize_for_pii(text)
     if type_filter is not None:
         # Custom ids are namespaced and by definition absent from the
         # canonical taxonomy, so they must not be reported as unknown.
@@ -247,7 +361,7 @@ def sanitize(
 
     analyzer = _pii_loader.try_get_analyzer()
     masked = text
-    records: list[Sanitization] = []
+    records = []
     if analyzer is not None:
         try:
             masked, records = _sanitize_with_presidio(
@@ -294,8 +408,23 @@ def label_redact(
     """
     if not text:
         return text
-    text = _normalize_for_pii(text)
     type_filter = _resolve_types(types, kinds)
+    engine = _remote_engine
+    if engine is not None:
+        try:
+            redacted = engine.label_redact(text, type_filter)
+        except Exception as exc:  # noqa: BLE001 — fail open to local engine
+            LOGGER.warning(
+                "[egisai] remote PII label_redact failed (%s: %s) — running "
+                "the local engine instead.",
+                exc.__class__.__name__,
+                exc,
+            )
+        else:
+            # Custom labels are this process's job — overlay them on
+            # the worker's built-in labelled text.
+            return _pii_custom.redact_labels(redacted, type_filter)
+    text = _normalize_for_pii(text)
 
     analyzer = _pii_loader.try_get_analyzer()
     redacted = text
