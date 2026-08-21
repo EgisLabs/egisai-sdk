@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.70.0] — 2026-08-20
+
+### Added
+
+- **`deny_resource_access` — identity-aware per-resource access control.**
+  A new deterministic policy kind that blocks a single resource — a file
+  id, record id, path, or MCP resource URI found inside a tool call's
+  arguments or MCP target — for the wrong end-user, while the same tool
+  keeps working for everyone else and every other resource. It reads the
+  end-user identity the caller already sets via
+  `egisai.set_context(user_role=..., end_user_id=...)`, so no new user
+  code is required. Config: `resource_patterns` / `tool_patterns` scope
+  which resource and tool the rule governs; `allow_roles` /
+  `allow_end_users` are fail-closed allowlists (an unidentified caller is
+  refused); `deny_roles` / `deny_end_users` are blocklists that win over
+  allowlists. Runs in Phase 1 (deterministic, local, no network) on the
+  tool / MCP output surface, so it enforces on every framework the
+  enforcement matrix marks as `enforced` — including self-hosted agents
+  the gateway never sees.
+
 ## [0.69.0] — 2026-08-17
 
 ### Added

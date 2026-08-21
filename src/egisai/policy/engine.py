@@ -122,6 +122,17 @@ class OutputPolicyContext:
     mcp_targets: list[str]
     stream: bool
     allow_sanitize: bool = False
+    # ── Identity of the end-user this call serves ──────────────────
+    # Read from ``EgisaiContext`` (``egisai.set_context(...)``) at gate
+    # time and carried here so evaluators stay pure functions of their
+    # inputs. Empty string when the caller never set it. Powers
+    # identity-aware access rules (``deny_resource_access``): the same
+    # tool call is allowed or refused depending on *who* the agent is
+    # acting for. Appended with defaults so every existing positional /
+    # keyword construction of this dataclass keeps compiling unchanged.
+    user_role: str = ""
+    end_user_id: str = ""
+    user_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -280,6 +291,12 @@ _DETERMINISTIC_KINDS = frozenset(
         "deny_mcp_call",
         "deny_db_query",
         "deny_financial_action",
+        # Identity-aware per-resource access control (the "scalpel"):
+        # block one file / record / URI for the wrong end-user while the
+        # same tool keeps working for everyone else. Pure-Python — reads
+        # the identity carried on ``OutputPolicyContext`` and matches
+        # the resource id inside the call's arguments / MCP target.
+        "deny_resource_access",
         # Prompt-injection shapes (0.65.0). Compiled regex + two
         # character-class counts over the text — no model, no network,
         # and no ONNX bundle, which is why it is allowed to run on
@@ -2126,6 +2143,9 @@ def _evaluate_one_output_policy(
     if policy.type == "deny_financial_action":
         return _deny_financial_action_match(policy, context)
 
+    if policy.type == "deny_resource_access":
+        return _deny_resource_access_match(policy, context)
+
     if policy.type == "injection_scan":
         # The response side is where this earns its keep. A tool
         # result — a fetched web page, a Jira comment, a PDF the agent
@@ -2743,3 +2763,214 @@ def _walk_currency_values(obj: Any) -> list[str]:
         for item in obj:
             out.extend(_walk_currency_values(item))
     return out
+
+
+# ── Identity-aware access control (``deny_resource_access``) ─────────
+#
+# The "scalpel". ``deny_tool_call`` blocks a tool for everyone;
+# ``deny_resource_access`` blocks one *resource* — a file id, a record
+# id, a path, an MCP resource URI found inside the call's arguments —
+# for the wrong *people*, leaving the same tool working for everyone
+# else and every other resource. It is the runtime counterpart to a
+# data platform's per-file ACL, enforced at the exact seam the SDK
+# already sits on (the tool / MCP call), with no re-login and no data
+# ever leaving the boundary.
+#
+# Two things it deliberately is NOT:
+#
+# * Not a data-source connector. It governs the call the agent already
+#   makes; it does not fetch, index, or proxy the file itself.
+# * Not a substitute for the source system's own permissions. It is a
+#   second, agent-scoped gate an operator controls centrally.
+
+
+def _tool_call_payload(tc: dict[str, Any]) -> str:
+    """Best-effort searchable string for one tool call's arguments.
+
+    The provider patches normalize model-response tool calls to
+    ``{"name": ..., "arguments": <json str>}``, but the PreToolUse and
+    MCP-client gates hand us ``{"name": ..., "input": <dict>}`` instead
+    (see ``_patches/claude_agent_sdk.py`` and ``_patches/mcp_client.py``).
+    A resource rule must see the file id / path regardless of which path
+    produced the call, so read both shapes and JSON-serialize a dict /
+    list ``input`` into the same string the argument matchers expect.
+    """
+    args = tc.get("arguments")
+    if isinstance(args, str) and args:
+        return args
+    payload = tc.get("input")
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, dict | list):
+        try:
+            import json as _json
+
+            return _json.dumps(payload, default=str, sort_keys=True)
+        except Exception:  # noqa: BLE001
+            return str(payload)
+    # A caller that stuffed a dict directly under ``arguments``.
+    if isinstance(args, dict | list):
+        try:
+            import json as _json
+
+            return _json.dumps(args, default=str, sort_keys=True)
+        except Exception:  # noqa: BLE001
+            return str(args)
+    return ""
+
+
+def _identity_in(value: str, entries: list[str]) -> bool:
+    """Case-insensitive membership test for a role / end-user token.
+
+    An empty ``value`` (the caller never set ``user_role`` /
+    ``end_user_id``) never matches: ``_config_str_list`` already drops
+    empty strings from ``entries``, so an unknown identity is never on
+    any list. That single property is what makes the allowlist branch
+    fail closed — an un-identified caller is treated as "not permitted"
+    rather than "permitted".
+    """
+    if not value:
+        return False
+    needle = value.lower()
+    return any(needle == entry.lower() for entry in entries)
+
+
+def _short_resource_label(text: str, limit: int = 120) -> str:
+    """Trim a resource string to something quotable in a block message
+    without leaking a whole serialized argument blob into the audit."""
+    text = text.strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _resource_hit(haystack: str, patterns: list[str]) -> str | None:
+    """Is ``haystack`` a resource this rule governs?
+
+    Returns a short label when yes, ``None`` when no. A label of ``""``
+    means "in scope but nothing quotable" (an un-patterned rule against
+    an empty payload) — callers must test the result with ``is None``,
+    never truthiness, so that case isn't mistaken for a miss.
+
+    * No ``patterns`` → every resource is in scope.
+    * With ``patterns`` → in scope only when one matches.
+    """
+    if not patterns:
+        return _short_resource_label(haystack) if haystack else ""
+    if not haystack:
+        return None
+    for pattern in patterns:
+        if safe_search(pattern, haystack, re.IGNORECASE):
+            return _short_resource_label(haystack)
+    return None
+
+
+def _resource_in_scope(
+    context: OutputPolicyContext,
+    resource_patterns: list[str],
+    tool_patterns: list[str],
+) -> str | None:
+    """First governed resource this call touches, or ``None``.
+
+    ``tool_patterns`` narrows *which* tool calls the rule looks at (by
+    name); ``resource_patterns`` matches the resource id *inside* those
+    calls' arguments — or inside an MCP target. Returns a short label
+    (possibly ``""``) for the first hit, ``None`` when the call touches
+    nothing the rule governs.
+    """
+    for tc in context.tool_calls:
+        raw_name = tc.get("name")
+        name = raw_name if isinstance(raw_name, str) else ""
+        if tool_patterns and not any(
+            safe_search(pattern, name, re.IGNORECASE)
+            for pattern in tool_patterns
+        ):
+            continue
+        hit = _resource_hit(_tool_call_payload(tc), resource_patterns)
+        if hit is not None:
+            return hit or name
+    # An MCP target ("server/resource-uri") carries no tool name of its
+    # own, so a rule narrowed to specific tool names doesn't reach it;
+    # an un-narrowed rule does.
+    if not tool_patterns:
+        for target in context.mcp_targets:
+            hit = _resource_hit(target, resource_patterns)
+            if hit is not None:
+                return hit or target
+    return None
+
+
+def _deny_resource_access_match(
+    policy: PolicyRule,
+    context: OutputPolicyContext,
+) -> MatchedPolicyRecord | None:
+    """Block a tool / MCP call that touches a governed resource unless
+    the end-user behind the call is permitted it.
+
+    Config (all optional, but at least one identity predicate is
+    required for the rule to do anything):
+
+    * ``resource_patterns`` — regex matched against the serialized tool
+      arguments AND MCP target strings, i.e. the resource identifier
+      (file id, record id, path, URI). Empty ⇒ every resource the call
+      touches is in scope.
+    * ``tool_patterns`` — regex against the tool *name*, to scope the
+      rule to specific tools. Empty ⇒ any tool.
+    * ``allow_roles`` / ``allow_end_users`` — allowlists. When set,
+      anyone NOT on them — **including an unknown / unset identity** —
+      is blocked. Fail-closed: access control refuses when it can't
+      prove the caller is permitted.
+    * ``deny_roles`` / ``deny_end_users`` — blocklists, evaluated first
+      so a denied user can't slip through by also being allow-listed.
+    * ``message`` — custom block message.
+
+    Identity comes from ``EgisaiContext`` (``egisai.set_context(
+    user_role=..., end_user_id=...)``) carried on the context. A rule
+    with no identity predicate no-ops rather than blocking everything —
+    that would just be a mislabelled ``deny_tool_call`` — matching the
+    fail-open-on-availability contract for a single broken rule. The
+    backend rejects such a rule at creation time so the operator learns
+    early; this is the runtime safety net.
+    """
+    resource_patterns = _config_str_list(policy.config, "resource_patterns")
+    tool_patterns = _config_str_list(policy.config, "tool_patterns")
+    allow_roles = _config_str_list(policy.config, "allow_roles")
+    deny_roles = _config_str_list(policy.config, "deny_roles")
+    allow_end_users = _config_str_list(policy.config, "allow_end_users")
+    deny_end_users = _config_str_list(policy.config, "deny_end_users")
+
+    if not (allow_roles or deny_roles or allow_end_users or deny_end_users):
+        return None
+
+    matched_resource = _resource_in_scope(
+        context, resource_patterns, tool_patterns
+    )
+    if matched_resource is None:
+        return None
+
+    role = context.user_role or ""
+    end_user = context.end_user_id or ""
+
+    blocked = (
+        _identity_in(role, deny_roles)
+        or _identity_in(end_user, deny_end_users)
+        or (bool(allow_roles) and not _identity_in(role, allow_roles))
+        or (
+            bool(allow_end_users)
+            and not _identity_in(end_user, allow_end_users)
+        )
+    )
+    if not blocked:
+        return None
+
+    who = role or end_user or "this user"
+    default_message = (
+        f"Access to '{matched_resource}' is not permitted for {who}."
+        if matched_resource
+        else f"This resource is not permitted for {who}."
+    )
+    return MatchedPolicyRecord(
+        name=policy.name,
+        type=policy.type,
+        verdict="block",
+        reason_code="resource_access_blocked",
+        message=policy.config.get("message", default_message),
+    )

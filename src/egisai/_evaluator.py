@@ -566,6 +566,10 @@ def evaluate_output(call: OutputCall) -> PolicyDecision:
     # ``claude_agent_sdk``) where the first patched entry point is the
     # output / tool-result hook rather than the model-call entrypoint.
     _maybe_wait_for_pii_analyzer(rules)
+    # Snapshot the end-user identity so identity-aware access rules
+    # (``deny_resource_access``) can decide per user. Read once, here,
+    # so the policy engine stays a pure function of its inputs.
+    identity = get_context()
     ctx = OutputPolicyContext(
         tenant=call.tenant or "",
         model=call.model,
@@ -575,6 +579,9 @@ def evaluate_output(call: OutputCall) -> PolicyDecision:
         mcp_targets=list(call.mcp_targets),
         stream=call.stream,
         allow_sanitize=call.allow_sanitize,
+        user_role=identity.user_role or "",
+        end_user_id=identity.end_user_id or "",
+        user_id=identity.user_id or "",
     )
     blocker = _get_semantic_blocker() if _has_semantic_rule(rules) else None
     try:
