@@ -59,6 +59,8 @@ def init(
     on_block: str = "raise",
     on_pending: str = "raise",
     approval_wait_budget_ms: int | None = None,
+    approval_mode: str | None = None,
+    approval_poll_interval_ms: int | None = None,
     semantic_on_outage: str = "allow",
     on_outage: str | None = None,
     refresh_interval_seconds: float = 10.0,
@@ -251,6 +253,33 @@ def init(
         if resolved_budget_ms is None:
             resolved_budget_ms = 120_000
         resolved_budget_ms = max(0, int(resolved_budget_ms))
+        # ``approval_mode`` resolves explicit kwarg → env var → default
+        # "auto" (follow the policy's wait_mode). "wait"/"async" force
+        # the behavior for every hold this process opens.
+        resolved_approval_mode = (
+            approval_mode
+            or os.getenv("EGISAI_APPROVAL_MODE")
+            or "auto"
+        ).strip().lower()
+        if resolved_approval_mode not in ("auto", "wait", "async"):
+            raise ValueError(
+                f"approval_mode must be 'auto', 'wait', or 'async', "
+                f"got {resolved_approval_mode!r}"
+            )
+        # ``approval_poll_interval_ms`` resolves explicit kwarg → env var
+        # → default 500. Clamped ≥ 50 so a typo can't turn the wait into
+        # a tight busy-loop against the control plane.
+        resolved_poll_ms = approval_poll_interval_ms
+        if resolved_poll_ms is None:
+            raw_poll = os.getenv("EGISAI_APPROVAL_POLL_INTERVAL_MS")
+            if raw_poll and raw_poll.strip():
+                try:
+                    resolved_poll_ms = int(raw_poll.strip())
+                except ValueError:
+                    resolved_poll_ms = None
+        if resolved_poll_ms is None:
+            resolved_poll_ms = 500
+        resolved_poll_ms = max(50, int(resolved_poll_ms))
         if semantic_on_outage not in ("allow", "block"):
             raise ValueError(
                 f"semantic_on_outage must be 'allow' or 'block', "
@@ -355,6 +384,8 @@ def init(
             on_block=on_block,  # type: ignore[arg-type]
             on_pending=on_pending,  # type: ignore[arg-type]
             approval_wait_budget_ms=resolved_budget_ms,
+            approval_mode=resolved_approval_mode,  # type: ignore[arg-type]
+            approval_poll_interval_ms=resolved_poll_ms,
             semantic_on_outage=semantic_on_outage,  # type: ignore[arg-type]
             on_outage=resolved_on_outage,  # type: ignore[arg-type]
             refresh_interval_seconds=refresh_interval_seconds,
