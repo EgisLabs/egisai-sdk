@@ -24,7 +24,7 @@ What's pinned
   than an empty column.
 
 ``opentelemetry`` is deliberately not a test dependency — it isn't a
-runtime one either, and pinning behaviour against a stub is what keeps
+runtime one either, and pinning behavior against a stub is what keeps
 it that way. The stubs below implement only the two methods the SDK
 touches.
 """

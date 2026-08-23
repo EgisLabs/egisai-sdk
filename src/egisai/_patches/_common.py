@@ -596,6 +596,74 @@ def _block_response(
     return stub_factory(decision, ensure_trace_id(), model)
 
 
+# Sentinel meaning "the hold resolved to approved — resume the call".
+_APPROVAL_PROCEED = object()
+
+
+def _handle_pending(
+    *,
+    decision: PolicyDecision,
+    ev: dict[str, Any],
+    model: str,
+    surface: str,
+    stub_factory: Callable[[PolicyDecision, str, str], Any] | None,
+    step_started: float | None,
+) -> Any:
+    """Hold the call for human approval, then resume, block, or park it.
+
+    Returns :data:`_APPROVAL_PROCEED` when the human approved and the
+    gate should continue to the real forward. Otherwise returns (or
+    raises) a terminal response: a block on reject / expire, or the
+    ``on_pending`` outcome (raise ``ApprovalPendingError`` / stub) when
+    the wait budget elapsed without a decision.
+
+    The approval wait is booked ONLY on ``ev["approval_wait_ms"]`` — it
+    never touches ``latency_ms`` / ``policy_latency_ms``.
+    """
+    from egisai._approvals import ApprovalPendingError, request_approval
+
+    outcome = request_approval(
+        decision=decision, ev=ev, surface=surface, model=model
+    )
+    ev["approval_wait_ms"] = outcome.wait_ms
+    if outcome.approval_id:
+        ev["approval_id"] = outcome.approval_id
+    ev["approval_state"] = outcome.state
+
+    if outcome.decided and outcome.approved:
+        # Approved — resume. Timers restart in the caller (a fresh
+        # ``model_started`` is stamped right before the forward), so
+        # the wait never inflates model latency.
+        return _APPROVAL_PROCEED
+
+    if outcome.decided and not outcome.approved:
+        # Rejected or expired-with-block: refuse the call. Record the
+        # hold's outcome on the audit event before the block dispatch.
+        ev["latency_ms"] = 0
+        ev.setdefault("enforcement_status", ENFORCEMENT_ENFORCED)
+        return _block_response(
+            decision=decision,
+            ev=ev,
+            model=model,
+            stub_factory=stub_factory,
+            step_started=step_started,
+        )
+
+    # Budget elapsed with no decision — apply ``on_pending``. We do NOT
+    # emit an audit row here: the call was neither allowed nor blocked,
+    # it's parked. The hold itself is the record (tracked server-side in
+    # ``approval_requests``); ``request_logs`` stays terminal-only, so a
+    # parked call never pollutes verdict counters, trust, or behavior.
+    cfg = get_config()
+    msg = (
+        f"[egisai] {decision.message or 'awaiting human approval'} "
+        f"(matched={decision.matched_policy})"
+    )
+    if cfg.on_pending == "raise" or stub_factory is None:
+        raise ApprovalPendingError(msg, approval_id=outcome.approval_id)
+    return stub_factory(decision, ensure_trace_id(), model)
+
+
 def _run_output_phase(
     *,
     response: Any,
@@ -1189,6 +1257,18 @@ def _gate_call_inner(
                 step_started=step_started,
             )
 
+        if decision.verdict == "pending_approval":
+            resumed = _handle_pending(
+                decision=decision,
+                ev=ev,
+                model=model,
+                surface="model",
+                stub_factory=stub_factory,
+                step_started=step_started,
+            )
+            if resumed is not _APPROVAL_PROCEED:
+                return resumed
+
         if decision.verdict == "sanitize":
             _apply_sanitization(decision=decision, payload=payload, ev=ev)
 
@@ -1231,6 +1311,22 @@ def _gate_call_inner(
             extract_output_signals=extract_output_signals,
             ev=ev,
         )
+        if (
+            output_decision is not None
+            and output_decision.verdict == "pending_approval"
+        ):
+            resumed = _handle_pending(
+                decision=output_decision,
+                ev=ev,
+                model=served_model,
+                surface="model",
+                stub_factory=stub_factory,
+                step_started=step_started,
+            )
+            if resumed is not _APPROVAL_PROCEED:
+                return resumed
+            # Approved — let the response through as a normal allow.
+            output_decision = None
         if output_decision is not None and output_decision.verdict == "block":
             _stamp_output_block(ev, output_decision)
             return _block_response(
@@ -1402,6 +1498,22 @@ async def _async_gate_call_inner(
                 step_started=step_started,
             )
 
+        if decision.verdict == "pending_approval":
+            # The hold poll is a blocking sleep/HTTP loop; park it on a
+            # worker thread so the event loop stays free while a human
+            # decides (same posture as the judge round-trip above).
+            resumed = await asyncio.to_thread(
+                _handle_pending,
+                decision=decision,
+                ev=ev,
+                model=model,
+                surface="model",
+                stub_factory=stub_factory,
+                step_started=step_started,
+            )
+            if resumed is not _APPROVAL_PROCEED:
+                return resumed
+
         if decision.verdict == "sanitize":
             _apply_sanitization(decision=decision, payload=payload, ev=ev)
 
@@ -1452,6 +1564,22 @@ async def _async_gate_call_inner(
             extract_output_signals=extract_output_signals,
             ev=ev,
         )
+        if (
+            output_decision is not None
+            and output_decision.verdict == "pending_approval"
+        ):
+            resumed = _handle_pending(
+                decision=output_decision,
+                ev=ev,
+                model=served_model,
+                surface="model",
+                stub_factory=stub_factory,
+                step_started=step_started,
+            )
+            if resumed is not _APPROVAL_PROCEED:
+                return resumed
+            # Approved — let the response through as a normal allow.
+            output_decision = None
         if output_decision is not None and output_decision.verdict == "block":
             _stamp_output_block(ev, output_decision)
             return _block_response(

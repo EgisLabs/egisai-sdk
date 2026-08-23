@@ -14,7 +14,12 @@ plus an httpx / requests fallback.
 
 from __future__ import annotations
 
-__version__ = "0.70.0"
+__version__ = "0.71.0"
+
+# Human-in-the-loop approvals — raised when a call is held for human
+# approval and the in-line wait budget elapses without a decision.
+# Public so callers using ``on_pending="raise"`` can catch it.
+from egisai._approvals import ApprovalPendingError
 
 # Identity v2 helpers — public for advanced callers (and the
 # platform's gateway) that need to compute the same model-invariant
@@ -40,6 +45,7 @@ from egisai.policy import (
 )
 
 __all__ = [
+    "ApprovalPendingError",
     "AsyncClient",
     "Client",
     "OutputPolicyContext",
