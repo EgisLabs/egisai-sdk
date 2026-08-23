@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.72.0] — 2026-08-23
+
+### Added
+
+- **Async human-in-the-loop approvals.** A `require_approval` policy can
+  now be `wait` (block the call in-line until decided — the interactive
+  default) or `async` (return a pending outcome immediately and resume
+  when the identical call is re-issued). The mode is reported by the
+  control plane per policy; a retried call reproduces a stable
+  idempotency key so it re-attaches to the same hold and inherits its
+  decision instead of opening a duplicate. This makes both single-step
+  and multi-step runs resume cleanly after approval, rejection, or
+  timeout.
+- **`init(approval_mode=..., approval_poll_interval_ms=...)`** plus the
+  `EGISAI_APPROVAL_MODE` and `EGISAI_APPROVAL_POLL_INTERVAL_MS` env vars.
+  `approval_mode` is `"auto"` (default — follow the policy's `wait_mode`),
+  `"wait"`, or `"async"`; `approval_poll_interval_ms` tunes the in-line
+  poll cadence (default 500 ms).
+- The SDK now sends the hold `idempotency_key` (plus any
+  `amount` / `currency` / `amount_threshold` hints) when opening a hold,
+  so resume-by-re-submit works and duplicate holds are avoided.
+
+### Changed
+
+- The in-line approval poll interval is now configurable rather than a
+  fixed 500 ms start; the ×1.5 backoff and 3 s cap are unchanged.
+
 ## [0.71.0] — 2026-08-22
 
 ### Added

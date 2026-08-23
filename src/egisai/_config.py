@@ -17,6 +17,15 @@ OnBlock = Literal["raise", "stub"]
 #           once decided. "stub" — return a framework-shaped
 #           "pending" response so an agent loop keeps running.
 OnPending = Literal["raise", "stub"]
+# How the SDK delivers a human-in-the-loop decision back to the call.
+# "auto" (default) — follow the matched policy's ``wait_mode`` reported
+#           by the control plane: 'wait' blocks in-line, 'async' returns
+#           a pending outcome immediately. "wait" — always block in-line
+#           polling up to the budget, then apply ``on_pending``. "async"
+#           — never block: open the hold, return pending immediately and
+#           let a later re-submit (same idempotency key) resume once
+#           decided.
+ApprovalMode = Literal["auto", "wait", "async"]
 OnOutage = Literal["allow", "block"]
 # In-process availability posture: what the SDK does when it cannot
 # confirm policy from the control plane (it never completed a
@@ -57,6 +66,14 @@ class EgisaiConfig:
     # fall back to the retry-resumes contract.
     on_pending: OnPending = "raise"
     approval_wait_budget_ms: int = 120_000
+    # How the SDK delivers the approval decision — see ``ApprovalMode``.
+    # "auto" follows the policy's ``wait_mode``; an explicit "wait" /
+    # "async" overrides it for every hold this process opens.
+    approval_mode: ApprovalMode = "auto"
+    # Starting poll interval (ms) while blocking in-line for a decision.
+    # Backs off ×1.5 up to max(this, 3000) ms so a fast Slack/email
+    # click resumes almost instantly without busy-looping on a long wait.
+    approval_poll_interval_ms: int = 500
     refresh_interval_seconds: float = 10.0
     flush_interval_seconds: float = 1.0
     flush_batch_size: int = 50
@@ -195,6 +212,8 @@ def update_config(**fields: object) -> EgisaiConfig:
         "on_block": _CONFIG.on_block,
         "on_pending": _CONFIG.on_pending,
         "approval_wait_budget_ms": _CONFIG.approval_wait_budget_ms,
+        "approval_mode": _CONFIG.approval_mode,
+        "approval_poll_interval_ms": _CONFIG.approval_poll_interval_ms,
         "refresh_interval_seconds": _CONFIG.refresh_interval_seconds,
         "flush_interval_seconds": _CONFIG.flush_interval_seconds,
         "flush_batch_size": _CONFIG.flush_batch_size,

@@ -24,6 +24,7 @@ exception to the SDK's usual availability fail-open posture.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -55,10 +56,41 @@ class ApprovalOutcome:
     message: str | None = None
 
 
-# Poll cadence — start tight so a fast Slack/email click resumes almost
-# immediately, then back off so a long wait isn't a busy-loop.
-_POLL_MIN_S = 0.5
+# Backoff ceiling for the in-line poll. The starting interval is
+# operator-configurable (``approval_poll_interval_ms``); the cap keeps a
+# long wait from busy-looping while staying responsive to a fast click.
 _POLL_MAX_S = 3.0
+
+
+def _idempotency_key(
+    *,
+    decision: PolicyDecision,
+    ev: dict[str, Any],
+    surface: str,
+    model: str | None,
+) -> str | None:
+    """A stable key for this logical action so a retried call re-attaches
+    to the same hold (and inherits its decision) instead of opening a
+    duplicate.
+
+    Derived from the run + the tripped policy + the surface/model + a
+    hash of what needs approving (``approval_detail`` / ``message``).
+    Distinct steps of a multi-step run carry distinct ``approval_detail``
+    so each step gets its own hold, while a retry of the *same* step
+    reproduces the same key and resumes cleanly.
+    """
+    parts = [
+        str(ev.get("run_id") or ""),
+        str(ev.get("agent_id") or ""),
+        str(decision.matched_policy or ""),
+        str(surface or ""),
+        str(model or ""),
+        str(decision.approval_detail or decision.message or ""),
+    ]
+    raw = "|".join(parts)
+    if not raw.strip("|"):
+        return None
+    return hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()[:128]
 
 
 def request_approval(
@@ -68,7 +100,13 @@ def request_approval(
     surface: str,
     model: str | None,
 ) -> ApprovalOutcome:
-    """Open a hold and block in-line until decided or the budget elapses."""
+    """Open (or re-attach to) a hold and resolve it per the wait mode.
+
+    In 'wait' mode the call blocks in-line polling up to the budget; in
+    'async' mode it returns a pending outcome immediately. Either way a
+    terminal decision that is already known at create time (a re-attach
+    to a decided hold) resumes instantly.
+    """
     cfg = get_config()
     started = time.monotonic()
 
@@ -83,7 +121,16 @@ def request_approval(
         "agent_id": agent_id,
         "run_id": ev.get("run_id"),
         "trace_id": ev.get("trace_id"),
+        "idempotency_key": _idempotency_key(
+            decision=decision, ev=ev, surface=surface, model=model
+        ),
     }
+    # Structured approver-card hints, when the action carried them
+    # (already post-sanitization on the SDK side).
+    for field in ("amount", "currency", "amount_threshold"):
+        val = ev.get(field)
+        if val is not None:
+            payload[field] = val
 
     created = _backend.create_approval(payload)
     if not created or not created.get("id"):
@@ -100,6 +147,8 @@ def request_approval(
 
     approval_id = str(created["id"])
     if created.get("resolved"):
+        # Already decided — a re-attach to a resolved hold (retry after
+        # the decision) or an instant auto-resolve. Resume immediately.
         return ApprovalOutcome(
             decided=True,
             approved=bool(created.get("approved")),
@@ -109,8 +158,33 @@ def request_approval(
             message=created.get("message"),
         )
 
+    # Resolve the effective mode: an explicit SDK ``approval_mode`` wins;
+    # "auto" follows the policy's ``wait_mode`` reported on the create
+    # response.
+    mode: str = cfg.approval_mode
+    if mode == "auto":
+        mode = str(created.get("wait_mode") or "wait").strip().lower()
+    if mode not in ("wait", "async"):
+        mode = "wait"
+
+    if mode == "async":
+        # Don't block: return pending now. A later re-submit reproduces
+        # the idempotency key, re-attaches to this hold, and returns the
+        # decision. The gate applies ``on_pending`` (raise/stub) so the
+        # caller learns the action is parked.
+        return ApprovalOutcome(
+            decided=False,
+            approved=False,
+            approval_id=approval_id,
+            wait_ms=int((time.monotonic() - started) * 1000),
+            state="pending",
+            message="Held for human approval (async).",
+        )
+
     budget_s = max(0.0, cfg.approval_wait_budget_ms / 1000.0)
-    delay = _POLL_MIN_S
+    poll_min_s = max(0.05, cfg.approval_poll_interval_ms / 1000.0)
+    poll_max_s = max(poll_min_s, _POLL_MAX_S)
+    delay = poll_min_s
     while (time.monotonic() - started) < budget_s:
         time.sleep(min(delay, max(0.0, budget_s - (time.monotonic() - started))))
         status = _backend.poll_approval(approval_id)
@@ -123,7 +197,7 @@ def request_approval(
                 state=str(status.get("state") or "resolved"),
                 message=status.get("message"),
             )
-        delay = min(_POLL_MAX_S, delay * 1.5)
+        delay = min(poll_max_s, delay * 1.5)
 
     # Budget elapsed with no decision.
     return ApprovalOutcome(
