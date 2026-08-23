@@ -530,6 +530,52 @@ def route_quality(
         return None
 
 
+def create_approval(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Open a human-in-the-loop hold for a call the engine flagged.
+
+    Returns the parsed status body (``{id, state, resolved, approved,
+    ...}``) or ``None`` when the backend is unreachable / errors — the
+    caller (the gate) decides how to fail. Runs INLINE on the hot path,
+    so it uses a tight timeout: a slow control plane must not add more
+    than a couple of seconds before the fail-closed default applies.
+    """
+    try:
+        r = _retry_on_429(
+            "create_approval",
+            lambda: get_client().post(
+                "/v1/sdk/approvals",
+                json=payload,
+                timeout=ensure_agent_timeout_secs(),
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if r.status_code != 200:
+        LOGGER.warning("create_approval failed: HTTP %s", r.status_code)
+        return None
+    try:
+        return r.json()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def poll_approval(approval_id: str) -> dict[str, Any] | None:
+    """Fetch the current decision for a held call. ``None`` on error."""
+    try:
+        r = get_client().get(
+            f"/v1/sdk/approvals/{approval_id}",
+            timeout=ensure_agent_timeout_secs(),
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        return r.json()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def post_events(events: list[dict[str, Any]]) -> None:
     if not events:
         return

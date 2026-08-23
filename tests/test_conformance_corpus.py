@@ -11,7 +11,7 @@ would be a place for the runner to agree with the engine for the wrong
 reason.
 
 If a case here fails, exactly one of two things is true: the engine
-regressed, or someone changed intended behaviour and did not update the
+regressed, or someone changed intended behavior and did not update the
 corpus. Both are worth stopping for. Do not "fix" a red case by editing
 the expectation unless you also update its ``description`` to say what
 changed and why.
@@ -139,7 +139,7 @@ def _run(case: dict[str, Any], blocker: _RecordingBlocker | None) -> Any:
             model=ctx_spec.get("model", "gpt-4o"),
             prompt_text=text,
             # Derived, never declared: a corpus that let a case state a
-            # length different from its own text could pin behaviour
+            # length different from its own text could pin behavior
             # that no real caller can reproduce.
             prompt_chars=len(text),
             stream=bool(ctx_spec.get("stream", False)),

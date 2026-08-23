@@ -9,6 +9,14 @@ from dataclasses import dataclass
 from typing import Literal
 
 OnBlock = Literal["raise", "stub"]
+# What the SDK does when a call is held for human approval and the
+# wait budget elapses before a human decides.
+# "raise" (default) — raise ``ApprovalPendingError`` so the caller
+#           knows the action is parked; a retry re-attaches to the
+#           same hold via the idempotency key and returns instantly
+#           once decided. "stub" — return a framework-shaped
+#           "pending" response so an agent loop keeps running.
+OnPending = Literal["raise", "stub"]
 OnOutage = Literal["allow", "block"]
 # In-process availability posture: what the SDK does when it cannot
 # confirm policy from the control plane (it never completed a
@@ -40,6 +48,15 @@ class EgisaiConfig:
     env: str
     base_url: str = "https://app.egisai.co"
     on_block: OnBlock = "raise"
+    # Human-in-the-loop hold behavior. ``on_pending`` mirrors
+    # ``on_block``: what to do when the in-line wait budget elapses
+    # before a human decides. ``approval_wait_budget_ms`` bounds how
+    # long the SDK blocks the call polling for a decision before it
+    # gives up and applies ``on_pending``. A generous default (2 min)
+    # covers a human clicking Approve in Slack/email; long approvals
+    # fall back to the retry-resumes contract.
+    on_pending: OnPending = "raise"
+    approval_wait_budget_ms: int = 120_000
     refresh_interval_seconds: float = 10.0
     flush_interval_seconds: float = 1.0
     flush_batch_size: int = 50
@@ -176,6 +193,8 @@ def update_config(**fields: object) -> EgisaiConfig:
         "env": _CONFIG.env,
         "base_url": _CONFIG.base_url,
         "on_block": _CONFIG.on_block,
+        "on_pending": _CONFIG.on_pending,
+        "approval_wait_budget_ms": _CONFIG.approval_wait_budget_ms,
         "refresh_interval_seconds": _CONFIG.refresh_interval_seconds,
         "flush_interval_seconds": _CONFIG.flush_interval_seconds,
         "flush_batch_size": _CONFIG.flush_batch_size,

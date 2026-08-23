@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.71.0] — 2026-08-22
+
+### Added
+
+- **Human-in-the-loop approvals — a fourth governance outcome.** Any
+  deterministic or action policy can now carry `require_approval` (via
+  `config.require_approval: true` or `config.action: "require_approval"`).
+  When such a rule would block, the engine instead returns the new
+  `pending_approval` verdict (`PolicyDecision.hold(...)`), the gate opens
+  a hold on the control plane, notifies the configured approver(s), and
+  blocks the call in-line up to `approval_wait_budget_ms`. Approved →
+  the call resumes transparently; rejected / expired → the call is
+  blocked; budget elapsed with no decision → `on_pending` applies
+  (raise `ApprovalPendingError` or return a pending stub). The classic
+  case — "hold any `transfer` over $10k for a human" — now works end to
+  end via `deny_financial_action` + `amount_threshold` + `require_approval`.
+- **`init(on_pending=..., approval_wait_budget_ms=...)`** plus the
+  `EGISAI_APPROVAL_WAIT_BUDGET_MS` env var. `on_pending` mirrors
+  `on_block` (`"raise"` default, or `"stub"`).
+- **`ApprovalPendingError`** is now exported from the top-level package.
+
+### Changed
+
+- Verdict precedence is now `block > pending_approval > sanitize > allow`.
+  A hard block always wins over a hold; a hold always wins over a
+  sanitize. Phase 2 (LLM judges) is short-circuited on a pending hold,
+  exactly as it is on a block — no prompt ever reaches a judge for a
+  call that is already paused.
+
+### Security
+
+- The approval wait is measured separately and booked on a dedicated
+  `approval_wait_ms` field — never on `latency_ms` / `policy_latency_ms`
+  — so human think-time can't distort latency, trust, or behavior math.
+- Approvals fail **closed**: if the control plane can't be reached to
+  open or poll a hold, the held call is treated as not approved
+  (blocked). A rule important enough to need a human must not silently
+  proceed when we couldn't ask one. This is the deliberate approvals
+  exception to the SDK's usual availability fail-open posture.
+
 ## [0.70.0] — 2026-08-20
 
 ### Added
@@ -337,8 +377,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Documentation/comment-only sweep: standardized "behaviour" /
-  "behavioural" to American English ("behavior" / "behavioral")
+- Documentation/comment-only sweep: standardized "behavior" /
+  "behavioral" to American English ("behavior" / "behavioral")
   across docstrings and comments. No runtime behavior change.
 
 ---

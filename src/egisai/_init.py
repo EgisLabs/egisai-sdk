@@ -57,6 +57,8 @@ def init(
     env: str = "production",
     base_url: str | None = None,
     on_block: str = "raise",
+    on_pending: str = "raise",
+    approval_wait_budget_ms: int | None = None,
     semantic_on_outage: str = "allow",
     on_outage: str | None = None,
     refresh_interval_seconds: float = 10.0,
@@ -231,6 +233,24 @@ def init(
             )
         if on_block not in ("raise", "stub"):
             raise ValueError(f"on_block must be 'raise' or 'stub', got {on_block!r}")
+        if on_pending not in ("raise", "stub"):
+            raise ValueError(
+                f"on_pending must be 'raise' or 'stub', got {on_pending!r}"
+            )
+        # ``approval_wait_budget_ms`` resolves explicit kwarg → env var
+        # → default 120000. Clamped ≥ 0 so a negative typo can't turn
+        # the in-line wait into an immediate fallback.
+        resolved_budget_ms = approval_wait_budget_ms
+        if resolved_budget_ms is None:
+            raw_budget = os.getenv("EGISAI_APPROVAL_WAIT_BUDGET_MS")
+            if raw_budget and raw_budget.strip():
+                try:
+                    resolved_budget_ms = int(raw_budget.strip())
+                except ValueError:
+                    resolved_budget_ms = None
+        if resolved_budget_ms is None:
+            resolved_budget_ms = 120_000
+        resolved_budget_ms = max(0, int(resolved_budget_ms))
         if semantic_on_outage not in ("allow", "block"):
             raise ValueError(
                 f"semantic_on_outage must be 'allow' or 'block', "
@@ -333,6 +353,8 @@ def init(
             or os.getenv("EGISAI_BASE_URL")
             or "https://app.egisai.co",
             on_block=on_block,  # type: ignore[arg-type]
+            on_pending=on_pending,  # type: ignore[arg-type]
+            approval_wait_budget_ms=resolved_budget_ms,
             semantic_on_outage=semantic_on_outage,  # type: ignore[arg-type]
             on_outage=resolved_on_outage,  # type: ignore[arg-type]
             refresh_interval_seconds=refresh_interval_seconds,

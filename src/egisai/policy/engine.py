@@ -11,7 +11,7 @@ import logging
 import re
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from egisai.policy import _pii_custom, fastpath, injection
@@ -173,9 +173,21 @@ class PolicyDecision:
     - ``"sanitize"``  forward with masked PII (the raw value never
                       reaches the model)
     - ``"block"``     refuse the call
+    - ``"pending_approval"`` hold the call and route it to a human
+                      for approval (human-in-the-loop). The call is
+                      neither forwarded nor refused yet — the gate
+                      pauses, a human approves/rejects, and the call
+                      resumes (approved ⇒ forward) or fails
+                      (rejected/expired ⇒ block). Precedence is
+                      ``block > pending_approval > sanitize > allow``:
+                      a hard block always wins over a hold.
 
     ``matched_policy`` is the primary matched rule's name;
     ``matched_policies`` is the full ordered list of rules that fired.
+
+    ``approval_detail`` is a short human-readable phrase describing
+    what needs approving (e.g. ``"$25,000 transfer via wire_send"``);
+    only set when ``verdict == "pending_approval"``.
     """
     verdict: str
     reason_code: str | None
@@ -184,6 +196,7 @@ class PolicyDecision:
     matched_policies: tuple[MatchedPolicyRecord, ...] = ()
     sanitize_types: list[str] = field(default_factory=list)
     sanitize_mask_char: str = "#"
+    approval_detail: str | None = None
 
     @property
     def sanitize_kinds(self) -> list[str]:
@@ -266,6 +279,32 @@ class PolicyDecision:
             matched_policies=matched_policies,
             sanitize_types=list(types or []),
             sanitize_mask_char=mask_char or "#",
+        )
+
+    @classmethod
+    def hold(
+        cls,
+        *,
+        reason_code: str,
+        message: str,
+        matched_policy: str,
+        matched_policies: tuple[MatchedPolicyRecord, ...] = (),
+        approval_detail: str | None = None,
+    ) -> PolicyDecision:
+        """The call must be held for human approval before it proceeds.
+
+        The gate creates an approval request, notifies the configured
+        approver(s), and either resumes the call (approved) or refuses
+        it (rejected / expired). This is a non-terminal verdict — it
+        resolves to ``allow`` or ``block`` once a human decides.
+        """
+        return cls(
+            verdict="pending_approval",
+            reason_code=reason_code,
+            message=message,
+            matched_policy=matched_policy,
+            matched_policies=matched_policies,
+            approval_detail=approval_detail,
         )
 
 
@@ -472,7 +511,10 @@ def evaluate_policies(
 
     phase1_matches = _collect_input_matches(phase1, context, semantic_blocker=None)
 
-    if phase1_matches.has_block:
+    # A block or a human-approval hold both short-circuit Phase 2:
+    # there is no point spending an LLM judge round-trip (or leaking
+    # the prompt to it) on a call we are already refusing or pausing.
+    if phase1_matches.has_block or phase1_matches.has_pending:
         return _synthesize_decision(phase1_matches.records)
 
     text_for_phase2 = context.prompt_text
@@ -548,6 +590,10 @@ class _PhaseMatches:
     @property
     def has_block(self) -> bool:
         return any(r.verdict == "block" for r in self.records)
+
+    @property
+    def has_pending(self) -> bool:
+        return any(r.verdict == "pending_approval" for r in self.records)
 
     @property
     def has_sanitize(self) -> bool:
@@ -629,7 +675,51 @@ def _bind_input_policy(
     return run
 
 
+def _approval_requested(config: dict[str, Any]) -> bool:
+    """True when the operator asked this rule to hold for a human.
+
+    Two spellings are accepted so the flag composes with the existing
+    ``action`` field some kinds already use:
+
+    * ``config["require_approval"] is True`` — the canonical flag.
+    * ``config["action"] == "require_approval"`` — for kinds whose
+      operator UI already exposes an ``action`` selector.
+    """
+    if config.get("require_approval") is True:
+        return True
+    action = config.get("action")
+    return isinstance(action, str) and action.strip().lower() == "require_approval"
+
+
+def _maybe_require_approval(
+    policy: PolicyRule, rec: MatchedPolicyRecord | None
+) -> MatchedPolicyRecord | None:
+    """Convert a ``block`` record into a ``pending_approval`` hold when
+    the policy is configured to require human approval.
+
+    Only a ``block`` is convertible — a ``sanitize`` or ``flag`` was
+    never going to refuse the call, so there is nothing to hold. This
+    keeps the transform additive: a rule without the flag behaves
+    exactly as before.
+    """
+    if rec is None or rec.verdict != "block":
+        return rec
+    if not _approval_requested(policy.config or {}):
+        return rec
+    return replace(rec, verdict="pending_approval")
+
+
 def _evaluate_one_input_policy(
+    policy: PolicyRule,
+    context: PolicyContext,
+    semantic_blocker: SemanticBlocker | None,
+) -> MatchedPolicyRecord | None:
+    """Evaluate one prompt-side rule, then apply the approval transform."""
+    rec = _dispatch_one_input_policy(policy, context, semantic_blocker)
+    return _maybe_require_approval(policy, rec)
+
+
+def _dispatch_one_input_policy(
     policy: PolicyRule,
     context: PolicyContext,
     semantic_blocker: SemanticBlocker | None,
@@ -859,6 +949,22 @@ def _synthesize_decision(
             message=primary.message,
             matched_policy=primary.name,
             matched_policies=tuple(records),
+        )
+
+    # Human-in-the-loop hold. Sits below ``block`` (a hard block
+    # always wins) but above ``sanitize`` — a call that needs a human
+    # decision should not silently proceed just because some PII was
+    # also masked. The finding detail rides on ``approval_detail`` for
+    # the approver-facing notification / inbox.
+    holds = [r for r in records if r.verdict == "pending_approval"]
+    if holds:
+        primary = holds[0]
+        return PolicyDecision.hold(
+            reason_code=primary.reason_code,
+            message=primary.message,
+            matched_policy=primary.name,
+            matched_policies=tuple(records),
+            approval_detail=primary.message,
         )
 
     sanitizes = [r for r in records if r.verdict == "sanitize"]
@@ -1966,7 +2072,7 @@ def evaluate_output_policies(
     # responses), so a Phase 1 sanitize is impossible by
     # construction — but the ``has_block`` guard here mirrors the
     # prompt side regardless, so the contract reads identically.
-    if phase1_matches.has_block:
+    if phase1_matches.has_block or phase1_matches.has_pending:
         return _synthesize_decision(phase1_matches.records)
 
     if not phase2:
@@ -2067,6 +2173,16 @@ def _bind_output_policy(
 
 
 def _evaluate_one_output_policy(
+    policy: PolicyRule,
+    context: OutputPolicyContext,
+    semantic_blocker: SemanticBlocker | None,
+) -> MatchedPolicyRecord | None:
+    """Evaluate one response-side rule, then apply the approval transform."""
+    rec = _dispatch_one_output_policy(policy, context, semantic_blocker)
+    return _maybe_require_approval(policy, rec)
+
+
+def _dispatch_one_output_policy(
     policy: PolicyRule,
     context: OutputPolicyContext,
     semantic_blocker: SemanticBlocker | None,
