@@ -1245,6 +1245,7 @@ def _ensure_agent_id(
                 identity_simhash=simhash,
                 tool_bundle_hash=tool_bundle_hash,
                 model=model,
+                init_app=cfg.app,
             )
             agent_id = payload.get("id")
             if isinstance(agent_id, str) and agent_id:

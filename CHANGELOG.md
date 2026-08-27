@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.73.0] — 2026-08-26
+
+### Added
+
+- **`init(app=…)` now groups your fleet on the dashboard.** The SDK
+  sends its `init(app="…")` label on agent registration, and the
+  control plane stamps it on each auto-registered agent. The dashboard's
+  new "Organize by App" lens uses it to bucket agents by application.
+  Grouping metadata only — never part of any identity hash, and older
+  backends ignore the new field.
+
+---
+
 ## [0.72.0] — 2026-08-23
 
 ### Added
