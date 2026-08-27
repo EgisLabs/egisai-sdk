@@ -273,6 +273,7 @@ def ensure_agent(
     identity_simhash: str | None = None,
     tool_bundle_hash: str | None = None,
     model: str | None = None,
+    init_app: str | None = None,
 ) -> dict[str, Any]:
     """Find-or-create an agent in the caller's org by name. Idempotent.
 
@@ -312,6 +313,12 @@ def ensure_agent(
       Observed *metadata* only (models_seen histogram) — never part
       of any identity hash.
 
+    ``init_app`` (added in 0.73.0; older backends ignore it) is the
+    ``egisai.init(app="…")`` label of the registering process. The
+    backend stamps it on the agent as its ``sdk_app`` so the dashboard
+    can group the fleet by application. Grouping metadata only — never
+    identity.
+
     Availability contract: this is the only backend hop that runs
     inline on the customer's model call, so it gets its own tight
     timeout (:func:`ensure_agent_timeout_secs`) and no 429 retry
@@ -341,6 +348,8 @@ def ensure_agent(
         payload["tool_bundle_hash"] = tool_bundle_hash
     if model:
         payload["model"] = model
+    if init_app:
+        payload["init_app"] = init_app
     # DEBUG breadcrumb so a developer staring at an empty Provenance
     # card on the dashboard can confirm "yes, the SDK actually shipped
     # the fingerprint" without reaching for tcpdump. Off by default;
