@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.73.1] — 2026-08-27
+
+### Fixed
+
+- **Release pipeline unblocked.** Bumped the Sigstore signing action
+  (`gh-action-sigstore-python`) to v3.4.0 so artifact signing uses the
+  current Sigstore TUF trust root. The prior pin shipped a stale root
+  that could no longer verify Sigstore's rotated production root, which
+  blocked 0.73.0 from publishing. No runtime code changed — this is a
+  re-release of the 0.73.0 payload.
+
+---
+
 ## [0.73.0] — 2026-08-26
 
 ### Added
