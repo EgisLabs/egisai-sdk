@@ -32,12 +32,16 @@ from egisai.policy import (
     evaluate_output_policies,
     evaluate_policies,
 )
+from egisai.policy.injection_client import InjectionBlocker
 from egisai.policy.semantic import SemanticBlocker
 
 LOGGER = logging.getLogger("egisai.evaluator")
 
 _blocker_lock = threading.Lock()
 _blocker: SemanticBlocker | None = None
+
+_injection_blocker_lock = threading.Lock()
+_injection_blocker: InjectionBlocker | None = None
 
 # ── PII analyzer first-call gate ────────────────────────────────────
 #
@@ -201,6 +205,10 @@ def _has_semantic_rule(rules: list) -> bool:
     return any(getattr(r, "type", None) == "semantic_guard" for r in rules)
 
 
+def _has_injection_rule(rules: list) -> bool:
+    return any(getattr(r, "type", None) == "injection_scan" for r in rules)
+
+
 def _active_agent_id() -> str:
     """Return the agent UUID this call should be attributed to.
 
@@ -255,15 +263,56 @@ def _get_semantic_blocker() -> SemanticBlocker | None:
 
 
 def _close_semantic_blocker() -> None:
-    """Called from shutdown(). Idempotent."""
+    """Called from shutdown(). Idempotent.
+
+    Also closes the injection smart-tier client — both network clients
+    share the SDK lifecycle, so one shutdown hook tears both down.
+    """
     global _blocker
-    if _blocker is None:
+    if _blocker is not None:
+        try:
+            _blocker.close()
+        except Exception:  # noqa: BLE001
+            pass
+        _blocker = None
+    _close_injection_blocker()
+
+
+def _get_injection_blocker() -> InjectionBlocker | None:
+    """Lazy-construct a process-wide ``InjectionBlocker``.
+
+    Returns ``None`` until ``egisai.init()`` has run, in which case the
+    engine runs the local injection pre-filter alone (offline posture).
+    """
+    global _injection_blocker
+
+    if _injection_blocker is not None:
+        return _injection_blocker
+
+    cfg = get_config_optional()
+    if cfg is None:
+        return None
+
+    with _injection_blocker_lock:
+        if _injection_blocker is None:
+            _injection_blocker = InjectionBlocker(
+                platform_api_key=cfg.api_key,
+                platform_base_url=cfg.base_url,
+                on_outage=cfg.semantic_on_outage,
+            )
+    return _injection_blocker
+
+
+def _close_injection_blocker() -> None:
+    """Idempotent teardown for the injection client."""
+    global _injection_blocker
+    if _injection_blocker is None:
         return
     try:
-        _blocker.close()
+        _injection_blocker.close()
     except Exception:  # noqa: BLE001
         pass
-    _blocker = None
+    _injection_blocker = None
 
 
 @dataclass(frozen=True)
@@ -527,9 +576,16 @@ def evaluate(call: InputCall) -> PolicyDecision:
         agent_id=agent_id,
     )
     blocker = _get_semantic_blocker() if _has_semantic_rule(rules) else None
+    inj_blocker = (
+        _get_injection_blocker() if _has_injection_rule(rules) else None
+    )
     try:
         decision = evaluate_policies(
-            rules, ctx, semantic_blocker=blocker, surfaces=call.surfaces
+            rules,
+            ctx,
+            semantic_blocker=blocker,
+            surfaces=call.surfaces,
+            injection_blocker=inj_blocker,
         )
     except Exception:  # noqa: BLE001
         LOGGER.warning("policy evaluator errored, allowing by default", exc_info=True)
@@ -584,9 +640,16 @@ def evaluate_output(call: OutputCall) -> PolicyDecision:
         user_id=identity.user_id or "",
     )
     blocker = _get_semantic_blocker() if _has_semantic_rule(rules) else None
+    inj_blocker = (
+        _get_injection_blocker() if _has_injection_rule(rules) else None
+    )
     try:
         return evaluate_output_policies(
-            rules, ctx, semantic_blocker=blocker, surfaces=call.surfaces
+            rules,
+            ctx,
+            semantic_blocker=blocker,
+            surfaces=call.surfaces,
+            injection_blocker=inj_blocker,
         )
     except Exception:  # noqa: BLE001
         LOGGER.warning("output evaluator errored, allowing by default", exc_info=True)

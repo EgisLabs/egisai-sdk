@@ -8,13 +8,35 @@ to tell the difference, so the instruction runs with the agent's
 credentials. Every published agent compromise of the last two years is
 some version of that sentence.
 
-Why patterns rather than a model
---------------------------------
+This module is the local *pre-filter* tier
+-------------------------------------------
+Detection is two-tier by design. This module is the first tier: a
+fast, standard, fully-local regex pass that runs on every governed
+call, sub-millisecond, offline, and leaks nothing. Everything in it
+is public knowledge — the shapes below are documented in the OWASP
+LLM Top 10 and every prompt-injection write-up of the last two years,
+so keeping them local costs no proprietary advantage and buys instant,
+network-free blocking of the obvious attacks.
+
+The second tier is the platform's *smart* tier — a fine-tuned
+classifier plus EgisAI's calibrated pattern/scoring extensions —
+reached over HTTP by :class:`egisai.policy.injection_client.InjectionBlocker`.
+That tier holds the proprietary IP and never ships in a public PyPI
+artefact. The engine escalates to it only when this local pre-filter
+did *not* already block, and only after Phase 1 has masked PII, so an
+obvious attack is still refused instantly with no network and no data
+egress. Offline / air-gapped deployments run on this local tier alone
+(documented best-effort); online deployments additionally get the
+classifier's recall on paraphrased, multilingual, and novel attacks.
+
+Why patterns rather than a model *here*
+---------------------------------------
 A classifier would score better on a benchmark. It would also mean a
 network call or a 400 MB ONNX bundle inside the hot path of every
-governed request, which breaks two rules this SDK does not break:
-policy evaluation stays local, and it stays under a millisecond. So
-this tier is regex, scoped to the *shapes* injections have to take.
+governed request, which breaks two rules this local tier does not
+break: it stays local, and it stays under a millisecond. So this tier
+is regex, scoped to the *shapes* injections have to take, with the
+model-grade recall provided by the smart tier above.
 
 That scoping is what makes it work. An injection has a job — override
 the model's instructions, extract its configuration, or get it to
