@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.74.0] — 2026-08-28
+
+### Added
+
+- **Prompt-injection smart tier (two-tier detection).** `injection_scan`
+  now runs as a fast, standard local pre-filter *plus* an optional
+  platform "smart tier" reached over HTTP by the new
+  `egisai.policy.injection_client.InjectionBlocker`. The local
+  pre-filter (chat-template delimiters, invisible Unicode, base64 runs,
+  and the well-known override/exfiltration shapes — all public OWASP
+  knowledge) still blocks obvious attacks instantly, offline, with no
+  network. When it does *not* block and a platform client is present,
+  the engine escalates the already-PII-masked text to the platform
+  classifier for model-grade recall on paraphrased / multilingual /
+  novel attacks. Escalation is fail-open: an outage leaves the local
+  pre-filter's verdict standing. Offline/air-gapped installs run on the
+  local tier alone (documented best-effort). Set `escalate: false` on a
+  rule to keep it purely local.
+
+### Changed
+
+- **`deny_db_query` gains an AST axis.** When `sqlparse` is installed,
+  the kind now blocks a table-wide `DELETE`/`UPDATE` (no `WHERE`) even
+  if the verb isn't in `dangerous_operations`, while leaving a scoped
+  `DELETE … WHERE id = 5` alone — fewer false positives than a keyword
+  regex, and it never fires on a `"DROP"` sitting inside a string
+  literal. Optional dependency: the regex axes still run when `sqlparse`
+  is absent. Disable with `block_unfiltered_mutations: false`.
+
+---
+
 ## [0.73.1] — 2026-08-27
 
 ### Fixed

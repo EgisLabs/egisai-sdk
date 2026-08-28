@@ -7,17 +7,21 @@ Evaluates ``PolicyRule`` objects against an input or output
 from __future__ import annotations
 
 import contextvars
+import json
 import logging
 import re
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from egisai.policy import _pii_custom, fastpath, injection
 from egisai.policy import pii as pii_scanner
 from egisai.policy._regex_safe import safe_search
 from egisai.policy.semantic import SemanticBlocker
+
+if TYPE_CHECKING:
+    from egisai.policy.injection_client import InjectionBlocker
 
 LOGGER = logging.getLogger("egisai.policy.engine")
 
@@ -475,6 +479,7 @@ def evaluate_policies(
     semantic_blocker: SemanticBlocker | None = None,
     *,
     surfaces: tuple[str, ...] = ("model",),
+    injection_blocker: InjectionBlocker | None = None,
 ) -> PolicyDecision:
     """Evaluate input-side policies in two phases.
 
@@ -484,9 +489,11 @@ def evaluate_policies(
     the SDK process. If Phase 1 sanitizes, the prompt is masked
     locally before Phase 2 sees it.
 
-    Phase 2 runs LLM-backed checks (``semantic_guard``) against the
-    possibly-masked prompt. A Phase 2 block overrides a Phase 1
-    sanitize, but both records are kept on the decision.
+    Phase 2 runs the network-backed checks against the possibly-masked
+    prompt: the ``semantic_guard`` LLM judge, and the prompt-injection
+    *smart tier* when an ``injection_blocker`` is supplied and the
+    local pre-filter did not already block. A Phase 2 block overrides a
+    Phase 1 sanitize, but every record is kept on the decision.
 
     Rules whose ``phase`` is ``"response"`` are skipped entirely
     on this side — they only run during ``evaluate_output_policies``.
@@ -499,8 +506,10 @@ def evaluate_policies(
     MCP ``tools/call``.
 
     The verdict precedence across all matches is
-    ``block > sanitize > allow``. ``semantic_blocker`` is optional;
-    when ``None``, ``semantic_guard`` rules become no-ops.
+    ``block > sanitize > allow``. ``semantic_blocker`` and
+    ``injection_blocker`` are both optional; when ``None`` the
+    respective network tier is skipped and the local pre-filter's
+    verdict stands (fail-open on availability).
     """
     request_side = [
         p for p in policies
@@ -525,8 +534,22 @@ def evaluate_policies(
             mask_char=phase1_matches.sanitize_mask_char,
         )
 
+    # Prompt-injection smart tier. Runs in the Phase-2 network slot —
+    # after PII masking, only when the local pre-filter did not already
+    # block — so obvious attacks are refused locally for free and the
+    # classifier only sees data-clean, ambiguous text. Fail-open.
+    injection_records = _collect_injection_escalation(
+        request_side,
+        already_recorded={r.name for r in phase1_matches.records},
+        text=text_for_phase2,
+        injection_blocker=injection_blocker,
+        reason_code="injection_detected",
+    )
+
     if not phase2:
-        return _synthesize_decision(phase1_matches.records)
+        return _synthesize_decision(
+            phase1_matches.records + injection_records
+        )
 
     phase2_ctx = PolicyContext(
         tenant=context.tenant,
@@ -574,7 +597,80 @@ def evaluate_policies(
                 legacy_records=phase2_matches.records,
             )
 
-    return _synthesize_decision(phase1_matches.records + phase2_matches.records)
+    return _synthesize_decision(
+        phase1_matches.records + injection_records + phase2_matches.records
+    )
+
+
+# ── Prompt-injection smart-tier escalation ─────────────────────────────
+
+
+def _collect_injection_escalation(
+    policies: list[PolicyRule],
+    *,
+    already_recorded: set[str],
+    text: str,
+    injection_blocker: InjectionBlocker | None,
+    reason_code: str,
+) -> list[MatchedPolicyRecord]:
+    """Escalate ``injection_scan`` rules to the platform smart tier.
+
+    Called once per evaluation, after Phase 1, for every ``injection_scan``
+    rule that did NOT already fire locally (a local block would have
+    short-circuited before we got here; a local flag/miss leaves no
+    record we need to duplicate). For each such rule we ask the
+    platform classifier about the already-masked ``text``; a positive
+    verdict becomes a ``block`` or ``flag`` record per the rule's
+    ``action``.
+
+    Never raises and never blocks the decision on the network beyond
+    the client's own timeout: the blocker fails open (returns ``None``)
+    on any error, so the local pre-filter's verdict stands. When
+    ``injection_blocker`` is ``None`` (offline, or no platform
+    configured) this is a no-op and the SDK runs on the local tier
+    alone — the documented best-effort posture.
+    """
+    if injection_blocker is None or not text:
+        return []
+    inj_policies = [
+        p
+        for p in policies
+        if p.type == "injection_scan" and p.name not in already_recorded
+    ]
+    if not inj_policies:
+        return []
+
+    records: list[MatchedPolicyRecord] = []
+    for policy in inj_policies:
+        config = policy.config or {}
+        action = str(config.get("action") or "flag").strip().lower()
+        if action not in _INJECTION_ACTIONS:
+            action = "flag"
+        try:
+            match = injection_blocker.check(text, config)
+        except Exception:  # noqa: BLE001 — fail open, never break the call
+            LOGGER.debug("injection escalation raised", exc_info=True)
+            match = None
+        if match is None:
+            continue
+        label = (match.cls or "prompt injection").replace("_", " ")
+        detail = f"{label}, confidence {match.score:.2f}"
+        default_message = (
+            f"Content matched a prompt-injection shape ({detail})."
+            if action == "block"
+            else f"Possible prompt injection in this content ({detail})."
+        )
+        records.append(
+            MatchedPolicyRecord(
+                name=policy.name,
+                type="injection_scan",
+                verdict="block" if action == "block" else "flag",
+                reason_code=reason_code,
+                message=str(config.get("message") or "").strip()
+                or default_message,
+            )
+        )
+    return records
 
 
 # ── Internal: phase-walking + decision synthesis ───────────────────────
@@ -2027,6 +2123,7 @@ def evaluate_output_policies(
     semantic_blocker: SemanticBlocker | None = None,
     *,
     surfaces: tuple[str, ...] = ("model", "tool", "mcp"),
+    injection_blocker: InjectionBlocker | None = None,
 ) -> PolicyDecision:
     """Evaluate output-side policies in two phases.
 
@@ -2075,8 +2172,23 @@ def evaluate_output_policies(
     if phase1_matches.has_block or phase1_matches.has_pending:
         return _synthesize_decision(phase1_matches.records)
 
+    # Prompt-injection smart tier on the response side — the indirect
+    # injection surface (fetched pages, tool results). Same contract as
+    # the request side: escalate only rules the local pre-filter didn't
+    # already fire, mirror the semantic path's use of ``context.text``,
+    # and fail open.
+    injection_records = _collect_injection_escalation(
+        response_side,
+        already_recorded={r.name for r in phase1_matches.records},
+        text=context.text,
+        injection_blocker=injection_blocker,
+        reason_code="injection_in_output",
+    )
+
     if not phase2:
-        return _synthesize_decision(phase1_matches.records)
+        return _synthesize_decision(
+            phase1_matches.records + injection_records
+        )
 
     # Fast-governance dispatch — mirror of the input side; see
     # ``evaluate_policies`` and ``egisai.policy.fastpath``.
@@ -2113,7 +2225,7 @@ def evaluate_output_policies(
             )
 
     return _synthesize_decision(
-        phase1_matches.records + phase2_matches.records
+        phase1_matches.records + injection_records + phase2_matches.records
     )
 
 
@@ -2596,6 +2708,91 @@ def _deny_mcp_call_match(
     return None
 
 
+# ── SQL AST helper (commodity, local; optional sqlparse dependency) ────
+#
+# ``sqlparse`` is a standard, widely-used SQL tokenizer — commodity, so
+# per the "keep standard checks local" rule it stays in the engine. It's
+# an *optional* import: the backend ships it (see backend/pyproject.toml)
+# so the in-process gateway path gets AST precision; the pip SDK degrades
+# gracefully to the regex axes when it isn't installed, so we never force
+# a heavier install on offline users.
+_sqlparse_mod: Any = None
+_sqlparse_tried = False
+
+
+def _load_sqlparse() -> Any:
+    global _sqlparse_mod, _sqlparse_tried
+    if not _sqlparse_tried:
+        _sqlparse_tried = True
+        try:
+            import sqlparse as _sqlparse  # type: ignore[import-not-found,import-untyped]  # noqa: PLC0415
+
+            _sqlparse_mod = _sqlparse
+        except Exception:  # noqa: BLE001
+            _sqlparse_mod = None
+    return _sqlparse_mod
+
+
+def _extract_sql_candidates(arguments: str) -> list[str]:
+    """Pull SQL-looking strings out of a tool-call arguments blob.
+
+    Tool arguments usually arrive JSON-encoded (``{"sql": "…"}``), so we
+    walk any JSON we can parse and collect its string leaves; we also
+    keep the raw blob as a fallback for tools that pass bare SQL.
+    """
+    candidates: list[str] = []
+    try:
+        obj = json.loads(arguments)
+    except Exception:  # noqa: BLE001
+        obj = None
+
+    def _walk(value: Any) -> None:
+        if isinstance(value, str):
+            candidates.append(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                _walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                _walk(item)
+
+    if obj is not None:
+        _walk(obj)
+    candidates.append(arguments)
+    return candidates
+
+
+def _sql_unfiltered_mutation(arguments: str) -> str | None:
+    """Return ``"DELETE"``/``"UPDATE"`` for an unfiltered mass mutation.
+
+    Uses the SQL AST — not a keyword regex — so it can tell
+    ``DELETE FROM orders`` (blocks: wipes the table) from
+    ``DELETE FROM orders WHERE id = 5`` (a scoped, ordinary write) and
+    from the literal string ``"DROP"`` sitting inside a column value
+    (never a statement, so never a false positive). Returns ``None`` when
+    ``sqlparse`` isn't installed — the regex axes still run.
+    """
+    sqlparse = _load_sqlparse()
+    if sqlparse is None:
+        return None
+    from sqlparse.sql import Where  # type: ignore[import-not-found,import-untyped]  # noqa: PLC0415
+
+    for sql in _extract_sql_candidates(arguments):
+        if not sql or len(sql) > 20_000:
+            continue
+        try:
+            statements = sqlparse.parse(sql)
+        except Exception:  # noqa: BLE001
+            continue
+        for stmt in statements:
+            verb = (stmt.get_type() or "").upper()
+            if verb not in ("DELETE", "UPDATE"):
+                continue
+            if not any(isinstance(tok, Where) for tok in stmt.tokens):
+                return verb
+    return None
+
+
 def _deny_db_query_match(
     policy: PolicyRule,
     context: OutputPolicyContext,
@@ -2618,6 +2815,12 @@ def _deny_db_query_match(
     * ``dangerous_operations`` — top-level SQL verbs (default:
       DROP / TRUNCATE / DELETE / ALTER / GRANT). Set
       ``block_dangerous_defaults: false`` to disable.
+    * ``block_unfiltered_mutations`` (default ``True``) — an AST-based
+      axis that blocks a ``DELETE``/``UPDATE`` with no ``WHERE`` clause
+      (a table-wide wipe) even when the verb isn't in
+      ``dangerous_operations``, while leaving a scoped
+      ``DELETE … WHERE id = 5`` alone. Uses ``sqlparse`` when
+      installed; a no-op otherwise. Set ``false`` to disable.
 
     Operators can scope this to specific tools via ``tool_patterns``
     (default: any tool whose call arguments look SQL-shaped).
@@ -2635,7 +2838,9 @@ def _deny_db_query_match(
     else:
         dangerous_ops = []
 
-    if not (query_patterns or denied_tables or dangerous_ops):
+    block_unfiltered = bool(policy.config.get("block_unfiltered_mutations", True))
+
+    if not (query_patterns or denied_tables or dangerous_ops or block_unfiltered):
         return None
 
     tool_patterns = _config_str_list(policy.config, "tool_patterns")
@@ -2684,6 +2889,27 @@ def _deny_db_query_match(
                         "message",
                         f"Dangerous SQL operation '{op}' in tool '{tool_name}' "
                         f"was blocked.",
+                    ),
+                )
+
+        # Axis 2b: unfiltered mass mutation, via SQL AST. Catches a
+        # table-wide DELETE/UPDATE (no WHERE) that a narrowed
+        # ``dangerous_operations`` list would otherwise miss, without the
+        # false positives a "DELETE" keyword regex would create on
+        # scoped writes or string literals. Best-effort: no-op when
+        # ``sqlparse`` isn't installed (the pip SDK's offline posture).
+        if block_unfiltered:
+            verb = _sql_unfiltered_mutation(arguments)
+            if verb is not None:
+                return MatchedPolicyRecord(
+                    name=policy.name,
+                    type=policy.type,
+                    verdict="block",
+                    reason_code="db_query_blocked",
+                    message=policy.config.get(
+                        "message",
+                        f"Unfiltered {verb} (no WHERE clause) in tool "
+                        f"'{tool_name}' was blocked.",
                     ),
                 )
 
