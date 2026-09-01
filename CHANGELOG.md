@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.75.0] — 2026-09-01
+
+### Added
+
+- **Per-user budgets and limits (SDK-side enforcement).** When a
+  workspace member has per-user budgets/limits configured on the Team
+  page, the SDK's limits engine now enforces them locally on
+  auto-patch traffic: a billed model call is refused before it leaves
+  the process once the owning member is over their dollar budget,
+  request, or token cap for the window (or their access has expired).
+  Caps + current usage arrive additively on the existing
+  `GET /v1/sdk/usage` snapshot (new `member` block), so no new call is
+  made on the hot path. Enforcement is a Phase-1 deterministic gate
+  (`egisai.policy.limits.member_limit_block`) and **fails open** on any
+  missing snapshot — budgets are an availability control, never a PII
+  control. The inline Gateway remains the authoritative real-time hard
+  block for per-user limits; this covers SDK traffic that never
+  touches the Gateway. Local enforcement rides the usage-sync worker,
+  which is active whenever the org has any budget/rate policy.
+
+### Fixed
+
+- MCP tool-block results now construct `CallToolResult` by its pydantic
+  field name (`is_error`) so the SDK type-checks cleanly against current
+  `mcp` releases; the on-the-wire `isError` alias is unchanged.
+
 ## [0.74.0] — 2026-08-28
 
 ### Added
