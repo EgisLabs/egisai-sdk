@@ -77,9 +77,13 @@ def mcp_types(monkeypatch: pytest.MonkeyPatch) -> None:
     """
 
     class CallToolResult:
-        def __init__(self, content: Any, isError: bool) -> None:  # noqa: N803
+        # Mirrors current ``mcp``: the pydantic field is ``is_error``
+        # (the ``isError`` wire alias is exposed via serialization, not
+        # the constructor). The ``.isError`` attribute is kept so the
+        # tests can assert on the wire-facing name.
+        def __init__(self, content: Any, is_error: bool) -> None:
             self.content = content
-            self.isError = isError  # noqa: N815
+            self.isError = is_error  # noqa: N815
 
     class TextContent:
         def __init__(self, type: str, text: str) -> None:  # noqa: A002
@@ -293,13 +297,23 @@ def test_a_block_returns_a_result_rather_than_raising(
     assert getattr(result, "isError", None) is True
 
 
-def test_a_block_falls_back_to_raising_if_mcp_types_are_missing() -> None:
+def test_a_block_falls_back_to_raising_if_mcp_types_are_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A hard stop beats quietly letting a blocked call through.
 
     This path should be unreachable in production — the patch only
     installs when ``mcp`` is importable — but "unreachable" is not a
     reason to let a refusal turn into an allow.
+
+    Force the "mcp not importable" branch deterministically by blanking
+    it out of ``sys.modules`` (a ``None`` entry makes ``import`` raise).
+    Otherwise this test's outcome depends on whether ``mcp`` happens to
+    be installed in the environment — absent in CI, present in a local
+    combined venv — which made it flake between the two.
     """
+    monkeypatch.setitem(sys.modules, "mcp", None)
+    monkeypatch.setitem(sys.modules, "mcp.types", None)
     with pytest.raises(PermissionError, match="nope"):
         mcp_client._blocked_result("nope")
 

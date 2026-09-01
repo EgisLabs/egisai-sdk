@@ -114,6 +114,20 @@ _snap_org: dict[str, Any] | None = None
 # merge) so they aren't counted twice.
 _snap_epoch: float | None = None
 
+# Per-user (member) limit block for the calling key's owner, delivered
+# additively by ``GET /v1/sdk/usage`` (backend ≥ the member-limits
+# release). ``None`` when the owner has no active per-user limits, or
+# when talking to an older backend that doesn't serve the field. Shape::
+#
+#     {
+#       "budget_usd": "50.00", "budget_period": "monthly",
+#       "max_requests": 1000, "requests_period": "daily",
+#       "max_tokens": 200000, "tokens_period": "monthly",
+#       "spend_usd": "12.30", "requests_used": 40,
+#       "tokens_used": 1234, "access_expired": false
+#     }
+_snap_member: dict[str, Any] | None = None
+
 # Local sliding-window call log. Keyed by lower-case agent UUID plus
 # the reserved ``_ORG_KEY`` aggregate. Values are wall-clock epoch
 # timestamps of allowed model-surface evaluations.
@@ -246,6 +260,97 @@ def budget_usage_usd(agent_id: str, window: str, scope: str) -> float | None:
             return 0.0
 
 
+# ── Per-user (member) limits ────────────────────────────────────────
+
+
+def member_limit_block() -> tuple[str, str] | None:
+    """Block reason for the calling key owner's per-user limit, or None.
+
+    Returns ``(reason_code, message)`` when the owning member is over a
+    hard per-user cap (budget / requests / tokens) or their access has
+    expired, else ``None``.
+
+    Fail-open posture (``security-and-compliance.mdc`` §4): budgets are
+    an availability control, so a missing snapshot (older backend,
+    first seconds after a rule appears, network blip) yields ``None``.
+    Spend and tokens are backend-priced at ingest and cannot be
+    observed locally, so those caps enforce off the snapshot alone;
+    the request count bridges the sync gap with the local org counter
+    (every call in this process belongs to the key's owner).
+
+    The inline Gateway is the authoritative real-time hard block for
+    per-user limits; this local check governs auto-patch traffic that
+    never touches the Gateway, on a best-effort basis.
+    """
+    with _lock:
+        member = _snap_member
+        snap_epoch = _snap_epoch
+    if not member:
+        return None
+
+    if member.get("access_expired"):
+        return (
+            "member_access_expired",
+            "This member's access has expired. Ask an admin to extend it.",
+        )
+
+    # Budget — snapshot spend only (SDK cannot price locally).
+    budget = member.get("budget_usd")
+    if budget is not None:
+        try:
+            cap = float(budget)
+            spent = float(member.get("spend_usd") or 0)
+        except (TypeError, ValueError):
+            cap = 0.0
+            spent = 0.0
+        if cap > 0 and spent >= cap:
+            return (
+                "member_budget_exceeded",
+                f"Per-user budget exceeded: ${spent:.4f} of the "
+                f"${cap:.2f} {member.get('budget_period') or 'monthly'} "
+                "budget for this member has been spent.",
+            )
+
+    # Request count — snapshot count plus local calls since the snapshot.
+    max_requests = member.get("max_requests")
+    if max_requests is not None:
+        try:
+            capr = int(max_requests)
+        except (TypeError, ValueError):
+            capr = 0
+        if capr > 0:
+            used = int(member.get("requests_used") or 0)
+            if snap_epoch is not None:
+                with _lock:
+                    used += _count_local(_ORG_KEY, snap_epoch)
+            if used >= capr:
+                return (
+                    "member_requests_exceeded",
+                    f"Per-user request budget exceeded: {used} of "
+                    f"{capr} {member.get('requests_period') or 'monthly'} "
+                    "model calls for this member.",
+                )
+
+    # Token count — snapshot only (tokens are backend-priced).
+    max_tokens = member.get("max_tokens")
+    if max_tokens is not None:
+        try:
+            capt = int(max_tokens)
+            used_tok = int(member.get("tokens_used") or 0)
+        except (TypeError, ValueError):
+            capt = 0
+            used_tok = 0
+        if capt > 0 and used_tok >= capt:
+            return (
+                "member_tokens_exceeded",
+                f"Per-user token budget exceeded: {used_tok} of "
+                f"{capt} {member.get('tokens_period') or 'monthly'} "
+                "tokens for this member.",
+            )
+
+    return None
+
+
 # ── Snapshot ingestion (sync worker / tests) ────────────────────────
 
 
@@ -270,11 +375,14 @@ def replace_snapshot(payload: dict[str, Any] | None) -> None:
                 agents[str(k).strip().lower()] = v
     org_raw = payload.get("org")
     org = org_raw if isinstance(org_raw, dict) else None
+    member_raw = payload.get("member")
+    member = member_raw if isinstance(member_raw, dict) else None
 
-    global _snap_agents, _snap_org, _snap_epoch
+    global _snap_agents, _snap_org, _snap_epoch, _snap_member
     with _lock:
         _snap_agents = agents
         _snap_org = org
+        _snap_member = member
         _snap_epoch = computed_at
         for dq in _local.values():
             while dq and dq[0] <= computed_at:
@@ -371,11 +479,13 @@ def stop() -> None:
 
 def clear() -> None:
     """Reset all state (tests + ``shutdown``)."""
-    global _snap_agents, _snap_org, _snap_epoch, _warned_no_snapshot
+    global _snap_agents, _snap_org, _snap_epoch, _snap_member
+    global _warned_no_snapshot
     _stop_worker()
     with _lock:
         _snap_agents = {}
         _snap_org = None
+        _snap_member = None
         _snap_epoch = None
         _local.clear()
         _warned_no_snapshot = False

@@ -322,9 +322,13 @@ def _blocked_result(message: str) -> Any:
     try:
         from mcp.types import CallToolResult, TextContent  # type: ignore
 
+        # Construct by the pydantic field name (``is_error``). Current
+        # ``mcp`` sets ``populate_by_name=True`` so the wire alias
+        # ``isError`` still serializes correctly; using the field name
+        # keeps the static type-checker happy across mcp versions.
         return CallToolResult(
             content=[TextContent(type="text", text=message)],
-            isError=True,
+            is_error=True,
         )
     except Exception:  # noqa: BLE001
         raise PermissionError(message) from None

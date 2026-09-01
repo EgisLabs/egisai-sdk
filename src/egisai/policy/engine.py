@@ -518,6 +518,19 @@ def evaluate_policies(
     phase1 = [p for p in request_side if p.type in _DETERMINISTIC_KINDS]
     phase2 = [p for p in request_side if p.type in _LLM_BACKED_KINDS]
 
+    # Per-user (member) budget / limit gate. A platform-level Phase-1
+    # deterministic check, independent of operator-configured policies:
+    # when the calling key's owner is over a per-user budget / request /
+    # token cap (or their access expired), refuse the billed model call
+    # before it leaves the process. Fail-open when no usage snapshot has
+    # arrived (older backend / first seconds after a cap is set). The
+    # inline Gateway is the authoritative real-time hard block; this
+    # covers auto-patch traffic that never touches the Gateway.
+    if "model" in surfaces:
+        member_record = _member_limit_record()
+        if member_record is not None:
+            return _synthesize_decision([member_record])
+
     phase1_matches = _collect_input_matches(phase1, context, semantic_blocker=None)
 
     # A block or a human-approval hold both short-circuit Phase 2:
@@ -1014,6 +1027,27 @@ def _budget_limit_match(
         type="budget_limit",
         verdict="block",
         reason_code="budget_exceeded",
+        message=message,
+    )
+
+
+def _member_limit_record() -> MatchedPolicyRecord | None:
+    """Synthesize a block record when the key owner is over a per-user
+    limit, else ``None``. Never raises — fails open on any error."""
+    try:
+        from egisai.policy import limits
+
+        blocked = limits.member_limit_block()
+    except Exception:  # noqa: BLE001
+        return None
+    if not blocked:
+        return None
+    reason_code, message = blocked
+    return MatchedPolicyRecord(
+        name="Per-user limit",
+        type="member_limit",
+        verdict="block",
+        reason_code=reason_code,
         message=message,
     )
 
