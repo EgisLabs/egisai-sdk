@@ -465,7 +465,7 @@ A row says **enforced** when the SDK can physically prevent the failure mode in 
 What you can rely on for **every row above except Bedrock Agents**:
 
 - A `deny_tool_call` / `deny_mcp_call` / `semantic_guard` verdict on a tool call physically stops the tool from running.
-- A `pii_scan` / `deny_output_regex` / `semantic_guard` verdict on a tool result either masks the result in place (`action="sanitize"`) or refuses it (`action="block"`) before the model is shown it. For Tier 1 + Tier 2 frameworks this happens on the next round trip's input phase; for the Claude Agent SDK it happens at the `PostToolUse` hook so the model never even sees the raw bytes for one turn.
+- A `pii_scan` / `deny_output_regex` / `semantic_guard` verdict on a tool result either masks the result in place (`action="sanitize"`) or refuses it (`action="block"`) before the model is shown it. For Tier 1 + Tier 2 frameworks this happens on the next round trip's input phase; for the Claude Agent SDK it happens at the `PostToolUse` hook so the model never even sees the raw bytes for one turn. Claude's built-in `ToolSearch` catalog dump is not scanned as retrieved content (it is the runtime's own tool list); `Read` / MCP / `Skill` results still are.
 - Input-side policies (PII scan, deny_regex, deny_model, max_prompt_chars, semantic_guard on the prompt) always run before the model is called.
 - Sanitization rewrites the prompt locally before it reaches the provider.
 - **Aggregated OUTPUT replay** — For `claude_agent_sdk`, OUTPUT policies
