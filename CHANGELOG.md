@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.75.1] — 2026-09-02
+
+### Fixed
+
+- Claude Agent SDK `PostToolUse` no longer scans `ToolSearch` catalog
+  dumps with injection / semantic output rules. That payload is the
+  runtime's own deferred-tool list, not retrieved content, and treating
+  it as an instruction-override attack marked recovered runs as
+  Blocked. Real tool results (`Read`, MCP lookups, `Skill`, …) are
+  still scanned.
+
 ## [0.75.0] — 2026-09-01
 
 ### Added

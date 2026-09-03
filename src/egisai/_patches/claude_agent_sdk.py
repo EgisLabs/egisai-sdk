@@ -1004,6 +1004,34 @@ def _hook_response_post_replace(
     return {"hookSpecificOutput": out}
 
 
+# Built-in tools whose *result* is the runtime's own tool catalog
+# (deferred tool definitions), not untrusted retrieved content.
+# Scanning that catalog with ``injection_scan`` / ``semantic_guard``
+# is a category error: a tool list looks like "here are your new
+# instructions" to those detectors, which is exactly how Claude's
+# deferred-tool protocol works. A false-positive block marks the
+# whole Run ``block`` (worst-of-steps) even when the agent recovered
+# and finished the real work.
+#
+# Narrow on purpose. ``Skill``, ``Read``, ``WebFetch``, MCP tools,
+# and ``ListMcpResources`` / ``ReadMcpResource`` return user- or
+# network-authored content and MUST still be scanned. Other
+# frameworks (OpenAI, Anthropic, LangGraph, …) do not expose a
+# ToolSearch catalog tool; they scan real tool results on the next
+# call's input phase, which is the correct untrusted-content surface.
+_CATALOG_RESULT_TOOLS: frozenset[str] = frozenset({"toolsearch"})
+
+
+def _is_first_party_catalog_tool(tool_name: str) -> bool:
+    """True when ``tool_name`` is a first-party deferred-tool catalog.
+
+    Exact built-in name only (case-insensitive). An MCP tool that
+    happens to be named ``ToolSearch`` (``mcp__…__ToolSearch``) is
+    *not* skipped — that is user-authored and still scanned.
+    """
+    return (tool_name or "").strip().lower() in _CATALOG_RESULT_TOOLS
+
+
 def _build_posttooluse_callback(
     *,
     record: IdentityRecord | None,
@@ -1077,6 +1105,13 @@ def _build_posttooluse_callback(
         # name and id; PostToolUse only governs the RESPONSE text.
         # Keeping the closure narrow avoids accidentally including
         # tool args in audit fields where only the result belongs.
+
+        # First-party catalog dump — not attacker-controlled content.
+        # PreToolUse still gates the invocation by name (an operator
+        # ``deny_tool_call`` on ToolSearch still fires). We only skip
+        # scanning the *result*.
+        if _is_first_party_catalog_tool(tool_name):
+            return {}
 
         extracted_text, shape = _extract_tool_response_text(tool_response)
         if not extracted_text:
