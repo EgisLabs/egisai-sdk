@@ -73,6 +73,20 @@ _PHASE_ALIASES = {
 _VALID_SURFACES = ("model", "tool", "mcp")
 
 
+def _parse_semantic_patterns(raw: object) -> tuple[dict[str, str], ...]:
+    if not isinstance(raw, list):
+        return ()
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").strip().lower()
+        text = str(item.get("text") or "").strip()
+        if kind in ("detect", "exclude") and text:
+            out.append({"kind": kind, "text": text})
+    return tuple(out)
+
+
 def _to_rule(d: dict) -> PolicyRule:
     """Wire-shape → ``PolicyRule`` dataclass.
 
@@ -130,6 +144,7 @@ def _to_rule(d: dict) -> PolicyRule:
         phase=phase,
         applies_to=applies_to,
         mcp_server_ids=mcp_server_ids,
+        semantic_patterns=_parse_semantic_patterns(d.get("semantic_patterns")),
     )
 
 

@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -120,6 +121,7 @@ from egisai._patches._common import (
     _safe_text_preview,
     _serialize_matched_policies,
     _stamp_output_block,
+    _stamp_policy_timings,
 )
 from egisai._patches._framework import make_identity, patch_method
 from egisai._run import (
@@ -737,6 +739,7 @@ def _build_pretooluse_callback(
                             surfaces=(
                                 ("mcp",) if mcp_target else ("tool",)
                             ),
+                            hook="PreToolUse",
                         ),
                     )
                 except Exception:  # noqa: BLE001
@@ -816,6 +819,7 @@ def _build_pretooluse_callback(
                     # double-counted governance time.
                     "latency_ms": 0,
                 }
+                _stamp_policy_timings(ev, decision)
                 if hook_init_ms > 0:
                     ev["init_latency_ms"] = hook_init_ms
                 if stamped_input is not None:
@@ -1161,6 +1165,7 @@ def _build_posttooluse_callback(
                                 if tool_name.startswith("mcp__")
                                 else ("tool",)
                             ),
+                            hook="PostToolUse",
                         ),
                     )
                 except Exception:  # noqa: BLE001
@@ -1177,7 +1182,25 @@ def _build_posttooluse_callback(
                     # already emitted one for this tool, and the
                     # common path stays cheap (no extra audit churn
                     # for the 99% case where the tool result is
-                    # PII-free).
+                    # PII-free). Timings still go to the structured
+                    # log so Phase 0 can measure this hook without
+                    # a Requests row. Never include raw text.
+                    LOGGER.info(
+                        "egisai.policy_timings %s",
+                        json.dumps(
+                            {
+                                "hook": "PostToolUse",
+                                "semantic_in_scope": int(
+                                    decision.semantic_in_scope or 0
+                                ),
+                                "policy_timings": [
+                                    t.as_dict()
+                                    for t in decision.policy_timings
+                                ],
+                            },
+                            separators=(",", ":"),
+                        ),
+                    )
                     return {}
 
                 # Verdict is sanitize or block — emit an audit step
@@ -1261,6 +1284,7 @@ def _build_posttooluse_callback(
                     "latency_ms": 0,
                     "response_decision": _decision_block(decision),
                 }
+                _stamp_policy_timings(ev, decision)
                 if hook_init_ms > 0:
                     ev["init_latency_ms"] = hook_init_ms
                 if decision.verdict == "block":
@@ -1845,6 +1869,7 @@ def _dispatch_tool_call_step(
                 stream=True,
                 # Single-surface advisory row for one tool call.
                 surfaces=(("mcp",) if mcp_target else ("tool",)),
+                hook="tool_call",
             )
         )
     except Exception:  # noqa: BLE001
@@ -1866,6 +1891,7 @@ def _dispatch_tool_call_step(
 
     if decision is not None:
         ev["response_decision"] = _decision_block(decision)
+        _stamp_policy_timings(ev, decision)
         if decision.verdict == "block":
             ev["verdict"] = "block"
             ev["reason_code"] = decision.reason_code
@@ -2159,6 +2185,7 @@ def _run_output_phase(
                 tool_calls=tool_calls,
                 mcp_targets=mcp_targets,
                 stream=stream,
+                hook="response",
             )
         )
     except Exception:  # noqa: BLE001
@@ -2181,6 +2208,7 @@ def _run_output_phase(
     ev["policy_tokens_out"] = int(ev.get("policy_tokens_out") or 0) + max(
         0, cur_pol_out - prev_pol_out
     )
+    _stamp_policy_timings(ev, decision, concatenate=True)
 
     # Enforcement honesty for auditors (SOC 2 / ISO):
     # Output evaluation runs here at ``ResultMessage`` — after every

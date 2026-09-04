@@ -52,6 +52,8 @@ def _legacy_engine_baseline(monkeypatch: pytest.MonkeyPatch) -> None:
     that proves the two walks agree.
     """
     monkeypatch.setenv("EGISAI_FAST_GOVERNANCE", "off")
+    monkeypatch.setenv("EGISAI_SEMANTIC_ENGINE", "judge")
+    monkeypatch.delenv("EGISAI_SEMANTIC_SHADOW", raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -106,6 +108,10 @@ def reset_sdk() -> Iterator[None]:
     from egisai.policy import limits
 
     limits.clear()
+
+    from egisai.policy import semantic_local
+
+    semantic_local.reset_for_tests()
 
     # The init module also caches whether it's been called via _CONFIG; the
     # logger module's queue persists between tests, so we drain it.

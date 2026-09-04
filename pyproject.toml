@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "egisai"
-version = "0.75.1"
+version = "0.76.0"
 description = "Native runtime governance SDK for AI agents — import egisai; egisai.init() and you're protected."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -78,6 +78,13 @@ dependencies = [
   # the Presidio NER analyzer fails to load on first ``init()``.
   # Pinning click directly closes that gap until spaCy adapts.
   "click>=8.0",
+  # MiniLM local gate for semantic_guard (allow-only first stage).
+  # ~60 MB extra install. The engine default stays ``judge`` until
+  # a later release flips to ``cascade``; without these wheels the
+  # gate simply never loads and every evaluation stays on the LLM
+  # judge. No auto-download of model weights on ``init()``.
+  "onnxruntime>=1.17.0",
+  "tokenizers>=0.15.0",
 ]
 
 [project.optional-dependencies]
@@ -94,13 +101,10 @@ anthropic = ["anthropic>=0.40.0"]
 # package. The two extras are independent and can be combined.
 google = ["google-genai>=1.0.0"]
 google-legacy = ["google-generativeai>=0.8.0"]
-# Enables ``EGISAI_NER_ENGINE=ettin``: swaps spaCy NER for an ONNX
-# transformer fine-tuned on Nvidia's Nemotron-PII corpus. Measured on
-# a 27k-character source file: 27 false positives (spaCy) → 0, and it
-# additionally catches lowercase and non-English names. Deliberately
-# an extra, not a runtime dependency — onnxruntime is ~60 MB and the
-# default install must stay lean; the engine is opt-in via env var
-# even when installed, per sdk-design-philosophy.mdc.
+# Enables ``EGISAI_NER_ENGINE=ettin``. onnxruntime + tokenizers are
+# now default runtime deps (MiniLM semantic gate); this extra stays
+# as an alias so existing ``pip install egisai[fast-ner]`` lines
+# keep resolving.
 fast-ner = ["onnxruntime>=1.17.0", "tokenizers>=0.15.0"]
 all = [
   "openai>=1.40.0",

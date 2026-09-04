@@ -10,6 +10,7 @@ import contextvars
 import json
 import logging
 import re
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -76,6 +77,10 @@ class PolicyRule:
     # When non-empty, the MCP-server gate only applies this rule to
     # the listed server UUIDs. Has no effect on agent-side evaluation.
     mcp_server_ids: tuple[str, ...] = field(default=())
+    # Detect/exclude example sentences for the local MiniLM gate.
+    # Empty ⇒ fail open to the LLM judge. Wire sibling field, not
+    # inside ``config``.
+    semantic_patterns: tuple[dict[str, str], ...] = field(default=())
 
 
 @dataclass(frozen=True)
@@ -96,6 +101,11 @@ class PolicyContext:
     prompt_chars: int
     stream: bool
     agent_id: str = ""
+    # Call-site label for per-policy latency rows (``model``,
+    # ``PreToolUse``, ``PostToolUse``, ``response``, …). Empty when
+    # the caller did not set it. Appended with a default so existing
+    # constructions keep compiling unchanged.
+    hook: str = ""
 
 
 @dataclass(frozen=True)
@@ -137,6 +147,10 @@ class OutputPolicyContext:
     user_role: str = ""
     end_user_id: str = ""
     user_id: str = ""
+    # Same contract as ``PolicyContext.hook`` — which output-side
+    # call site ran this evaluation. Default empty so every existing
+    # construction keeps compiling.
+    hook: str = ""
 
 
 @dataclass(frozen=True)
@@ -168,6 +182,30 @@ class MatchedPolicyRecord:
 
 
 @dataclass(frozen=True)
+class PolicyTiming:
+    """Wall-clock cost of evaluating one rule on one hook.
+
+    Recorded even when the rule allows (no ``MatchedPolicyRecord``),
+    so a per-policy latency baseline is not silently missing on the
+    common path. ``ms`` is milliseconds with sub-ms fractions.
+    ``hook`` is the call site (``model``, ``PreToolUse``, …).
+    """
+
+    type: str
+    name: str
+    hook: str
+    ms: float
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "type": self.type,
+            "name": self.name,
+            "hook": self.hook,
+            "ms": self.ms,
+        }
+
+
+@dataclass(frozen=True)
 class PolicyDecision:
     """Outcome of running the policy engine on one call.
 
@@ -192,6 +230,13 @@ class PolicyDecision:
     ``approval_detail`` is a short human-readable phrase describing
     what needs approving (e.g. ``"$25,000 transfer via wire_send"``);
     only set when ``verdict == "pending_approval"``.
+
+    ``policy_timings`` is additive instrumentation: one row per rule
+    that actually ran, including allows. Empty when the caller
+    constructed a decision without going through the engine.
+    ``semantic_in_scope`` is how many ``semantic_guard`` rules were
+    in the Phase 2 set for this evaluation (0 when Phase 2 did not
+    run).
     """
     verdict: str
     reason_code: str | None
@@ -201,6 +246,8 @@ class PolicyDecision:
     sanitize_types: list[str] = field(default_factory=list)
     sanitize_mask_char: str = "#"
     approval_detail: str | None = None
+    policy_timings: tuple[PolicyTiming, ...] = ()
+    semantic_in_scope: int = 0
 
     @property
     def sanitize_kinds(self) -> list[str]:
@@ -217,6 +264,8 @@ class PolicyDecision:
         cls,
         *,
         matched_policies: tuple[MatchedPolicyRecord, ...] = (),
+        policy_timings: tuple[PolicyTiming, ...] = (),
+        semantic_in_scope: int = 0,
     ) -> PolicyDecision:
         """The call proceeds.
 
@@ -232,6 +281,8 @@ class PolicyDecision:
             message=None,
             matched_policy=None,
             matched_policies=matched_policies,
+            policy_timings=policy_timings,
+            semantic_in_scope=semantic_in_scope,
         )
 
     @classmethod
@@ -242,6 +293,8 @@ class PolicyDecision:
         message: str,
         matched_policy: str,
         matched_policies: tuple[MatchedPolicyRecord, ...] = (),
+        policy_timings: tuple[PolicyTiming, ...] = (),
+        semantic_in_scope: int = 0,
     ) -> PolicyDecision:
         return cls(
             verdict="block",
@@ -249,6 +302,8 @@ class PolicyDecision:
             message=message,
             matched_policy=matched_policy,
             matched_policies=matched_policies,
+            policy_timings=policy_timings,
+            semantic_in_scope=semantic_in_scope,
         )
 
     @classmethod
@@ -262,6 +317,8 @@ class PolicyDecision:
         mask_char: str = "#",
         matched_policies: tuple[MatchedPolicyRecord, ...] = (),
         kinds: list[str] | None = None,
+        policy_timings: tuple[PolicyTiming, ...] = (),
+        semantic_in_scope: int = 0,
     ) -> PolicyDecision:
         """The call should forward, but with these PII types masked.
 
@@ -283,6 +340,8 @@ class PolicyDecision:
             matched_policies=matched_policies,
             sanitize_types=list(types or []),
             sanitize_mask_char=mask_char or "#",
+            policy_timings=policy_timings,
+            semantic_in_scope=semantic_in_scope,
         )
 
     @classmethod
@@ -294,6 +353,8 @@ class PolicyDecision:
         matched_policy: str,
         matched_policies: tuple[MatchedPolicyRecord, ...] = (),
         approval_detail: str | None = None,
+        policy_timings: tuple[PolicyTiming, ...] = (),
+        semantic_in_scope: int = 0,
     ) -> PolicyDecision:
         """The call must be held for human approval before it proceeds.
 
@@ -309,6 +370,8 @@ class PolicyDecision:
             matched_policy=matched_policy,
             matched_policies=matched_policies,
             approval_detail=approval_detail,
+            policy_timings=policy_timings,
+            semantic_in_scope=semantic_in_scope,
         )
 
 
@@ -537,7 +600,10 @@ def evaluate_policies(
     # there is no point spending an LLM judge round-trip (or leaking
     # the prompt to it) on a call we are already refusing or pausing.
     if phase1_matches.has_block or phase1_matches.has_pending:
-        return _synthesize_decision(phase1_matches.records)
+        return _synthesize_decision(
+            phase1_matches.records,
+            timings=phase1_matches.timings,
+        )
 
     text_for_phase2 = context.prompt_text
     if phase1_matches.has_sanitize:
@@ -551,17 +617,19 @@ def evaluate_policies(
     # after PII masking, only when the local pre-filter did not already
     # block — so obvious attacks are refused locally for free and the
     # classifier only sees data-clean, ambiguous text. Fail-open.
-    injection_records = _collect_injection_escalation(
+    injection_matches = _collect_injection_escalation(
         request_side,
         already_recorded={r.name for r in phase1_matches.records},
         text=text_for_phase2,
         injection_blocker=injection_blocker,
         reason_code="injection_detected",
+        hook=context.hook,
     )
 
     if not phase2:
         return _synthesize_decision(
-            phase1_matches.records + injection_records
+            phase1_matches.records + injection_matches.records,
+            timings=phase1_matches.timings + injection_matches.timings,
         )
 
     phase2_ctx = PolicyContext(
@@ -571,6 +639,7 @@ def evaluate_policies(
         prompt_chars=len(text_for_phase2),
         stream=context.stream,
         agent_id=context.agent_id,
+        hook=context.hook,
     )
     # Fast-governance dispatch (see ``egisai.policy.fastpath``).
     # ``off`` keeps the release-tested legacy walk byte-identical.
@@ -588,14 +657,16 @@ def evaluate_policies(
             tool_calls=None,
             semantic_blocker=semantic_blocker,
             side="prompt",
+            hook=context.hook,
         )
         # Any future non-mergeable LLM-backed kind still runs, via
         # the legacy walker, in every mode.
         if other2:
-            for rec in _collect_input_matches(
-                other2, phase2_ctx, semantic_blocker=semantic_blocker
-            ).records:
-                phase2_matches.add(rec)
+            phase2_matches.absorb(
+                _collect_input_matches(
+                    other2, phase2_ctx, semantic_blocker=semantic_blocker
+                )
+            )
     else:
         phase2_matches = _collect_input_matches(
             phase2, phase2_ctx, semantic_blocker=semantic_blocker
@@ -611,7 +682,15 @@ def evaluate_policies(
             )
 
     return _synthesize_decision(
-        phase1_matches.records + injection_records + phase2_matches.records
+        phase1_matches.records
+        + injection_matches.records
+        + phase2_matches.records,
+        timings=(
+            phase1_matches.timings
+            + injection_matches.timings
+            + phase2_matches.timings
+        ),
+        semantic_in_scope=len(sem2),
     )
 
 
@@ -625,7 +704,8 @@ def _collect_injection_escalation(
     text: str,
     injection_blocker: InjectionBlocker | None,
     reason_code: str,
-) -> list[MatchedPolicyRecord]:
+    hook: str = "",
+) -> _PhaseMatches:
     """Escalate ``injection_scan`` rules to the platform smart tier.
 
     Called once per evaluation, after Phase 1, for every ``injection_scan``
@@ -643,27 +723,29 @@ def _collect_injection_escalation(
     configured) this is a no-op and the SDK runs on the local tier
     alone — the documented best-effort posture.
     """
+    out = _PhaseMatches()
     if injection_blocker is None or not text:
-        return []
+        return out
     inj_policies = [
         p
         for p in policies
         if p.type == "injection_scan" and p.name not in already_recorded
     ]
     if not inj_policies:
-        return []
+        return out
 
-    records: list[MatchedPolicyRecord] = []
     for policy in inj_policies:
         config = policy.config or {}
         action = str(config.get("action") or "flag").strip().lower()
         if action not in _INJECTION_ACTIONS:
             action = "flag"
+        started = time.monotonic()
         try:
             match = injection_blocker.check(text, config)
         except Exception:  # noqa: BLE001 — fail open, never break the call
             LOGGER.debug("injection escalation raised", exc_info=True)
             match = None
+        out.add_timing(_timing_for(policy, hook, started))
         if match is None:
             continue
         label = (match.cls or "prompt injection").replace("_", " ")
@@ -673,7 +755,7 @@ def _collect_injection_escalation(
             if action == "block"
             else f"Possible prompt injection in this content ({detail})."
         )
-        records.append(
+        out.add(
             MatchedPolicyRecord(
                 name=policy.name,
                 type="injection_scan",
@@ -683,7 +765,7 @@ def _collect_injection_escalation(
                 or default_message,
             )
         )
-    return records
+    return out
 
 
 # ── Internal: phase-walking + decision synthesis ───────────────────────
@@ -695,6 +777,7 @@ class _PhaseMatches:
     records: list[MatchedPolicyRecord] = field(default_factory=list)
     sanitize_types: list[str] = field(default_factory=list)  # union, ordered
     sanitize_mask_char: str = "#"
+    timings: list[PolicyTiming] = field(default_factory=list)
 
     @property
     def has_block(self) -> bool:
@@ -718,6 +801,63 @@ class _PhaseMatches:
                 r.verdict == "sanitize" for r in self.records[:-1]
             ):
                 self.sanitize_mask_char = rec.sanitize_mask_char
+
+    def add_timing(self, timing: PolicyTiming) -> None:
+        self.timings.append(timing)
+
+    def absorb(self, other: _PhaseMatches) -> None:
+        """Append another walk's records and timings, preserving order."""
+        for rec in other.records:
+            self.add(rec)
+        self.timings.extend(other.timings)
+
+
+def _timing_for(policy: PolicyRule, hook: str, started: float) -> PolicyTiming:
+    """One timing row from a ``time.monotonic()`` start mark."""
+    return PolicyTiming(
+        type=str(policy.type),
+        name=str(policy.name),
+        hook=hook,
+        ms=round((time.monotonic() - started) * 1000.0, 3),
+    )
+
+
+def _timed_input_policy(
+    policy: PolicyRule,
+    context: PolicyContext,
+    semantic_blocker: SemanticBlocker | None,
+) -> tuple[MatchedPolicyRecord | None, PolicyTiming]:
+    started = time.monotonic()
+    rec = _evaluate_one_input_policy(policy, context, semantic_blocker)
+    return rec, _timing_for(policy, context.hook, started)
+
+
+def _timed_output_policy(
+    policy: PolicyRule,
+    context: OutputPolicyContext,
+    semantic_blocker: SemanticBlocker | None,
+) -> tuple[MatchedPolicyRecord | None, PolicyTiming]:
+    started = time.monotonic()
+    rec = _evaluate_one_output_policy(policy, context, semantic_blocker)
+    return rec, _timing_for(policy, context.hook, started)
+
+
+def _collect_timed_results(
+    out: _PhaseMatches,
+    results: list[Any],
+) -> None:
+    """Unpack fan-out ``(record, timing)`` pairs onto ``out``.
+
+    A raising task yields ``None`` from ``_fan_out``; skip it so one
+    failed rule does not drop the rest of the walk's timings.
+    """
+    for item in results:
+        if item is None:
+            continue
+        rec, timing = item
+        out.add_timing(timing)
+        if rec is not None:
+            out.add(rec)
 
 
 def _collect_input_matches(
@@ -749,7 +889,10 @@ def _collect_input_matches(
     out = _PhaseMatches()
     if semantic_blocker is None or len(policies) < 2:
         for policy in policies:
-            rec = _evaluate_one_input_policy(policy, context, semantic_blocker)
+            rec, timing = _timed_input_policy(
+                policy, context, semantic_blocker
+            )
+            out.add_timing(timing)
             if rec is not None:
                 out.add(rec)
         return out
@@ -761,9 +904,7 @@ def _collect_input_matches(
         ],
         max_workers=_judge_budget.get(),
     )
-    for rec in results:
-        if rec is not None:
-            out.add(rec)
+    _collect_timed_results(out, results)
     return out
 
 
@@ -771,15 +912,15 @@ def _bind_input_policy(
     policy: PolicyRule,
     context: PolicyContext,
     semantic_blocker: SemanticBlocker | None,
-) -> Callable[[], MatchedPolicyRecord | None]:
+) -> Callable[[], tuple[MatchedPolicyRecord | None, PolicyTiming]]:
     """Freeze one prompt-side evaluation into a zero-arg callable.
 
     A named factory rather than an inline ``lambda`` in a
     comprehension — the loop variable would otherwise be captured by
     reference and every task would evaluate the *last* policy.
     """
-    def run() -> MatchedPolicyRecord | None:
-        return _evaluate_one_input_policy(policy, context, semantic_blocker)
+    def run() -> tuple[MatchedPolicyRecord | None, PolicyTiming]:
+        return _timed_input_policy(policy, context, semantic_blocker)
 
     return run
 
@@ -1054,6 +1195,9 @@ def _member_limit_record() -> MatchedPolicyRecord | None:
 
 def _synthesize_decision(
     records: list[MatchedPolicyRecord],
+    *,
+    timings: list[PolicyTiming] | tuple[PolicyTiming, ...] = (),
+    semantic_in_scope: int = 0,
 ) -> PolicyDecision:
     """Roll a list of matches up into a single ``PolicyDecision``.
 
@@ -1067,9 +1211,17 @@ def _synthesize_decision(
     of an allow decision so the finding reaches the audit row, which
     is the only reason an operator would set a rule to flag rather
     than block.
+
+    ``timings`` and ``semantic_in_scope`` are additive instrumentation
+    and do not change the verdict.
     """
+    stamped = tuple(timings)
+
     if not records:
-        return PolicyDecision.allow()
+        return PolicyDecision.allow(
+            policy_timings=stamped,
+            semantic_in_scope=semantic_in_scope,
+        )
 
     blocks = [r for r in records if r.verdict == "block"]
     if blocks:
@@ -1079,6 +1231,8 @@ def _synthesize_decision(
             message=primary.message,
             matched_policy=primary.name,
             matched_policies=tuple(records),
+            policy_timings=stamped,
+            semantic_in_scope=semantic_in_scope,
         )
 
     # Human-in-the-loop hold. Sits below ``block`` (a hard block
@@ -1095,6 +1249,8 @@ def _synthesize_decision(
             matched_policy=primary.name,
             matched_policies=tuple(records),
             approval_detail=primary.message,
+            policy_timings=stamped,
+            semantic_in_scope=semantic_in_scope,
         )
 
     sanitizes = [r for r in records if r.verdict == "sanitize"]
@@ -1112,9 +1268,15 @@ def _synthesize_decision(
             message=primary.message,
             matched_policy=primary.name,
             matched_policies=tuple(records),
+            policy_timings=stamped,
+            semantic_in_scope=semantic_in_scope,
         )
 
-    return PolicyDecision.allow(matched_policies=tuple(records))
+    return PolicyDecision.allow(
+        matched_policies=tuple(records),
+        policy_timings=stamped,
+        semantic_in_scope=semantic_in_scope,
+    )
 
 
 def _semantic_guard_match(
@@ -1168,6 +1330,15 @@ def _semantic_guard_match(
     if semantic_blocker is None:
         return None
 
+    from egisai.policy import semantic_local
+
+    windowed = fastpath.window_text(text) if text else ""
+    tool_texts = list(_unique_tool_sentences(tool_calls).keys())
+    if semantic_local.should_skip_judge(
+        policy, text=windowed, tool_texts=tool_texts
+    ):
+        return None
+
     targets_raw = policy.config.get("targets")
     if isinstance(targets_raw, list) and targets_raw:
         targets = [str(t) for t in targets_raw if isinstance(t, str)]
@@ -1180,7 +1351,7 @@ def _semantic_guard_match(
     # Phase A — text target. Kept verbatim from the pre-0.24 path
     # so existing rules (no ``targets`` field) cannot regress.
     if "text" in targets and text:
-        match = semantic_blocker.check(text, policy.config)
+        match = semantic_blocker.check(text, _judge_config(policy))
         if match is not None:
             return MatchedPolicyRecord(
                 name=policy.name,
@@ -1254,7 +1425,7 @@ def _semantic_guard_match(
         # turns hit this path.
         if len(normalized) == 1:
             name, synthesized = normalized[0]
-            match = semantic_blocker.check(synthesized, policy.config)
+            match = semantic_blocker.check(synthesized, _judge_config(policy))
             if match is None:
                 return None
             return MatchedPolicyRecord(
@@ -1280,7 +1451,9 @@ def _semantic_guard_match(
         # policies above us.
         results = _fan_out(
             [
-                _bind_tool_judge(semantic_blocker, synthesized, policy.config)
+                _bind_tool_judge(
+                    semantic_blocker, synthesized, _judge_config(policy)
+                )
                 for _, synthesized in normalized
             ],
             max_workers=_judge_budget.get(),
@@ -1413,6 +1586,26 @@ def _fan_out(
         return out
 
 
+def _unique_tool_sentences(
+    tool_calls: list[dict[str, Any]] | None,
+) -> dict[str, str]:
+    """Dedup synthesized tool-call sentences. First name wins."""
+    seen: dict[str, str] = {}
+    for tc in tool_calls or []:
+        if not isinstance(tc, dict):
+            continue
+        name = tc.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        args = tc.get("input")
+        if args is None:
+            args = tc.get("arguments")
+        synthesized = _synthesize_tool_call_text(name, args)
+        if synthesized and synthesized not in seen:
+            seen[synthesized] = name
+    return seen
+
+
 def _synthesize_tool_call_text(name: str, args: Any) -> str:
     """Render a tool call as a sentence the judge can intent-classify.
 
@@ -1496,6 +1689,34 @@ def _threshold_group_key(policy: PolicyRule) -> str:
     return repr(policy.config.get("threshold"))
 
 
+def _wire_patterns(raw: Any) -> list[dict[str, str]]:
+    """kind+text only — never persist, never put inside ``policies.config``."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").strip()
+        text = str(item.get("text") or "").strip()
+        if kind and text:
+            out.append({"kind": kind, "text": text})
+    return out
+
+
+def _judge_config(policy: PolicyRule) -> dict[str, Any]:
+    """Transient overlay of sibling ``semantic_patterns`` onto check config.
+
+    Patterns are not stored in ``policy.config``. The HTTP judge and
+    the in-process blocker read them from this copy only.
+    """
+    cfg = dict(policy.config)
+    pats = _wire_patterns(policy.semantic_patterns)
+    if pats:
+        cfg["semantic_patterns"] = pats
+    return cfg
+
+
 def _merged_judge_config(group: list[PolicyRule]) -> dict[str, Any]:
     """One judge-call config carrying the group's union intent list.
 
@@ -1503,6 +1724,11 @@ def _merged_judge_config(group: list[PolicyRule]) -> dict[str, Any]:
     judge's prompt lists intents in the same relative order operators
     see on the dashboard. The shared threshold (identical across the
     group by construction) rides along verbatim.
+
+    Pattern groups stay per-policy so Cloud Run MiniLM can skip the
+    LLM only when every remaining policy would local-allow. Unioning
+    detect/exclude across policies would let one policy's exclude
+    cancel another's detect.
     """
     union: dict[str, None] = {}
     for policy in group:
@@ -1512,6 +1738,9 @@ def _merged_judge_config(group: list[PolicyRule]) -> dict[str, Any]:
     threshold = group[0].config.get("threshold")
     if threshold is not None:
         cfg["threshold"] = threshold
+    groups = [_wire_patterns(p.semantic_patterns) for p in group]
+    if any(groups):
+        cfg["semantic_pattern_groups"] = groups
     return cfg
 
 
@@ -1629,24 +1858,7 @@ def _fast_judge_questions(
         p for p in active if "tool_calls" in _semantic_targets(p)
     ] if tool_calls else []
     if tool_policies:
-        # Normalize + dedup by synthesized sentence. Two byte-equal
-        # questions have one answer; asking twice (per duplicate tool
-        # call, and again per policy) was pure latency. First tool
-        # name wins the audit label, matching the legacy walk's
-        # first-match-by-input-order semantics.
-        seen: dict[str, str] = {}
-        for tc in tool_calls or []:
-            if not isinstance(tc, dict):
-                continue
-            name = tc.get("name")
-            if not isinstance(name, str) or not name:
-                continue
-            args = tc.get("input")
-            if args is None:
-                args = tc.get("arguments")
-            synthesized = _synthesize_tool_call_text(name, args)
-            if synthesized and synthesized not in seen:
-                seen[synthesized] = name
+        seen = _unique_tool_sentences(tool_calls)
         for synthesized, name in seen.items():
             for group in _grouped(tool_policies):
                 questions.append(
@@ -1690,6 +1902,7 @@ def _collect_semantic_fast(
     tool_calls: list[dict[str, Any]] | None,
     semantic_blocker: SemanticBlocker | None,
     side: str,
+    hook: str = "",
 ) -> _PhaseMatches:
     """Merged-question Phase-2 walk. Enforcement path of fast mode.
 
@@ -1708,8 +1921,45 @@ def _collect_semantic_fast(
     * Text questions are windowed via ``fastpath.window_text``; tool
       questions are deduped by their synthesized sentence (a repeated
       tool call is the same question — asked once).
+
+    Timing: one row per in-scope policy; ``ms`` is the wall clock of
+    this merged walk (shared), not a per-policy slice.
     """
     out = _PhaseMatches()
+    started = time.monotonic()
+    try:
+        return _collect_semantic_fast_body(
+            out,
+            policies,
+            text=text,
+            tool_calls=tool_calls,
+            semantic_blocker=semantic_blocker,
+            side=side,
+            hook=hook,
+        )
+    finally:
+        elapsed = round((time.monotonic() - started) * 1000.0, 3)
+        for policy in policies:
+            out.add_timing(
+                PolicyTiming(
+                    type=str(policy.type),
+                    name=str(policy.name),
+                    hook=hook,
+                    ms=elapsed,
+                )
+            )
+
+
+def _collect_semantic_fast_body(
+    out: _PhaseMatches,
+    policies: list[PolicyRule],
+    *,
+    text: str,
+    tool_calls: list[dict[str, Any]] | None,
+    semantic_blocker: SemanticBlocker | None,
+    side: str,
+    hook: str = "",
+) -> _PhaseMatches:
     if semantic_blocker is None:
         return out
 
@@ -1717,10 +1967,32 @@ def _collect_semantic_fast(
     if not active:
         return out
 
+    from egisai.policy import semantic_local
+
+    windowed = fastpath.window_text(text) if text else ""
+    tool_texts = list(_unique_tool_sentences(tool_calls).keys())
+    active, observations = semantic_local.filter_escalations(
+        active, text=windowed, tool_texts=tool_texts
+    )
+    judge_started = time.monotonic()
+
     questions = _fast_judge_questions(
         active, text=text, tool_calls=tool_calls
     )
     if not questions:
+        judge_ms = round((time.monotonic() - judge_started) * 1000.0, 3)
+        if observations and semantic_local.shadow_enabled():
+            hashed = semantic_local.sha256_text(
+                windowed + "\n" + "\n".join(tool_texts)
+            )
+            semantic_local.emit_shadow(
+                observations,
+                matched_names=set(),
+                hook=hook,
+                text_sha256=hashed,
+                semantic_in_scope=len(policies),
+                judge_ms=judge_ms,
+            )
         return out
 
     tasks: list[Callable[[], Any]] = [
@@ -1777,6 +2049,19 @@ def _collect_semantic_fast(
                     ),
                 )
             )
+    if observations and semantic_local.shadow_enabled():
+        judge_ms = round((time.monotonic() - judge_started) * 1000.0, 3)
+        hashed = semantic_local.sha256_text(
+            windowed + "\n" + "\n".join(tool_texts)
+        )
+        semantic_local.emit_shadow(
+            observations,
+            matched_names={r.name for r in out.records},
+            hook=hook,
+            text_sha256=hashed,
+            semantic_in_scope=len(policies),
+            judge_ms=judge_ms,
+        )
     return out
 
 
@@ -2204,24 +2489,29 @@ def evaluate_output_policies(
     # construction — but the ``has_block`` guard here mirrors the
     # prompt side regardless, so the contract reads identically.
     if phase1_matches.has_block or phase1_matches.has_pending:
-        return _synthesize_decision(phase1_matches.records)
+        return _synthesize_decision(
+            phase1_matches.records,
+            timings=phase1_matches.timings,
+        )
 
     # Prompt-injection smart tier on the response side — the indirect
     # injection surface (fetched pages, tool results). Same contract as
     # the request side: escalate only rules the local pre-filter didn't
     # already fire, mirror the semantic path's use of ``context.text``,
     # and fail open.
-    injection_records = _collect_injection_escalation(
+    injection_matches = _collect_injection_escalation(
         response_side,
         already_recorded={r.name for r in phase1_matches.records},
         text=context.text,
         injection_blocker=injection_blocker,
         reason_code="injection_in_output",
+        hook=context.hook,
     )
 
     if not phase2:
         return _synthesize_decision(
-            phase1_matches.records + injection_records
+            phase1_matches.records + injection_matches.records,
+            timings=phase1_matches.timings + injection_matches.timings,
         )
 
     # Fast-governance dispatch — mirror of the input side; see
@@ -2236,14 +2526,16 @@ def evaluate_output_policies(
             tool_calls=context.tool_calls,
             semantic_blocker=semantic_blocker,
             side="output",
+            hook=context.hook,
         )
         # Any future non-mergeable LLM-backed kind still runs, via
         # the legacy walker, in every mode.
         if other2:
-            for rec in _collect_output_matches(
-                other2, context, semantic_blocker=semantic_blocker
-            ).records:
-                phase2_matches.add(rec)
+            phase2_matches.absorb(
+                _collect_output_matches(
+                    other2, context, semantic_blocker=semantic_blocker
+                )
+            )
     else:
         phase2_matches = _collect_output_matches(
             phase2, context, semantic_blocker=semantic_blocker
@@ -2259,7 +2551,15 @@ def evaluate_output_policies(
             )
 
     return _synthesize_decision(
-        phase1_matches.records + injection_records + phase2_matches.records
+        phase1_matches.records
+        + injection_matches.records
+        + phase2_matches.records,
+        timings=(
+            phase1_matches.timings
+            + injection_matches.timings
+            + phase2_matches.timings
+        ),
+        semantic_in_scope=len(sem2),
     )
 
 
@@ -2284,7 +2584,10 @@ def _collect_output_matches(
     out = _PhaseMatches()
     if semantic_blocker is None or len(policies) < 2:
         for policy in policies:
-            rec = _evaluate_one_output_policy(policy, context, semantic_blocker)
+            rec, timing = _timed_output_policy(
+                policy, context, semantic_blocker
+            )
+            out.add_timing(timing)
             if rec is not None:
                 out.add(rec)
         return out
@@ -2296,9 +2599,7 @@ def _collect_output_matches(
         ],
         max_workers=_judge_budget.get(),
     )
-    for rec in results:
-        if rec is not None:
-            out.add(rec)
+    _collect_timed_results(out, results)
     return out
 
 
@@ -2306,14 +2607,14 @@ def _bind_output_policy(
     policy: PolicyRule,
     context: OutputPolicyContext,
     semantic_blocker: SemanticBlocker | None,
-) -> Callable[[], MatchedPolicyRecord | None]:
+) -> Callable[[], tuple[MatchedPolicyRecord | None, PolicyTiming]]:
     """Freeze one response-side evaluation into a zero-arg callable.
 
     Sibling of ``_bind_input_policy``; see it for why this isn't a
     ``lambda`` inside the comprehension.
     """
-    def run() -> MatchedPolicyRecord | None:
-        return _evaluate_one_output_policy(policy, context, semantic_blocker)
+    def run() -> tuple[MatchedPolicyRecord | None, PolicyTiming]:
+        return _timed_output_policy(policy, context, semantic_blocker)
 
     return run
 

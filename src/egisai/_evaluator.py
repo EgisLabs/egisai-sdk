@@ -329,6 +329,11 @@ class InputCall:
     # rule's ``applies_to`` scope. The default is a model-call
     # prompt; per-tool and MCP gates narrow it.
     surfaces: tuple[str, ...] = ("model",)
+    # Call-site label copied onto ``PolicyContext.hook`` and the
+    # per-rule timing rows. Default matches the common auto-patch
+    # model-call path. Optional so every existing constructor keeps
+    # compiling.
+    hook: str = "model"
 
 
 @dataclass(frozen=True)
@@ -360,6 +365,10 @@ class OutputCall:
     # claude_agent_sdk per-tool hooks pass ``("tool",)`` /
     # ``("mcp",)`` and the MCP-server gate passes ``("mcp",)``.
     surfaces: tuple[str, ...] = ("model", "tool", "mcp")
+    # Same contract as ``InputCall.hook``. Default is the post-model
+    # response path; tool / MCP gates override (``PreToolUse``,
+    # ``PostToolUse``, ``mcp``).
+    hook: str = "response"
 
 
 # ── Phase 0: operator pause / resume gate ───────────────────────────
@@ -574,6 +583,7 @@ def evaluate(call: InputCall) -> PolicyDecision:
         prompt_chars=len(call.prompt_text),
         stream=call.stream,
         agent_id=agent_id,
+        hook=call.hook,
     )
     blocker = _get_semantic_blocker() if _has_semantic_rule(rules) else None
     inj_blocker = (
@@ -638,6 +648,7 @@ def evaluate_output(call: OutputCall) -> PolicyDecision:
         user_role=identity.user_role or "",
         end_user_id=identity.end_user_id or "",
         user_id=identity.user_id or "",
+        hook=call.hook,
     )
     blocker = _get_semantic_blocker() if _has_semantic_rule(rules) else None
     inj_blocker = (

@@ -15,6 +15,7 @@ from egisai.policy.engine import (
     PolicyContext,
     PolicyDecision,
     PolicyRule,
+    PolicyTiming,
     evaluate_output_policies,
     evaluate_policies,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "PolicyContext",
     "PolicyDecision",
     "PolicyRule",
+    "PolicyTiming",
     "Sanitization",
     "evaluate_output_policies",
     "evaluate_policies",

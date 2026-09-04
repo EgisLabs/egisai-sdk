@@ -49,6 +49,8 @@ bidirectional hook protocol; no real Node CLI involved.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import sys
 import types
 from collections.abc import AsyncIterator, Iterator
@@ -833,14 +835,17 @@ def test_opaque_dict_tool_response_serialized_and_replaced(
 
 def test_allow_path_no_substitution_no_extra_step(
     fake_claude: tuple[Any, type, types.ModuleType],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """When the PostToolUse evaluator returns allow (no PII / no
     matching rule), the callback MUST return ``{}`` so the SDK
     passes the original response through unchanged, AND it MUST
     NOT emit a tool_result step row (avoids audit churn for the
-    99% allow path)."""
+    99% allow path). Timings still land on a structured log with
+    no raw tool-result text."""
     fake_backend, client_cls, mod = fake_claude
     _load_rules(_pii_scan_rule(action="block", types_=["email"]))
+    tool_text = "Plain log line, no PII"
     mod.__script__ = [
         AssistantMessage(
             [ToolUseBlock("Read", {"path": "/tmp/x"}, id_="tu_clean")]
@@ -848,7 +853,7 @@ def test_allow_path_no_substitution_no_extra_step(
         ResultMessage(),
     ]
     mod.__tool_responses__["tu_clean"] = {
-        "content": [{"type": "text", "text": "Plain log line, no PII"}]
+        "content": [{"type": "text", "text": tool_text}]
     }
 
     async def run() -> None:
@@ -858,7 +863,10 @@ def test_allow_path_no_substitution_no_extra_step(
             async for _ in client.receive_response():
                 pass
 
-    asyncio.run(run())
+    with caplog.at_level(
+        logging.INFO, logger="egisai.patches.claude_agent_sdk"
+    ):
+        asyncio.run(run())
     _flush()
 
     posts = mod.__post_invocations__
@@ -868,6 +876,18 @@ def test_allow_path_no_substitution_no_extra_step(
     # PreToolUse emits 1 row (verdict=allow). PostToolUse emits 0.
     post_steps = _post_step_events(fake_backend.events_received)
     assert len(post_steps) == 0
+
+    timing_lines = [
+        rec.getMessage()
+        for rec in caplog.records
+        if "egisai.policy_timings" in rec.getMessage()
+    ]
+    assert len(timing_lines) == 1
+    assert tool_text not in timing_lines[0]
+    payload = json.loads(timing_lines[0].split(" ", 1)[1])
+    assert payload["hook"] == "PostToolUse"
+    assert "semantic_in_scope" in payload
+    assert isinstance(payload["policy_timings"], list)
 
 
 def test_empty_response_skipped(
