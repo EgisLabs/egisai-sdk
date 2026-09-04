@@ -96,6 +96,31 @@ def _serialize_matched_policies(
     return out
 
 
+def _stamp_policy_timings(
+    ev: dict[str, Any],
+    decision: PolicyDecision,
+    *,
+    concatenate: bool = False,
+) -> None:
+    """Copy per-rule timings onto the audit event next to ``policy_latency_ms``.
+
+    Additive instrumentation: never changes the verdict. Output-side
+    callers pass ``concatenate=True`` so response-phase rows append
+    onto whatever the input phase already booked, and
+    ``semantic_in_scope`` sums across both phases.
+    """
+    rows = [t.as_dict() for t in decision.policy_timings]
+    scope = int(decision.semantic_in_scope or 0)
+    if concatenate:
+        existing = ev.get("policy_timings")
+        prior = existing if isinstance(existing, list) else []
+        ev["policy_timings"] = prior + rows
+        ev["semantic_in_scope"] = int(ev.get("semantic_in_scope") or 0) + scope
+        return
+    ev["policy_timings"] = rows
+    ev["semantic_in_scope"] = scope
+
+
 def _decision_block(decision: PolicyDecision) -> dict[str, Any]:
     """Per-phase decision summary persisted alongside the audit row.
 
@@ -532,6 +557,7 @@ def _run_input_phase(
             model=model,
             prompt_text=prompt_text,
             stream=stream,
+            hook="model",
         )
     )
     elapsed_ms = int((time.monotonic() - policy_started) * 1000)
@@ -556,6 +582,7 @@ def _run_input_phase(
     ev["matched_policy"] = decision.matched_policy
     ev["matched_policies"] = _serialize_matched_policies(decision)
     ev["prompt_decision"] = _decision_block(decision)
+    _stamp_policy_timings(ev, decision)
     return decision
 
 
@@ -745,6 +772,7 @@ def _run_output_phase(
             tool_calls=list(tool_calls or []),
             mcp_targets=list(mcp_targets or []),
             stream=stream,
+            hook="response",
         )
     )
 
@@ -763,6 +791,7 @@ def _run_output_phase(
         ev["policy_tokens_out"] = int(ev.get("policy_tokens_out") or 0) + max(
             0, cur_pol_out - prev_pol_out
         )
+        _stamp_policy_timings(ev, decision, concatenate=True)
 
     return decision
 

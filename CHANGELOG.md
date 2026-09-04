@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.76.0] — 2026-09-04
+
+### Added
+
+- Optional MiniLM allow-only first stage in front of `semantic_guard`'s
+  LLM judge (`EGISAI_SEMANTIC_ENGINE=cascade`). Confident local-allows
+  skip the HTTP judge; the same gate on `POST /v1/sdk/judge` lets Cloud
+  Run skip the LLM when the SDK still uses engine `judge`. Blocks still
+  come only from the judge. Default remains `judge`. Ships `onnxruntime`
+  + `tokenizers` as default deps (~60 MB larger install). No model
+  auto-download on `init()`.
+
+---
+
+## [0.75.2] — 2026-09-03
+
+### Added
+
+- Per-policy latency rows (`policy_timings`) and `semantic_in_scope`
+  on every evaluation, including allows. Additive audit fields —
+  enforcement verdicts are unchanged. PostToolUse allow still skips
+  the extra Requests row and logs timings as structured JSON.
+
+---
+
 ## [0.75.1] — 2026-09-02
 
 ### Fixed

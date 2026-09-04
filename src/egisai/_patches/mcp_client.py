@@ -284,6 +284,7 @@ def _prepare_gate(session: Any, tool_name: str, arguments: Any) -> _Gate:
                 # point, which must block instead.
                 allow_sanitize=True,
                 surfaces=("mcp",),
+                hook="mcp",
             )
         )
     except Exception as exc:  # noqa: BLE001

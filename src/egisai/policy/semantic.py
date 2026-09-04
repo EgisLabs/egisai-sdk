@@ -170,6 +170,21 @@ class SemanticMatch:
 _OUTAGE_MATCH = SemanticMatch(intent="<judge unavailable>", similarity=0.0)
 
 
+def _wire_semantic_patterns(raw: Any) -> list[dict[str, str]]:
+    """kind+text only. Drop anything else so the judge body stays small."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").strip()
+        text = str(item.get("text") or "").strip()
+        if kind and text:
+            out.append({"kind": kind, "text": text})
+    return out
+
+
 class SemanticBlocker:
     """Client for the platform's ``semantic_guard`` judge.
 
@@ -431,6 +446,18 @@ class SemanticBlocker:
         }
         if config.get("threshold") is not None:
             body["threshold"] = config["threshold"]
+        # Sibling MiniLM patterns — forwarded so Cloud Run can skip
+        # the LLM even when this SDK process is still on engine=judge.
+        # Older backends ignore unknown fields (or the additive schema
+        # defaults). Never written into stored ``policies.config``.
+        pats = _wire_semantic_patterns(config.get("semantic_patterns"))
+        if pats:
+            body["semantic_patterns"] = pats
+        groups = config.get("semantic_pattern_groups")
+        if isinstance(groups, list) and groups:
+            wired = [_wire_semantic_patterns(g) for g in groups]
+            if any(wired):
+                body["semantic_pattern_groups"] = wired
         # ``judge_model`` used to be forwarded here so an operator
         # could swap the underlying judge model per policy. That
         # escape hatch has been removed: the platform's judge
