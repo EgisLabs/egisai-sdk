@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.76.1] — 2026-09-04
+
+### Fixed
+- MiniLM circuit breaker recovers after a slow first embed. Cold-start
+  samples are not counted; while open, a probe every 5s can close it.
+  Process start runs a dummy embed so the first live request is not
+  the warmup.
+
+---
+
 ## [0.76.0] — 2026-09-04
 
 ### Added

@@ -36,6 +36,8 @@ LOGGER = logging.getLogger("egisai.semantic_local")
 _DEFAULT_THRESHOLD = 0.35
 _DEFAULT_MAX_MS = 50.0
 _DEFAULT_MIN_CHARS = 80
+_DEFAULT_PROBE_S = 5.0
+_WARMUP_SAMPLES = 2
 _WINDOW = 32
 
 _UNSET: object = object()
@@ -45,6 +47,8 @@ _cache_lock = threading.Lock()
 _times: deque[float] = deque(maxlen=_WINDOW)
 _times_lock = threading.Lock()
 _tripped = False
+_warmup_left = _WARMUP_SAMPLES
+_last_probe_at = 0.0
 _local_mode_warned = False
 _load_ms: float | None = None
 
@@ -113,6 +117,29 @@ def _max_ms() -> float:
         return _DEFAULT_MAX_MS
 
 
+def _probe_every_s() -> float:
+    raw = (os.getenv("EGISAI_SEMANTIC_LOCAL_PROBE_S") or "").strip()
+    try:
+        v = float(raw) if raw else _DEFAULT_PROBE_S
+        return v if v >= 0 else _DEFAULT_PROBE_S
+    except ValueError:
+        return _DEFAULT_PROBE_S
+
+
+def _should_probe() -> bool:
+    """While the circuit is open, allow one real embed on this interval."""
+    global _last_probe_at
+    now = time.monotonic()
+    interval = _probe_every_s()
+    with _times_lock:
+        if not _tripped:
+            return False
+        if now - _last_probe_at < interval:
+            return False
+        _last_probe_at = now
+        return True
+
+
 def _min_chars() -> int:
     raw = (os.getenv("EGISAI_SEMANTIC_LANG_MIN_CHARS") or "").strip()
     try:
@@ -129,21 +156,33 @@ def set_embedder(embedder: Embedder | None) -> None:
 
 
 def reset_for_tests() -> None:
-    global _embedder, _tripped, _local_mode_warned, _load_ms
+    global _embedder, _tripped, _warmup_left, _last_probe_at
+    global _local_mode_warned, _load_ms
     _embedder = _UNSET
     _embed_cache.clear()
     _times.clear()
     _tripped = False
+    _warmup_left = _WARMUP_SAMPLES
+    _last_probe_at = 0.0
     _local_mode_warned = False
     _load_ms = None
 
 
 def prime_embedder() -> float | None:
-    """Eager-load the ONNX session. Returns load milliseconds, or None."""
+    """Eager-load the ONNX session and run one dummy embed.
+
+    The dummy infer pays the first-run cost at process start so a
+    live request does not record a multi-second sample that would
+    trip the circuit breaker. Returns load milliseconds, or None.
+    """
     started = time.monotonic()
     emb = _get_embedder()
     if emb is None:
         return None
+    try:
+        emb.embed(["warmup"])
+    except Exception:  # noqa: BLE001
+        LOGGER.debug("MiniLM warmup embed failed open", exc_info=True)
     global _load_ms
     _load_ms = round((time.monotonic() - started) * 1000.0, 3)
     return _load_ms
@@ -190,9 +229,22 @@ def _circuit_tripped() -> bool:
 
 
 def _record_ms(ms: float) -> None:
-    global _tripped
+    global _tripped, _warmup_left, _last_probe_at
     ceiling = _max_ms()
     with _times_lock:
+        if _warmup_left > 0:
+            _warmup_left -= 1
+            return
+        if _tripped and ms <= ceiling:
+            # Healthy probe: drop the cold-start / slow samples that
+            # latched the breaker so MiniLM can run again.
+            _times.clear()
+            _times.append(ms)
+            _tripped = False
+            LOGGER.info(
+                "egisai.semantic_local circuit closed p95_ms=%.1f", ms
+            )
+            return
         _times.append(ms)
         if len(_times) < 8:
             return
@@ -202,6 +254,7 @@ def _record_ms(ms: float) -> None:
         was = _tripped
         _tripped = p95 > ceiling
         if _tripped and not was:
+            _last_probe_at = time.monotonic()
             LOGGER.warning(
                 "egisai.semantic_local circuit open p95_ms=%.1f ceiling=%.1f",
                 p95,
@@ -352,7 +405,7 @@ def score_policies(
     tool_texts: Sequence[str],
 ) -> list[LocalObs]:
     started = time.monotonic()
-    if _circuit_tripped():
+    if _circuit_tripped() and not _should_probe():
         elapsed = round((time.monotonic() - started) * 1000.0, 3)
         return [
             LocalObs(

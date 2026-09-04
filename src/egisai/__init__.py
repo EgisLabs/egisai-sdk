@@ -14,7 +14,7 @@ plus an httpx / requests fallback.
 
 from __future__ import annotations
 
-__version__ = "0.76.0"
+__version__ = "0.76.1"
 
 # Human-in-the-loop approvals — raised when a call is held for human
 # approval and the in-line wait budget elapses without a decision.
