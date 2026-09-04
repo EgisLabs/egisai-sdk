@@ -484,10 +484,55 @@ def test_circuit_breaker_escalates(monkeypatch: pytest.MonkeyPatch) -> None:
 
     semantic_local.set_embedder(Slow())
     monkeypatch.setenv("EGISAI_SEMANTIC_LOCAL_MAX_MS", "5")
+    monkeypatch.setenv("EGISAI_SEMANTIC_LOCAL_PROBE_S", "999")
+    for i in range(10):
+        semantic_local.score_policies(
+            [_guard()], text=LONG_CLEAN + f" {i}", tool_texts=[]
+        )
+    blocker = _CountingBlocker()
+    evaluate_policies([_guard()], _ctx(LONG_CLEAN), semantic_blocker=blocker)
+    assert blocker.calls >= 1
+
+
+def test_slow_warmup_does_not_latch(monkeypatch: pytest.MonkeyPatch) -> None:
+    class OnceSlow:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            self.n += 1
+            if self.n == 1:
+                time.sleep(0.02)
+            return [_vec(t) for t in texts]
+
+    semantic_local.set_embedder(OnceSlow())
+    monkeypatch.setenv("EGISAI_SEMANTIC_LOCAL_MAX_MS", "5")
     for _ in range(10):
         semantic_local.score_policies(
             [_guard()], text=LONG_CLEAN, tool_texts=[]
         )
     blocker = _CountingBlocker()
     evaluate_policies([_guard()], _ctx(LONG_CLEAN), semantic_blocker=blocker)
-    assert blocker.calls >= 1
+    assert blocker.calls == 0
+
+
+def test_circuit_recovers_on_fast_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Slow:
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            time.sleep(0.02)
+            return [_vec(t) for t in texts]
+
+    semantic_local.set_embedder(Slow())
+    monkeypatch.setenv("EGISAI_SEMANTIC_LOCAL_MAX_MS", "5")
+    monkeypatch.setenv("EGISAI_SEMANTIC_LOCAL_PROBE_S", "0")
+    for i in range(10):
+        semantic_local.score_policies(
+            [_guard()], text=LONG_CLEAN + f" {i}", tool_texts=[]
+        )
+    semantic_local.set_embedder(_FakeEmbedder())
+    semantic_local.score_policies(
+        [_guard()], text=LONG_CLEAN, tool_texts=[]
+    )
+    blocker = _CountingBlocker()
+    evaluate_policies([_guard()], _ctx(LONG_CLEAN), semantic_blocker=blocker)
+    assert blocker.calls == 0
