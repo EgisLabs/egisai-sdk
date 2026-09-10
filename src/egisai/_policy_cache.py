@@ -87,6 +87,18 @@ def _parse_semantic_patterns(raw: object) -> tuple[dict[str, str], ...]:
     return tuple(out)
 
 
+def _parse_rule_version(raw: object) -> int | None:
+    """Positive int from the wire; anything else → None (flag off)."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int) and raw >= 1:
+        return raw
+    if isinstance(raw, str) and raw.isdigit():
+        n = int(raw)
+        return n if n >= 1 else None
+    return None
+
+
 def _to_rule(d: dict) -> PolicyRule:
     """Wire-shape → ``PolicyRule`` dataclass.
 
@@ -145,6 +157,7 @@ def _to_rule(d: dict) -> PolicyRule:
         applies_to=applies_to,
         mcp_server_ids=mcp_server_ids,
         semantic_patterns=_parse_semantic_patterns(d.get("semantic_patterns")),
+        version=_parse_rule_version(d.get("version")),
     )
 
 
