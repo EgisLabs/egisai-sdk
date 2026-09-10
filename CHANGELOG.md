@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.77.0] — 2026-09-09
+
+### Added
+- Policy timings now echo fetch-time `(policy_id, version)` for every
+  in-scope rule, plus `judge_group` on merged semantic asks, so an
+  auditor can reconstruct the rule set that judged a call.
+
+---
+
 ## [0.76.1] — 2026-09-04
 
 ### Fixed

@@ -7,6 +7,7 @@ Evaluates ``PolicyRule`` objects against an input or output
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import logging
 import re
@@ -81,6 +82,11 @@ class PolicyRule:
     # Empty ⇒ fail open to the LLM judge. Wire sibling field, not
     # inside ``config``.
     semantic_patterns: tuple[dict[str, str], ...] = field(default=())
+    # Latest ``policy_versions.version`` at fetch time. ``None`` when
+    # the control plane did not stamp it (flag off, or no snapshot).
+    # The engine echoes this onto timing rows so ingest can attribute
+    # a verdict to the rule that actually judged the call.
+    version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -195,14 +201,33 @@ class PolicyTiming:
     name: str
     hook: str
     ms: float
+    policy_id: str | None = None
+    version: int | None = None
+    intents: tuple[str, ...] | None = None
+    threshold: float | None = None
+    judge_group: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "type": self.type,
             "name": self.name,
             "hook": self.hook,
             "ms": self.ms,
         }
+        # Identity extras ride only when the cached rule carried a
+        # version (flag-on feed). Flag-off → the four keys above, same
+        # as 0.75.2, even if the rule has an id.
+        if self.version is not None:
+            if self.policy_id:
+                out["policy_id"] = self.policy_id
+            out["version"] = self.version
+            if self.intents:
+                out["intents"] = list(self.intents)
+            if self.threshold is not None:
+                out["threshold"] = self.threshold
+            if self.judge_group:
+                out["judge_group"] = self.judge_group
+        return out
 
 
 @dataclass(frozen=True)
@@ -778,6 +803,7 @@ class _PhaseMatches:
     sanitize_types: list[str] = field(default_factory=list)  # union, ordered
     sanitize_mask_char: str = "#"
     timings: list[PolicyTiming] = field(default_factory=list)
+    judge_groups: dict[int, str] = field(default_factory=dict)
 
     @property
     def has_block(self) -> bool:
@@ -810,15 +836,70 @@ class _PhaseMatches:
         for rec in other.records:
             self.add(rec)
         self.timings.extend(other.timings)
+        self.judge_groups.update(other.judge_groups)
 
 
-def _timing_for(policy: PolicyRule, hook: str, started: float) -> PolicyTiming:
-    """One timing row from a ``time.monotonic()`` start mark."""
+def _judge_group_id(
+    *,
+    kind: str,
+    hook: str,
+    group: list[PolicyRule],
+    config: dict[str, Any],
+) -> str:
+    """Stable id for one merged judge ask (the bin, not the match)."""
+    ids = ",".join(sorted(str(p.id) for p in group if p.id))
+    if not ids:
+        ids = ",".join(sorted(str(p.name) for p in group))
+    thr = str((config or {}).get("threshold") if config else "")
+    raw = f"{kind}|{hook}|{thr}|{ids}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _policy_timing(
+    policy: PolicyRule,
+    hook: str,
+    ms: float,
+    *,
+    judge_group: str | None = None,
+) -> PolicyTiming:
+    """One timing row, with fetch-time identity when the rule has it."""
+    intents: tuple[str, ...] | None = None
+    threshold: float | None = None
+    group = judge_group
+    if policy.type == "semantic_guard":
+        raw_intents = _semantic_intents(policy)
+        intents = tuple(raw_intents) if raw_intents else None
+        thr = (policy.config or {}).get("threshold")
+        if (
+            isinstance(thr, (int, float))
+            and not isinstance(thr, bool)
+        ):
+            threshold = float(thr)
+        if group is None:
+            group = _judge_group_id(
+                kind="text",
+                hook=hook,
+                group=[policy],
+                config=policy.config or {},
+            )
+    pid = str(policy.id) if policy.id else None
     return PolicyTiming(
         type=str(policy.type),
         name=str(policy.name),
         hook=hook,
-        ms=round((time.monotonic() - started) * 1000.0, 3),
+        ms=ms,
+        policy_id=pid,
+        version=policy.version,
+        intents=intents,
+        threshold=threshold,
+        judge_group=group if policy.type == "semantic_guard" else None,
+    )
+
+
+def _timing_for(policy: PolicyRule, hook: str, started: float) -> PolicyTiming:
+    """One timing row from a ``time.monotonic()`` start mark."""
+    return _policy_timing(
+        policy, hook, round((time.monotonic() - started) * 1000.0, 3)
     )
 
 
@@ -1941,11 +2022,11 @@ def _collect_semantic_fast(
         elapsed = round((time.monotonic() - started) * 1000.0, 3)
         for policy in policies:
             out.add_timing(
-                PolicyTiming(
-                    type=str(policy.type),
-                    name=str(policy.name),
-                    hook=hook,
-                    ms=elapsed,
+                _policy_timing(
+                    policy,
+                    hook,
+                    elapsed,
+                    judge_group=out.judge_groups.get(id(policy)),
                 )
             )
 
@@ -1979,6 +2060,12 @@ def _collect_semantic_fast_body(
     questions = _fast_judge_questions(
         active, text=text, tool_calls=tool_calls
     )
+    for kind, _tool_name, group, _question_text, config in questions:
+        gid = _judge_group_id(
+            kind=kind, hook=hook, group=group, config=config
+        )
+        for policy in group:
+            out.judge_groups[id(policy)] = gid
     if not questions:
         judge_ms = round((time.monotonic() - judge_started) * 1000.0, 3)
         if observations and semantic_local.shadow_enabled():
