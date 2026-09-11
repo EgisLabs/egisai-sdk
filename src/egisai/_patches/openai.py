@@ -963,11 +963,11 @@ def _build_input_tokens_details() -> Any:
             InputTokensDetails,
         )
 
-        return InputTokensDetails(cached_tokens=0)
+        return InputTokensDetails(cached_tokens=0, cache_write_tokens=0)
     except Exception:
         from types import SimpleNamespace
 
-        return SimpleNamespace(cached_tokens=0)
+        return SimpleNamespace(cached_tokens=0, cache_write_tokens=0)
 
 
 def _build_output_tokens_details() -> Any:

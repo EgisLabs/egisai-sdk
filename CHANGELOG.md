@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.78.0] — 2026-09-10
+
+### Added
+- Optional processing-time Policy number (`EGISAI_POLICY_PROCESSING_MS`):
+  local CPU plus the judge model's prompt_time + completion_time.
+  Unset keeps today's wall-clock wait. SDK and gateway Policy become
+  comparable when the flag is on.
+
+---
+
 ## [0.77.0] — 2026-09-09
 
 ### Added

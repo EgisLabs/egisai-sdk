@@ -260,6 +260,9 @@ class SemanticBlocker:
         key = self._cache_key(body)
         hit, found = self._cache_get(key)
         if found:
+            from egisai.policy import _processing
+
+            _processing.record_from_payload(None, cache_hit=True)
             return hit
 
         try:
@@ -269,6 +272,9 @@ class SemanticBlocker:
         except Exception as exc:  # noqa: BLE001
             # Not cached: an outage is a fact about the network at one
             # instant, not a verdict about this text.
+            from egisai.policy import _processing
+
+            _processing.record_from_payload(None)
             return self._on_outage_response(exc)
 
         match = self._interpret(data, body)
@@ -287,6 +293,9 @@ class SemanticBlocker:
         key = self._cache_key(body)
         hit, found = self._cache_get(key)
         if found:
+            from egisai.policy import _processing
+
+            _processing.record_from_payload(None, cache_hit=True)
             return hit
 
         try:
@@ -294,6 +303,9 @@ class SemanticBlocker:
             response.raise_for_status()
             data = response.json()
         except Exception as exc:  # noqa: BLE001
+            from egisai.policy import _processing
+
+            _processing.record_from_payload(None)
             return self._on_outage_response(exc)
 
         match = self._interpret(data, body)
@@ -475,6 +487,9 @@ class SemanticBlocker:
         self, data: dict[str, Any], body: dict[str, Any]
     ) -> SemanticMatch | None:
         """Account tokens then translate the judge response."""
+        from egisai.policy import _processing
+
+        _processing.record_from_payload(data)
         try:
             from egisai._context import add_policy_usage
 

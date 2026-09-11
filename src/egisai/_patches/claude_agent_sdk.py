@@ -135,7 +135,7 @@ from egisai._run import (
     finalize_run_in_place,
     open_run,
 )
-from egisai.policy import PolicyDecision
+from egisai.policy import PolicyDecision, _processing
 from egisai.policy.pii import sanitize as pii_sanitize
 
 LOGGER = logging.getLogger("egisai.patches.claude_agent_sdk")
@@ -756,8 +756,8 @@ def _build_pretooluse_callback(
                     (time.monotonic() - policy_started) * 1000
                 )
                 hook_init_ms = get_init_latency()
-                elapsed_policy_ms = max(
-                    0, elapsed_policy_ms_raw - hook_init_ms
+                elapsed_policy_ms = _processing.latency_ms(
+                    decision, max(0, elapsed_policy_ms_raw - hook_init_ms)
                 )
                 cur_pol_in, cur_pol_out = get_policy_usage()
 
@@ -1210,8 +1210,8 @@ def _build_posttooluse_callback(
                     (time.monotonic() - policy_started) * 1000
                 )
                 hook_init_ms = get_init_latency()
-                elapsed_policy_ms = max(
-                    0, elapsed_policy_ms_raw - hook_init_ms
+                elapsed_policy_ms = _processing.latency_ms(
+                    decision, max(0, elapsed_policy_ms_raw - hook_init_ms)
                 )
                 cur_pol_in, cur_pol_out = get_policy_usage()
 
@@ -1882,7 +1882,9 @@ def _dispatch_tool_call_step(
     elapsed_ms_raw = int((time.monotonic() - policy_started) * 1000)
     init_ms = get_init_latency()
     cur_pol_in, cur_pol_out = get_policy_usage()
-    ev["policy_latency_ms"] = max(0, elapsed_ms_raw - init_ms)
+    ev["policy_latency_ms"] = _processing.latency_ms(
+        decision, max(0, elapsed_ms_raw - init_ms)
+    )
     if init_ms > 0:
         ev["init_latency_ms"] = init_ms
     ev["policy_tokens_in"] = max(0, cur_pol_in - prev_pol_in)
@@ -2197,8 +2199,8 @@ def _run_output_phase(
     elapsed_ms = int((time.monotonic() - policy_started) * 1000)
     init_ms = get_init_latency()
     cur_pol_in, cur_pol_out = get_policy_usage()
-    ev["policy_latency_ms"] = int(ev.get("policy_latency_ms") or 0) + max(
-        0, elapsed_ms - init_ms
+    ev["policy_latency_ms"] = int(ev.get("policy_latency_ms") or 0) + (
+        _processing.latency_ms(decision, max(0, elapsed_ms - init_ms))
     )
     if init_ms > 0:
         ev["init_latency_ms"] = int(ev.get("init_latency_ms") or 0) + init_ms

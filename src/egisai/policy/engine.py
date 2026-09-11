@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
-from egisai.policy import _pii_custom, fastpath, injection
+from egisai.policy import _pii_custom, _processing, fastpath, injection
 from egisai.policy import pii as pii_scanner
 from egisai.policy._regex_safe import safe_search
 from egisai.policy.semantic import SemanticBlocker
@@ -262,6 +262,10 @@ class PolicyDecision:
     ``semantic_in_scope`` is how many ``semantic_guard`` rules were
     in the Phase 2 set for this evaluation (0 when Phase 2 did not
     run).
+    ``processing_ms`` is the composed Policy number when
+    ``EGISAI_POLICY_PROCESSING_MS`` is on; ``None`` keeps stamp
+    sites on today's wall-clock wait. See
+    ``egisai.policy._processing.PROCESSING_MS_DEFINITION``.
     """
     verdict: str
     reason_code: str | None
@@ -273,6 +277,7 @@ class PolicyDecision:
     approval_detail: str | None = None
     policy_timings: tuple[PolicyTiming, ...] = ()
     semantic_in_scope: int = 0
+    processing_ms: float | None = None
 
     @property
     def sanitize_kinds(self) -> list[str]:
@@ -291,6 +296,7 @@ class PolicyDecision:
         matched_policies: tuple[MatchedPolicyRecord, ...] = (),
         policy_timings: tuple[PolicyTiming, ...] = (),
         semantic_in_scope: int = 0,
+        processing_ms: float | None = None,
     ) -> PolicyDecision:
         """The call proceeds.
 
@@ -308,6 +314,7 @@ class PolicyDecision:
             matched_policies=matched_policies,
             policy_timings=policy_timings,
             semantic_in_scope=semantic_in_scope,
+            processing_ms=processing_ms,
         )
 
     @classmethod
@@ -320,6 +327,7 @@ class PolicyDecision:
         matched_policies: tuple[MatchedPolicyRecord, ...] = (),
         policy_timings: tuple[PolicyTiming, ...] = (),
         semantic_in_scope: int = 0,
+        processing_ms: float | None = None,
     ) -> PolicyDecision:
         return cls(
             verdict="block",
@@ -329,6 +337,7 @@ class PolicyDecision:
             matched_policies=matched_policies,
             policy_timings=policy_timings,
             semantic_in_scope=semantic_in_scope,
+            processing_ms=processing_ms,
         )
 
     @classmethod
@@ -344,6 +353,7 @@ class PolicyDecision:
         kinds: list[str] | None = None,
         policy_timings: tuple[PolicyTiming, ...] = (),
         semantic_in_scope: int = 0,
+        processing_ms: float | None = None,
     ) -> PolicyDecision:
         """The call should forward, but with these PII types masked.
 
@@ -367,6 +377,7 @@ class PolicyDecision:
             sanitize_mask_char=mask_char or "#",
             policy_timings=policy_timings,
             semantic_in_scope=semantic_in_scope,
+            processing_ms=processing_ms,
         )
 
     @classmethod
@@ -380,6 +391,7 @@ class PolicyDecision:
         approval_detail: str | None = None,
         policy_timings: tuple[PolicyTiming, ...] = (),
         semantic_in_scope: int = 0,
+        processing_ms: float | None = None,
     ) -> PolicyDecision:
         """The call must be held for human approval before it proceeds.
 
@@ -397,6 +409,7 @@ class PolicyDecision:
             approval_detail=approval_detail,
             policy_timings=policy_timings,
             semantic_in_scope=semantic_in_scope,
+            processing_ms=processing_ms,
         )
 
 
@@ -617,7 +630,10 @@ def evaluate_policies(
     if "model" in surfaces:
         member_record = _member_limit_record()
         if member_record is not None:
-            return _synthesize_decision([member_record])
+            return _synthesize_decision(
+                [member_record],
+                processing_ms=0.0 if _processing.enabled() else None,
+            )
 
     phase1_matches = _collect_input_matches(phase1, context, semantic_blocker=None)
 
@@ -628,6 +644,7 @@ def evaluate_policies(
         return _synthesize_decision(
             phase1_matches.records,
             timings=phase1_matches.timings,
+            processing_ms=_composed_processing_ms(phase1_matches),
         )
 
     text_for_phase2 = context.prompt_text
@@ -655,6 +672,9 @@ def evaluate_policies(
         return _synthesize_decision(
             phase1_matches.records + injection_matches.records,
             timings=phase1_matches.timings + injection_matches.timings,
+            processing_ms=_composed_processing_ms(
+                phase1_matches, injection_matches
+            ),
         )
 
     phase2_ctx = PolicyContext(
@@ -716,6 +736,9 @@ def evaluate_policies(
             + phase2_matches.timings
         ),
         semantic_in_scope=len(sem2),
+        processing_ms=_composed_processing_ms(
+            phase1_matches, injection_matches, phase2_matches
+        ),
     )
 
 
@@ -790,6 +813,7 @@ def _collect_injection_escalation(
                 or default_message,
             )
         )
+    out.note_walk(parallel=False)
     return out
 
 
@@ -804,6 +828,8 @@ class _PhaseMatches:
     sanitize_mask_char: str = "#"
     timings: list[PolicyTiming] = field(default_factory=list)
     judge_groups: dict[int, str] = field(default_factory=dict)
+    processing_local_ms: float = 0.0
+    processing_waves: list[float] = field(default_factory=list)
 
     @property
     def has_block(self) -> bool:
@@ -837,6 +863,29 @@ class _PhaseMatches:
             self.add(rec)
         self.timings.extend(other.timings)
         self.judge_groups.update(other.judge_groups)
+        self.processing_local_ms += other.processing_local_ms
+        self.processing_waves.extend(other.processing_waves)
+
+    def note_walk(self, *, parallel: bool) -> None:
+        """Fold this walk's timing rows into the processing compose."""
+        if not _processing.enabled():
+            return
+        items = [(t.judge_group, t.ms) for t in self.timings]
+        if parallel:
+            wave = _processing.max_wave(items)
+            if wave is not None:
+                self.processing_waves.append(wave)
+            return
+        self.processing_local_ms += sum(ms for _group, ms in items)
+
+
+def _composed_processing_ms(*phases: _PhaseMatches) -> float | None:
+    if not _processing.enabled():
+        return None
+    total = 0.0
+    for phase in phases:
+        total += phase.processing_local_ms + sum(phase.processing_waves)
+    return round(total, 3)
 
 
 def _judge_group_id(
@@ -898,9 +947,11 @@ def _policy_timing(
 
 def _timing_for(policy: PolicyRule, hook: str, started: float) -> PolicyTiming:
     """One timing row from a ``time.monotonic()`` start mark."""
-    return _policy_timing(
-        policy, hook, round((time.monotonic() - started) * 1000.0, 3)
-    )
+    wall = round((time.monotonic() - started) * 1000.0, 3)
+    ms = wall
+    if _processing.enabled():
+        ms = _processing.rule_ms(wall, _processing.take())
+    return _policy_timing(policy, hook, ms)
 
 
 def _timed_input_policy(
@@ -976,6 +1027,7 @@ def _collect_input_matches(
             out.add_timing(timing)
             if rec is not None:
                 out.add(rec)
+        out.note_walk(parallel=False)
         return out
 
     results = _fan_out(
@@ -986,6 +1038,7 @@ def _collect_input_matches(
         max_workers=_judge_budget.get(),
     )
     _collect_timed_results(out, results)
+    out.note_walk(parallel=True)
     return out
 
 
@@ -1279,6 +1332,7 @@ def _synthesize_decision(
     *,
     timings: list[PolicyTiming] | tuple[PolicyTiming, ...] = (),
     semantic_in_scope: int = 0,
+    processing_ms: float | None = None,
 ) -> PolicyDecision:
     """Roll a list of matches up into a single ``PolicyDecision``.
 
@@ -1302,6 +1356,7 @@ def _synthesize_decision(
         return PolicyDecision.allow(
             policy_timings=stamped,
             semantic_in_scope=semantic_in_scope,
+            processing_ms=processing_ms,
         )
 
     blocks = [r for r in records if r.verdict == "block"]
@@ -1314,6 +1369,7 @@ def _synthesize_decision(
             matched_policies=tuple(records),
             policy_timings=stamped,
             semantic_in_scope=semantic_in_scope,
+            processing_ms=processing_ms,
         )
 
     # Human-in-the-loop hold. Sits below ``block`` (a hard block
@@ -1332,6 +1388,7 @@ def _synthesize_decision(
             approval_detail=primary.message,
             policy_timings=stamped,
             semantic_in_scope=semantic_in_scope,
+            processing_ms=processing_ms,
         )
 
     sanitizes = [r for r in records if r.verdict == "sanitize"]
@@ -1351,12 +1408,14 @@ def _synthesize_decision(
             matched_policies=tuple(records),
             policy_timings=stamped,
             semantic_in_scope=semantic_in_scope,
+            processing_ms=processing_ms,
         )
 
     return PolicyDecision.allow(
         matched_policies=tuple(records),
         policy_timings=stamped,
         semantic_in_scope=semantic_in_scope,
+        processing_ms=processing_ms,
     )
 
 
@@ -1431,9 +1490,13 @@ def _semantic_guard_match(
 
     # Phase A — text target. Kept verbatim from the pre-0.24 path
     # so existing rules (no ``targets`` field) cannot regress.
+    text_taken: Any = _processing.UNSET
     if "text" in targets and text:
         match = semantic_blocker.check(text, _judge_config(policy))
+        if _processing.enabled():
+            text_taken = _processing.take()
         if match is not None:
+            _record_nested_processing(text_taken, [])
             return MatchedPolicyRecord(
                 name=policy.name,
                 type=policy.type,
@@ -1500,6 +1563,7 @@ def _semantic_guard_match(
             normalized.append((name, synthesized))
 
         if not normalized:
+            _record_nested_processing(text_taken, [])
             return None
 
         # Single-tool: skip the executor overhead entirely. Most
@@ -1507,6 +1571,10 @@ def _semantic_guard_match(
         if len(normalized) == 1:
             name, synthesized = normalized[0]
             match = semantic_blocker.check(synthesized, _judge_config(policy))
+            tool_taken = (
+                _processing.take() if _processing.enabled() else _processing.UNSET
+            )
+            _record_nested_processing(text_taken, [tool_taken])
             if match is None:
                 return None
             return MatchedPolicyRecord(
@@ -1540,10 +1608,14 @@ def _semantic_guard_match(
             max_workers=_judge_budget.get(),
         )
 
-        for (name, _synthesized), match in zip(normalized, results, strict=True):
-            if match is None:
+        first: MatchedPolicyRecord | None = None
+        tool_takens: list[Any] = []
+        for (name, _synthesized), item in zip(normalized, results, strict=True):
+            match, proc = _unpack_judge_result(item)
+            tool_takens.append(proc)
+            if match is None or first is not None:
                 continue
-            return MatchedPolicyRecord(
+            first = MatchedPolicyRecord(
                 name=policy.name,
                 type=policy.type,
                 verdict="block",
@@ -1556,7 +1628,10 @@ def _semantic_guard_match(
                     ),
                 ),
             )
+        _record_nested_processing(text_taken, tool_takens)
+        return first
 
+    _record_nested_processing(text_taken, [])
     return None
 
 
@@ -1598,9 +1673,40 @@ def _bind_tool_judge(
 ) -> Callable[[], Any]:
     """Freeze one tool-call judge round-trip into a zero-arg callable."""
     def run() -> Any:
-        return semantic_blocker.check(synthesized, config)
+        match = semantic_blocker.check(synthesized, config)
+        if not _processing.enabled():
+            return match, _processing.UNSET
+        return match, _processing.take()
 
     return run
+
+
+def _unpack_judge_result(item: Any) -> tuple[Any, Any]:
+    """``_bind_tool_judge`` returns ``(match, processing_ms)``."""
+    if item is None:
+        return None, None
+    if isinstance(item, tuple) and len(item) == 2:
+        return item[0], item[1]
+    return item, _processing.UNSET
+
+
+def _record_nested_processing(text_taken: Any, tool_takens: list[Any]) -> None:
+    """Text sequential + max(tools) onto the parent task's side channel."""
+    if not _processing.enabled():
+        return
+    seq: list[float] = []
+    if text_taken is not _processing.UNSET:
+        seq.append(0.0 if text_taken is None else float(text_taken))
+    wave_items: list[tuple[str | None, float | None]] = []
+    for taken in tool_takens:
+        if taken is _processing.UNSET:
+            continue
+        wave_items.append((None, None if taken is None else float(taken)))
+    wave = _processing.max_wave(wave_items)
+    if wave is not None:
+        seq.append(wave)
+    if seq:
+        _processing.record(sum(seq))
 
 
 def _fan_out(
@@ -2004,31 +2110,47 @@ def _collect_semantic_fast(
       tool call is the same question — asked once).
 
     Timing: one row per in-scope policy; ``ms`` is the wall clock of
-    this merged walk (shared), not a per-policy slice.
+    this merged walk (shared), not a per-policy slice. When
+    ``EGISAI_POLICY_PROCESSING_MS`` is on, ``ms`` is that question's
+    processing (siblings share ``judge_group``; composition counts
+    the group once) and MiniLM CPU rides as local processing.
     """
     out = _PhaseMatches()
-    started = time.monotonic()
-    try:
-        return _collect_semantic_fast_body(
-            out,
-            policies,
-            text=text,
-            tool_calls=tool_calls,
-            semantic_blocker=semantic_blocker,
-            side=side,
-            hook=hook,
-        )
-    finally:
-        elapsed = round((time.monotonic() - started) * 1000.0, 3)
-        for policy in policies:
-            out.add_timing(
-                _policy_timing(
-                    policy,
-                    hook,
-                    elapsed,
-                    judge_group=out.judge_groups.get(id(policy)),
-                )
+    if not _processing.enabled():
+        started = time.monotonic()
+        try:
+            return _collect_semantic_fast_body(
+                out,
+                policies,
+                text=text,
+                tool_calls=tool_calls,
+                semantic_blocker=semantic_blocker,
+                side=side,
+                hook=hook,
             )
+        finally:
+            elapsed = round((time.monotonic() - started) * 1000.0, 3)
+            for policy in policies:
+                out.add_timing(
+                    _policy_timing(
+                        policy,
+                        hook,
+                        elapsed,
+                        judge_group=out.judge_groups.get(id(policy)),
+                    )
+                )
+
+    _collect_semantic_fast_body(
+        out,
+        policies,
+        text=text,
+        tool_calls=tool_calls,
+        semantic_blocker=semantic_blocker,
+        side=side,
+        hook=hook,
+        stamp_processing=True,
+    )
+    return out
 
 
 def _collect_semantic_fast_body(
@@ -2040,6 +2162,7 @@ def _collect_semantic_fast_body(
     semantic_blocker: SemanticBlocker | None,
     side: str,
     hook: str = "",
+    stamp_processing: bool = False,
 ) -> _PhaseMatches:
     if semantic_blocker is None:
         return out
@@ -2052,9 +2175,14 @@ def _collect_semantic_fast_body(
 
     windowed = fastpath.window_text(text) if text else ""
     tool_texts = list(_unique_tool_sentences(tool_calls).keys())
+    minilm_started = time.monotonic()
     active, observations = semantic_local.filter_escalations(
         active, text=windowed, tool_texts=tool_texts
     )
+    if stamp_processing:
+        out.processing_local_ms += round(
+            (time.monotonic() - minilm_started) * 1000.0, 3
+        )
     judge_started = time.monotonic()
 
     questions = _fast_judge_questions(
@@ -2080,6 +2208,16 @@ def _collect_semantic_fast_body(
                 semantic_in_scope=len(policies),
                 judge_ms=judge_ms,
             )
+        if stamp_processing:
+            for policy in policies:
+                out.add_timing(
+                    _policy_timing(
+                        policy,
+                        hook,
+                        0.0,
+                        judge_group=out.judge_groups.get(id(policy)),
+                    )
+                )
         return out
 
     tasks: list[Callable[[], Any]] = [
@@ -2099,7 +2237,24 @@ def _collect_semantic_fast_body(
     # walk, where ``_semantic_guard_match`` returns that policy's
     # first match and nothing else.
     claimed: set[int] = set()
-    for (kind, tool_name, group), match in zip(meta, results, strict=True):
+    ms_by_policy: dict[int, float] = {}
+    wave_items: list[tuple[str | None, float | None]] = []
+    for (kind, tool_name, group), item in zip(meta, results, strict=True):
+        match, proc = _unpack_judge_result(item)
+        wave_gid = out.judge_groups.get(id(group[0])) if group else None
+        taken: float | None
+        if proc is _processing.UNSET or proc is None:
+            taken = None
+        else:
+            taken = float(proc)
+        if stamp_processing:
+            wave_items.append((wave_gid, taken))
+            row_ms = 0.0 if taken is None else taken
+            for policy in group:
+                prev = ms_by_policy.get(id(policy))
+                ms_by_policy[id(policy)] = (
+                    row_ms if prev is None else max(prev, row_ms)
+                )
         if match is None:
             continue
         owner, _canonical = _owning_policy(match.intent, group)
@@ -2134,6 +2289,19 @@ def _collect_semantic_fast_body(
                             f"intent: '{match.intent}'"
                         ),
                     ),
+                )
+            )
+    if stamp_processing:
+        wave = _processing.max_wave(wave_items)
+        if wave is not None:
+            out.processing_waves.append(wave)
+        for policy in policies:
+            out.add_timing(
+                _policy_timing(
+                    policy,
+                    hook,
+                    ms_by_policy.get(id(policy), 0.0),
+                    judge_group=out.judge_groups.get(id(policy)),
                 )
             )
     if observations and semantic_local.shadow_enabled():
@@ -2579,6 +2747,7 @@ def evaluate_output_policies(
         return _synthesize_decision(
             phase1_matches.records,
             timings=phase1_matches.timings,
+            processing_ms=_composed_processing_ms(phase1_matches),
         )
 
     # Prompt-injection smart tier on the response side — the indirect
@@ -2599,6 +2768,9 @@ def evaluate_output_policies(
         return _synthesize_decision(
             phase1_matches.records + injection_matches.records,
             timings=phase1_matches.timings + injection_matches.timings,
+            processing_ms=_composed_processing_ms(
+                phase1_matches, injection_matches
+            ),
         )
 
     # Fast-governance dispatch — mirror of the input side; see
@@ -2647,6 +2819,9 @@ def evaluate_output_policies(
             + phase2_matches.timings
         ),
         semantic_in_scope=len(sem2),
+        processing_ms=_composed_processing_ms(
+            phase1_matches, injection_matches, phase2_matches
+        ),
     )
 
 
@@ -2677,6 +2852,7 @@ def _collect_output_matches(
             out.add_timing(timing)
             if rec is not None:
                 out.add(rec)
+        out.note_walk(parallel=False)
         return out
 
     results = _fan_out(
@@ -2687,6 +2863,7 @@ def _collect_output_matches(
         max_workers=_judge_budget.get(),
     )
     _collect_timed_results(out, results)
+    out.note_walk(parallel=True)
     return out
 
 

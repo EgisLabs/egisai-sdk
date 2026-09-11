@@ -51,7 +51,7 @@ from egisai._evaluator import (
 from egisai._events import build_event, safe_preview
 from egisai._logger import enqueue
 from egisai._run import StepKind, append_step, current_run
-from egisai.policy import PolicyDecision, label_redact
+from egisai.policy import PolicyDecision, _processing, label_redact
 from egisai.policy.pii import Sanitization
 from egisai.policy.pii import sanitize as pii_sanitize
 
@@ -569,8 +569,13 @@ def _run_input_phase(
     # the very first time". The cold-start cost is still surfaced
     # on ``init_latency_ms`` so SOC 2 / capacity-planning use cases
     # don't lose the signal.
+    # When ``EGISAI_POLICY_PROCESSING_MS`` is on, the engine already
+    # composed processing (no hops, no warmup) and we use that
+    # instead of wall − init.
     init_ms = get_init_latency()
-    ev["policy_latency_ms"] = max(0, elapsed_ms - init_ms)
+    ev["policy_latency_ms"] = _processing.latency_ms(
+        decision, max(0, elapsed_ms - init_ms)
+    )
     if init_ms > 0:
         ev["init_latency_ms"] = init_ms
     policy_in, policy_out = get_policy_usage()
@@ -780,8 +785,8 @@ def _run_output_phase(
         elapsed_ms = int((time.monotonic() - policy_started) * 1000)
         init_ms = get_init_latency()
         cur_pol_in, cur_pol_out = get_policy_usage()
-        ev["policy_latency_ms"] = int(ev.get("policy_latency_ms") or 0) + max(
-            0, elapsed_ms - init_ms
+        ev["policy_latency_ms"] = int(ev.get("policy_latency_ms") or 0) + (
+            _processing.latency_ms(decision, max(0, elapsed_ms - init_ms))
         )
         if init_ms > 0:
             ev["init_latency_ms"] = int(ev.get("init_latency_ms") or 0) + init_ms
