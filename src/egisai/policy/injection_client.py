@@ -160,12 +160,18 @@ class InjectionBlocker:
         key = self._cache_key(body)
         hit, found = self._cache_get(key)
         if found:
+            from egisai.policy import _processing
+
+            _processing.record_from_payload(None, cache_hit=True)
             return hit
         try:
             response = self._post_with_429_retry(body)
             response.raise_for_status()
             data = response.json()
         except Exception as exc:  # noqa: BLE001
+            from egisai.policy import _processing
+
+            _processing.record_from_payload(None)
             return self._on_outage_response(exc)
         match = self._interpret(data)
         self._cache_put(key, match)
@@ -181,12 +187,18 @@ class InjectionBlocker:
         key = self._cache_key(body)
         hit, found = self._cache_get(key)
         if found:
+            from egisai.policy import _processing
+
+            _processing.record_from_payload(None, cache_hit=True)
             return hit
         try:
             response = await self._apost_with_429_retry(body)
             response.raise_for_status()
             data = response.json()
         except Exception as exc:  # noqa: BLE001
+            from egisai.policy import _processing
+
+            _processing.record_from_payload(None)
             return self._on_outage_response(exc)
         match = self._interpret(data)
         self._cache_put(key, match)
@@ -285,6 +297,9 @@ class InjectionBlocker:
         return body
 
     def _interpret(self, data: dict[str, Any]) -> InjectionMatch | None:
+        from egisai.policy import _processing
+
+        _processing.record_from_payload(data)
         if not isinstance(data, dict) or not data.get("match"):
             return None
         try:
