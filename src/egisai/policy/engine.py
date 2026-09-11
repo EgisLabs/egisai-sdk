@@ -262,10 +262,8 @@ class PolicyDecision:
     ``semantic_in_scope`` is how many ``semantic_guard`` rules were
     in the Phase 2 set for this evaluation (0 when Phase 2 did not
     run).
-    ``processing_ms`` is the composed Policy number when
-    ``EGISAI_POLICY_PROCESSING_MS`` is on; ``None`` keeps stamp
-    sites on today's wall-clock wait. See
-    ``egisai.policy._processing.PROCESSING_MS_DEFINITION``.
+    ``processing_ms`` is the composed Policy number (processing
+    only). See ``egisai.policy._processing.PROCESSING_MS_DEFINITION``.
     """
     verdict: str
     reason_code: str | None
@@ -632,7 +630,7 @@ def evaluate_policies(
         if member_record is not None:
             return _synthesize_decision(
                 [member_record],
-                processing_ms=0.0 if _processing.enabled() else None,
+                processing_ms=0.0,
             )
 
     phase1_matches = _collect_input_matches(phase1, context, semantic_blocker=None)
@@ -868,8 +866,6 @@ class _PhaseMatches:
 
     def note_walk(self, *, parallel: bool) -> None:
         """Fold this walk's timing rows into the processing compose."""
-        if not _processing.enabled():
-            return
         items = [(t.judge_group, t.ms) for t in self.timings]
         if parallel:
             wave = _processing.max_wave(items)
@@ -879,9 +875,7 @@ class _PhaseMatches:
         self.processing_local_ms += sum(ms for _group, ms in items)
 
 
-def _composed_processing_ms(*phases: _PhaseMatches) -> float | None:
-    if not _processing.enabled():
-        return None
+def _composed_processing_ms(*phases: _PhaseMatches) -> float:
     total = 0.0
     for phase in phases:
         total += phase.processing_local_ms + sum(phase.processing_waves)
@@ -948,9 +942,7 @@ def _policy_timing(
 def _timing_for(policy: PolicyRule, hook: str, started: float) -> PolicyTiming:
     """One timing row from a ``time.monotonic()`` start mark."""
     wall = round((time.monotonic() - started) * 1000.0, 3)
-    ms = wall
-    if _processing.enabled():
-        ms = _processing.rule_ms(wall, _processing.take())
+    ms = _processing.rule_ms(wall, _processing.take())
     return _policy_timing(policy, hook, ms)
 
 
@@ -1493,8 +1485,7 @@ def _semantic_guard_match(
     text_taken: Any = _processing.UNSET
     if "text" in targets and text:
         match = semantic_blocker.check(text, _judge_config(policy))
-        if _processing.enabled():
-            text_taken = _processing.take()
+        text_taken = _processing.take()
         if match is not None:
             _record_nested_processing(text_taken, [])
             return MatchedPolicyRecord(
@@ -1571,9 +1562,7 @@ def _semantic_guard_match(
         if len(normalized) == 1:
             name, synthesized = normalized[0]
             match = semantic_blocker.check(synthesized, _judge_config(policy))
-            tool_taken = (
-                _processing.take() if _processing.enabled() else _processing.UNSET
-            )
+            tool_taken = _processing.take()
             _record_nested_processing(text_taken, [tool_taken])
             if match is None:
                 return None
@@ -1674,8 +1663,6 @@ def _bind_tool_judge(
     """Freeze one tool-call judge round-trip into a zero-arg callable."""
     def run() -> Any:
         match = semantic_blocker.check(synthesized, config)
-        if not _processing.enabled():
-            return match, _processing.UNSET
         return match, _processing.take()
 
     return run
@@ -1692,8 +1679,6 @@ def _unpack_judge_result(item: Any) -> tuple[Any, Any]:
 
 def _record_nested_processing(text_taken: Any, tool_takens: list[Any]) -> None:
     """Text sequential + max(tools) onto the parent task's side channel."""
-    if not _processing.enabled():
-        return
     seq: list[float] = []
     if text_taken is not _processing.UNSET:
         seq.append(0.0 if text_taken is None else float(text_taken))
@@ -2109,37 +2094,11 @@ def _collect_semantic_fast(
       questions are deduped by their synthesized sentence (a repeated
       tool call is the same question — asked once).
 
-    Timing: one row per in-scope policy; ``ms`` is the wall clock of
-    this merged walk (shared), not a per-policy slice. When
-    ``EGISAI_POLICY_PROCESSING_MS`` is on, ``ms`` is that question's
+    Timing: one row per in-scope policy; ``ms`` is that question's
     processing (siblings share ``judge_group``; composition counts
-    the group once) and MiniLM CPU rides as local processing.
+    the group once). MiniLM CPU rides as local processing.
     """
     out = _PhaseMatches()
-    if not _processing.enabled():
-        started = time.monotonic()
-        try:
-            return _collect_semantic_fast_body(
-                out,
-                policies,
-                text=text,
-                tool_calls=tool_calls,
-                semantic_blocker=semantic_blocker,
-                side=side,
-                hook=hook,
-            )
-        finally:
-            elapsed = round((time.monotonic() - started) * 1000.0, 3)
-            for policy in policies:
-                out.add_timing(
-                    _policy_timing(
-                        policy,
-                        hook,
-                        elapsed,
-                        judge_group=out.judge_groups.get(id(policy)),
-                    )
-                )
-
     _collect_semantic_fast_body(
         out,
         policies,
@@ -2148,7 +2107,6 @@ def _collect_semantic_fast(
         semantic_blocker=semantic_blocker,
         side=side,
         hook=hook,
-        stamp_processing=True,
     )
     return out
 
@@ -2162,7 +2120,6 @@ def _collect_semantic_fast_body(
     semantic_blocker: SemanticBlocker | None,
     side: str,
     hook: str = "",
-    stamp_processing: bool = False,
 ) -> _PhaseMatches:
     if semantic_blocker is None:
         return out
@@ -2179,10 +2136,9 @@ def _collect_semantic_fast_body(
     active, observations = semantic_local.filter_escalations(
         active, text=windowed, tool_texts=tool_texts
     )
-    if stamp_processing:
-        out.processing_local_ms += round(
-            (time.monotonic() - minilm_started) * 1000.0, 3
-        )
+    out.processing_local_ms += round(
+        (time.monotonic() - minilm_started) * 1000.0, 3
+    )
     judge_started = time.monotonic()
 
     questions = _fast_judge_questions(
@@ -2208,16 +2164,15 @@ def _collect_semantic_fast_body(
                 semantic_in_scope=len(policies),
                 judge_ms=judge_ms,
             )
-        if stamp_processing:
-            for policy in policies:
-                out.add_timing(
-                    _policy_timing(
-                        policy,
-                        hook,
-                        0.0,
-                        judge_group=out.judge_groups.get(id(policy)),
-                    )
+        for policy in policies:
+            out.add_timing(
+                _policy_timing(
+                    policy,
+                    hook,
+                    0.0,
+                    judge_group=out.judge_groups.get(id(policy)),
                 )
+            )
         return out
 
     tasks: list[Callable[[], Any]] = [
@@ -2247,14 +2202,13 @@ def _collect_semantic_fast_body(
             taken = None
         else:
             taken = float(proc)
-        if stamp_processing:
-            wave_items.append((wave_gid, taken))
-            row_ms = 0.0 if taken is None else taken
-            for policy in group:
-                prev = ms_by_policy.get(id(policy))
-                ms_by_policy[id(policy)] = (
-                    row_ms if prev is None else max(prev, row_ms)
-                )
+        wave_items.append((wave_gid, taken))
+        row_ms = 0.0 if taken is None else taken
+        for policy in group:
+            prev = ms_by_policy.get(id(policy))
+            ms_by_policy[id(policy)] = (
+                row_ms if prev is None else max(prev, row_ms)
+            )
         if match is None:
             continue
         owner, _canonical = _owning_policy(match.intent, group)
@@ -2291,19 +2245,18 @@ def _collect_semantic_fast_body(
                     ),
                 )
             )
-    if stamp_processing:
-        wave = _processing.max_wave(wave_items)
-        if wave is not None:
-            out.processing_waves.append(wave)
-        for policy in policies:
-            out.add_timing(
-                _policy_timing(
-                    policy,
-                    hook,
-                    ms_by_policy.get(id(policy), 0.0),
-                    judge_group=out.judge_groups.get(id(policy)),
-                )
+    wave = _processing.max_wave(wave_items)
+    if wave is not None:
+        out.processing_waves.append(wave)
+    for policy in policies:
+        out.add_timing(
+            _policy_timing(
+                policy,
+                hook,
+                ms_by_policy.get(id(policy), 0.0),
+                judge_group=out.judge_groups.get(id(policy)),
             )
+        )
     if observations and semantic_local.shadow_enabled():
         judge_ms = round((time.monotonic() - judge_started) * 1000.0, 3)
         hashed = semantic_local.sha256_text(

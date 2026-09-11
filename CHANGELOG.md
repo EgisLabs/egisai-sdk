@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.79.0] — 2026-09-10
+
+### Changed
+- Policy (`policy_latency_ms`) is always processing time: local CPU
+  plus the judge model's prompt_time + completion_time. Hops, TLS,
+  queue time, and human-approval wait are out of the number. SDK and
+  gateway Policy are now the same measurement.
+
+---
+
 ## [0.78.0] — 2026-09-10
 
 ### Added
