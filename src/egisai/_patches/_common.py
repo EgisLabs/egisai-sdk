@@ -569,9 +569,8 @@ def _run_input_phase(
     # the very first time". The cold-start cost is still surfaced
     # on ``init_latency_ms`` so SOC 2 / capacity-planning use cases
     # don't lose the signal.
-    # When ``EGISAI_POLICY_PROCESSING_MS`` is on, the engine already
-    # composed processing (no hops, no warmup) and we use that
-    # instead of wall − init.
+    # The engine already composed processing (no hops, no warmup)
+    # and we use that instead of wall − init.
     init_ms = get_init_latency()
     ev["policy_latency_ms"] = _processing.latency_ms(
         decision, max(0, elapsed_ms - init_ms)

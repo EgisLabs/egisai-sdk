@@ -1,9 +1,8 @@
-"""Policy processing-time reporting (``EGISAI_POLICY_PROCESSING_MS``).
+"""Policy processing-time reporting.
 
-Off by default. Flag-off leaves ``policy_latency_ms`` as wall-clock
-wait — including every network hop — so existing dashboards do not
-move. Flag-on stamps processing only, so SDK and gateway Policy
-numbers are finally comparable.
+``policy_latency_ms`` is processing only — local CPU plus the judge
+model's prompt_time + completion_time. SDK and gateway stamp the
+same number. There is no opt-out.
 
 The definition below is the stamp-site contract. Do not paraphrase
 it at the call sites; import ``PROCESSING_MS_DEFINITION``.
@@ -12,7 +11,6 @@ it at the call sites; import ``PROCESSING_MS_DEFINITION``.
 from __future__ import annotations
 
 import contextvars
-import os
 from collections.abc import Sequence
 from typing import Any
 
@@ -26,8 +24,6 @@ PROCESSING_MS_DEFINITION = (
     "judge calls in one wave. Count each judge_group once."
 )
 
-FLAG = "EGISAI_POLICY_PROCESSING_MS"
-
 # Sentinel: no check() recorded a value on this task. Distinct from
 # ``None`` (clocks missing — omit, contribute 0) and ``0.0`` (cache
 # hit / no compute).
@@ -36,12 +32,6 @@ UNSET: object = object()
 _last: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "egisai_processing_ms", default=UNSET
 )
-
-
-def enabled() -> bool:
-    """``EGISAI_POLICY_PROCESSING_MS`` — unset/invalid is off."""
-    raw = (os.environ.get(FLAG) or "").strip().lower()
-    return raw in ("1", "true", "yes", "on")
 
 
 def record(ms: float | None) -> None:
@@ -62,13 +52,10 @@ def take() -> Any:
 
 
 def record_from_payload(data: Any, *, cache_hit: bool = False) -> None:
-    """SDK clients: honour ``processing_ms`` only when the flag is on.
+    """SDK clients: honour ``processing_ms`` from the judge / injection JSON.
 
-    Flag-off ignores a backend that already emits the field, so an
-    old SDK + new backend cannot change today's Policy number.
+    Missing field → omit (``None``), never the HTTP wait.
     """
-    if not enabled():
-        return
     if cache_hit:
         record(0.0)
         return
@@ -104,7 +91,7 @@ def max_wave(
 
 
 def rule_ms(wall: float, taken: Any) -> float:
-    """Per-rule ``PolicyTiming.ms`` under the processing flag.
+    """Per-rule ``PolicyTiming.ms``.
 
     Unset (local rule, or judge never called) keeps the wall — that
     wall *is* local CPU. A recorded ``None`` stamps 0 (omit). A

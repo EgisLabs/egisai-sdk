@@ -1,9 +1,8 @@
-"""``EGISAI_POLICY_PROCESSING_MS`` — processing, not wait.
+"""Policy is processing time, not wait.
 
-Flag-off leaves enforcement and today's wall-clock Policy number
-untouched. Flag-on composes local CPU + judge prompt+completion,
-counts a merged ``judge_group`` once, and never falls back to the
-HTTP wait when clocks are missing.
+Composes local CPU + judge prompt+completion, counts a merged
+``judge_group`` once, and never falls back to the HTTP wait when
+clocks are missing.
 """
 
 from __future__ import annotations
@@ -94,49 +93,7 @@ def _enforcement(decision: Any) -> dict[str, Any]:
     }
 
 
-def test_flag_off_processing_ms_is_none() -> None:
-    calls = {"n": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls["n"] += 1
-        return httpx.Response(200, json=_allow_json(processing_ms=40.0))
-
-    decision = evaluate_policies(
-        [_pii(), _guard("g1", "exfiltrate secrets")],
-        _ctx("hello"),
-        semantic_blocker=_blocker(handler),
-    )
-    assert decision.processing_ms is None
-    assert calls["n"] == 1
-    assert _enforcement(decision)["verdict"] == "allow"
-    sem = next(t for t in decision.policy_timings if t.type == "semantic_guard")
-    # Wall, not the 40 ms the JSON offered — flag off ignores it.
-    assert sem.ms >= 0.0
-
-
-def test_flag_off_backend_processing_ms_ignored(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("EGISAI_POLICY_PROCESSING_MS", raising=False)
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=_allow_json(processing_ms=999.0))
-
-    decision = evaluate_policies(
-        [_guard("g1", "exfiltrate secrets")],
-        _ctx("hello"),
-        semantic_blocker=_blocker(handler),
-    )
-    assert decision.processing_ms is None
-    row = decision.policy_timings[0]
-    assert row.ms != 999.0
-
-
-def test_flag_on_uses_processing_not_wait(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("EGISAI_POLICY_PROCESSING_MS", "true")
-
+def test_uses_processing_not_wait() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=_allow_json(processing_ms=41.5))
 
@@ -147,13 +104,10 @@ def test_flag_on_uses_processing_not_wait(
     )
     assert decision.processing_ms == pytest.approx(41.5)
     assert decision.policy_timings[0].ms == pytest.approx(41.5)
+    assert _processing.latency_ms(decision, 800) == 42
 
 
-def test_flag_on_missing_clocks_omit_not_wait(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("EGISAI_POLICY_PROCESSING_MS", "true")
-
+def test_missing_clocks_omit_not_wait() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=_allow_json())
 
@@ -166,8 +120,7 @@ def test_flag_on_missing_clocks_omit_not_wait(
     assert decision.policy_timings[0].ms == pytest.approx(0.0)
 
 
-def test_flag_on_cache_hit_is_zero(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("EGISAI_POLICY_PROCESSING_MS", "true")
+def test_cache_hit_is_zero() -> None:
     calls = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -191,7 +144,6 @@ def test_flag_on_cache_hit_is_zero(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_merge_counts_judge_group_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("EGISAI_POLICY_PROCESSING_MS", "true")
     monkeypatch.setenv("EGISAI_FAST_GOVERNANCE", "on")
     calls = {"n": 0}
 
@@ -215,9 +167,7 @@ def test_merge_counts_judge_group_once(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(groups) == 1
 
 
-def test_parallel_wave_is_max_not_sum(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("EGISAI_POLICY_PROCESSING_MS", "true")
-    # Legacy walk: two guards, two parallel POSTs, different groups.
+def test_parallel_wave_is_max_not_sum() -> None:
     n = {"i": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -237,9 +187,7 @@ def test_parallel_wave_is_max_not_sum(monkeypatch: pytest.MonkeyPatch) -> None:
     assert decision.processing_ms == pytest.approx(40.0)
 
 
-def test_sequential_phases_sum(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("EGISAI_POLICY_PROCESSING_MS", "true")
-
+def test_sequential_phases_sum() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=_allow_json(processing_ms=20.0))
 
@@ -267,17 +215,12 @@ def test_sequential_phases_sum(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     assert inp.processing_ms == pytest.approx(20.0)
     assert out.processing_ms == pytest.approx(20.0)
-    # Stamp sites add sequential evaluate() results.
     assert _processing.latency_ms(inp, 999) + _processing.latency_ms(
         out, 999
     ) == 40
 
 
-def test_flag_off_enforcement_unchanged_when_json_has_clocks(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("EGISAI_POLICY_PROCESSING_MS", raising=False)
-
+def test_enforcement_unchanged_when_json_has_clocks() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=_allow_json(processing_ms=40.0))
 
@@ -285,8 +228,10 @@ def test_flag_off_enforcement_unchanged_when_json_has_clocks(
     a = evaluate_policies(policies, _ctx("hello"), semantic_blocker=_blocker(handler))
     b = evaluate_policies(policies, _ctx("hello"), semantic_blocker=_blocker(handler))
     assert _enforcement(a) == _enforcement(b)
-    assert a.processing_ms is None
-    assert b.processing_ms is None
+    assert a.processing_ms is not None
+    assert b.processing_ms is not None
+    assert a.processing_ms >= 40.0
+    assert b.processing_ms >= 40.0
 
 
 def test_max_wave_counts_group_once() -> None:
