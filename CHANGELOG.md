@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.79.3] — 2026-10-10
+
+### Fixed
+- Multi-tool `semantic_guard` parallelism regression test no longer
+  flakes on cold CI runners (asserts overlapping judge calls instead
+  of wall-clock).
+
+---
+
 ## [0.79.2] — 2026-10-09
 
 ### Fixed

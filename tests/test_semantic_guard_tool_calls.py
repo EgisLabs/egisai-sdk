@@ -277,26 +277,39 @@ def test_matcher_parallelizes_judge_calls_for_multi_tool_turns() -> None:
     collapses to ``max(t_i) + thread overhead`` rather than
     ``sum(t_i)``.
 
-    The test stubs the judge with a per-call sleep so a *strictly
-    sequential* implementation would take ``N × delay`` and a
-    *parallel* implementation takes ~``delay``. Asserting on the
-    elapsed wall-clock makes the regression alarm fire if some
-    future refactor accidentally re-serialises the loop.
+    Assert on *observed concurrency* (peak in-flight judge calls),
+    not wall-clock. Wall-clock was flake-prone on CI: the matcher
+    PII-label-redacts every tool's args *before* the fan-out, and a
+    cold Presidio/spaCy load on one matrix cell could push elapsed
+    near the sequential floor even when the judges themselves
+    overlapped. Counting concurrent handlers is immune to that.
     """
+    import threading
     import time as _time
 
     from egisai.policy.engine import _semantic_guard_match
 
-    delay_per_call = 0.15  # 150 ms each — exaggerates the difference
+    delay_per_call = 0.15  # long enough for siblings to overlap
     n_tools = 6
+    in_flight = 0
+    max_in_flight = 0
+    lock = threading.Lock()
 
     def transport_handler(request: httpx.Request) -> httpx.Response:
-        _time.sleep(delay_per_call)
-        return httpx.Response(200, json=_stub_judge_no_match())
+        nonlocal in_flight, max_in_flight
+        with lock:
+            in_flight += 1
+            if in_flight > max_in_flight:
+                max_in_flight = in_flight
+        try:
+            _time.sleep(delay_per_call)
+            return httpx.Response(200, json=_stub_judge_no_match())
+        finally:
+            with lock:
+                in_flight -= 1
 
     blocker = _make_blocker(transport_handler)
 
-    started = _time.monotonic()
     record = _semantic_guard_match(
         policy=_rule(
             intents=["wipe the production database"],
@@ -310,22 +323,15 @@ def test_matcher_parallelizes_judge_calls_for_multi_tool_turns() -> None:
         semantic_blocker=blocker,
         side="output",
     )
-    elapsed = _time.monotonic() - started
 
     assert record is None, (
         "no match expected — every tool returns no_match"
     )
-    # Sequential lower bound: ``n_tools * delay_per_call`` =
-    # 6 × 150 ms = 900 ms. Parallel upper bound (with thread pool
-    # overhead): generous 600 ms ceiling. We anchor the assertion
-    # well below the sequential lower bound so a flake-free CI
-    # signal still proves parallelism.
-    sequential_floor = n_tools * delay_per_call
-    assert elapsed < sequential_floor * 0.7, (
-        f"expected parallel evaluation; took {elapsed:.2f}s for "
-        f"{n_tools} tools at {delay_per_call:.2f}s each. "
-        f"Sequential lower bound is {sequential_floor:.2f}s; the "
-        f"matcher must collapse to ~max(t_i) + pool overhead."
+    # Strictly sequential would keep max_in_flight at 1. Parallel
+    # fan-out (budget ≥ 2) must overlap at least two sleeps.
+    assert max_in_flight >= 2, (
+        f"expected parallel judge calls; peak in-flight was "
+        f"{max_in_flight} for {n_tools} tools (want ≥ 2)."
     )
 
 
