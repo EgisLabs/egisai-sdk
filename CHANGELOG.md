@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.79.2] — 2026-10-09
+
+### Fixed
+- `egisai.Client` without `provider_key` always uses BYOK vault mode.
+  A stray `OPENAI_API_KEY` in the environment no longer silently becomes
+  the Authorization bearer (which hid a missing Gateway vault key
+  behind a vague upstream "Incorrect API key").
+- Backend HTTP errors from handshake / policy fetch now include a short
+  hint (bad key, wrong URL, rate limit) instead of only the status code.
+
+---
+
+## [0.79.1] — 2026-09-23
+
+### Fixed
+- When several detectors match the same digits, the label follows the nearby words if that detector also matched. Otherwise a real check, such as a card number, beats a loose guess. A match that merely starts earlier no longer wins.
+- Newer Mastercard numbers (the 2-series) are recognized as cards instead of falling through to a bank-account guess.
+- A bare run of digits is still hidden, but it is no longer labeled a bank account unless the words nearby mention a bank or account.
+
+---
+
 ## [0.79.0] — 2026-09-10
 
 ### Changed

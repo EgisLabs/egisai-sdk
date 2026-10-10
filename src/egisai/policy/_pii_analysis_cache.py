@@ -106,6 +106,7 @@ ceiling described above).
 from __future__ import annotations
 
 import hashlib
+import inspect
 import logging
 import os
 import threading
@@ -152,6 +153,9 @@ class Span:
     start: int
     end: int
     score: float
+    # True when nearby words agreed with this detector. A bool, never
+    # the word itself — the cache must not retain prompt text.
+    context: bool = False
 
 
 def _env_float(name: str, default: float) -> float:
@@ -505,6 +509,7 @@ def _analyze_chunked(
                 start=span.start + start,
                 end=span.end + start,
                 score=span.score,
+                context=span.context,
             )
             for span in analyze_cached(
                 analyzer, text=text[start:end], entities=entities
@@ -537,6 +542,7 @@ def _analyze_chunked(
                     start=last.start,
                     end=max(last.end, span.end),
                     score=max(last.score, span.score),
+                    context=last.context or span.context,
                 )
                 continue
         merged.append(span)
@@ -559,16 +565,52 @@ def _analyze(
     thing this engine must never do (security-and-compliance rule 4).
     """
     with _get_gate():
-        results = analyzer.analyze(text=text, entities=entities, language="en")
+        # Keep the decision trace long enough to see whether nearby
+        # words supported the hit. The trace is reduced to a bool
+        # below and is not cached as text. Fakes used in tests don't
+        # accept the flag; a real Presidio engine does.
+        results = analyzer.analyze(
+            **_analyze_kwargs(analyzer, text=text, entities=entities)
+        )
     return tuple(
         Span(
             entity_type=r.entity_type,
             start=int(r.start),
             end=int(r.end),
             score=float(r.score),
+            context=_context_supported(r),
         )
         for r in results
     )
+
+
+def _analyze_kwargs(
+    analyzer: Any,
+    *,
+    text: str,
+    entities: list[str] | None,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "text": text,
+        "entities": entities,
+        "language": "en",
+    }
+    try:
+        params = inspect.signature(analyzer.analyze).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if "return_decision_process" in params:
+        kwargs["return_decision_process"] = True
+    return kwargs
+
+
+def _context_supported(result: Any) -> bool:
+    """Whether Presidio's context enhancer agreed with this hit."""
+    explanation = getattr(result, "analysis_explanation", None)
+    if explanation is None:
+        return False
+    word = getattr(explanation, "supportive_context_word", "") or ""
+    return bool(str(word).strip())
 
 
 def clear() -> None:

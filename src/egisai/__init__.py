@@ -14,7 +14,12 @@ plus an httpx / requests fallback.
 
 from __future__ import annotations
 
-__version__ = "0.79.0"
+__version__ = "0.79.2"
+
+# Stamped ``True`` only in private on-prem wheels / control-plane builds.
+# Public PyPI builds keep ``False``. Used to refuse the cloud URL default
+# and to let ``doctor`` detect a dependency-confused install.
+__onprem_build__ = False
 
 # Human-in-the-loop approvals — raised when a call is held for human
 # approval and the in-line wait budget elapses without a decision.
@@ -54,6 +59,7 @@ __all__ = [
     "PolicyRule",
     "PromptIdentity",
     "__version__",
+    "__onprem_build__",
     "agent",
     "canonicalize_identity_text",
     "derive_prompt_identity",

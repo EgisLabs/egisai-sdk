@@ -963,7 +963,16 @@ def _build_input_tokens_details() -> Any:
             InputTokensDetails,
         )
 
-        return InputTokensDetails(cached_tokens=0, cache_write_tokens=0)
+        # Runtime openai models and published stubs disagree on whether
+        # ``cache_write_tokens`` exists. Prefer the full shape when the
+        # live model accepts it; never lose the duck-typed attribute for
+        # callers that still read it.
+        fields = getattr(InputTokensDetails, "model_fields", None)
+        if isinstance(fields, dict) and "cache_write_tokens" in fields:
+            return InputTokensDetails(  # type: ignore[call-arg]
+                cached_tokens=0, cache_write_tokens=0
+            )
+        return InputTokensDetails(cached_tokens=0)  # type: ignore[call-arg]
     except Exception:
         from types import SimpleNamespace
 
