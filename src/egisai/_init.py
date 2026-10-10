@@ -94,9 +94,10 @@ def init(
     env
         Free-form environment label (``"dev"``, ``"staging"``, ``"prod"``).
     base_url
-        Override the platform URL. Defaults to ``EGISAI_BASE_URL`` or
-        ``https://app.egisai.co``. Only needed for self-hosted /
-        regional installs.
+        Override the platform URL. Cloud builds default to
+        ``EGISAI_BASE_URL`` or ``https://app.egisai.co``. On-prem builds
+        (``egisai.__onprem_build__``) **require** an explicit
+        ``base_url`` or ``EGISAI_BASE_URL`` and refuse the cloud host.
     on_block
         ``"raise"`` (default) — raise ``PermissionError`` when a policy
         denies a call. ``"stub"`` — return a framework-shaped "blocked"
@@ -374,13 +375,13 @@ def init(
         else:
             resolved_cloud_identity = bool(cloud_identity)
 
+        from egisai._base_url import resolve_platform_base_url
+
         cfg = EgisaiConfig(
             api_key=api_key,
             app=app,
             env=env,
-            base_url=base_url
-            or os.getenv("EGISAI_BASE_URL")
-            or "https://app.egisai.co",
+            base_url=resolve_platform_base_url(base_url),
             on_block=on_block,  # type: ignore[arg-type]
             on_pending=on_pending,  # type: ignore[arg-type]
             approval_wait_budget_ms=resolved_budget_ms,

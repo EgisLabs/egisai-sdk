@@ -151,7 +151,17 @@ def close_client() -> None:
 
 
 def _http_error(*, op: str, status: int) -> BackendError:
-    """Build a ``BackendError`` with operation name + HTTP status only."""
+    """Build a ``BackendError`` with operation name + a short actionable hint."""
+    hints = {
+        401: "check api_key / EGISAI_API_KEY (egis_live_…)",
+        403: "this key is not allowed for this operation",
+        404: "platform URL may be wrong (base_url / EGISAI_BASE_URL)",
+        429: "rate limited — retry shortly",
+        503: "platform temporarily unavailable — retry shortly",
+    }
+    hint = hints.get(status)
+    if hint:
+        return BackendError(f"{op} failed (HTTP {status}): {hint}")
     return BackendError(f"{op} failed (HTTP {status})")
 
 

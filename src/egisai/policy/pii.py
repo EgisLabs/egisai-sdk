@@ -492,33 +492,20 @@ def _scan_with_presidio(
         analyzer, text=text, entities=entities
     )
     findings: list[PIIFinding] = []
-    for r in results:
-        if not _pii_scores.is_believable(
-            r.entity_type, float(r.score), text[r.start : r.end]
-        ):
-            # Recognizer fired below the confidence its own design
-            # says is believable — see :mod:`egisai.policy._pii_scores`.
-            continue
-        op_type = _pii_taxonomy.type_for_entity(r.entity_type)
-        if op_type is None:
-            # Recognizer fired for an entity we don't expose to the
-            # operator; ignore so we don't surface taxonomy-internal
-            # noise on audit records.
-            continue
-        if type_filter is not None and op_type not in type_filter:
-            continue
-        raw = text[r.start : r.end]
-        # Email post-filter: strip RFC-2606 reserved domains.
-        if op_type == "email" and "@" in raw:
-            domain = raw.rsplit("@", 1)[-1]
-            if is_reserved_email_domain(domain):
-                continue
+    for decision in _resolve_detections(text, results, type_filter):
+        raw = text[decision.start : decision.end]
+        if decision.confirmed:
+            redacted = _redact_value(decision.op_type, raw)
+        else:
+            # Digits stay hidden, but the preview must not name a type
+            # the loose pattern only guessed.
+            redacted = re.sub(r"\d", "#", raw)
         findings.append(
             PIIFinding(
-                type=op_type,
-                value_redacted=_redact_value(op_type, raw),
-                confidence=float(r.score),
-                method=f"presidio:{r.entity_type}",
+                type=decision.op_type,
+                value_redacted=redacted,
+                confidence=decision.score,
+                method=f"presidio:{decision.entity_type}",
             )
         )
     return findings
@@ -564,6 +551,196 @@ def _label_redact_with_presidio(
     return masked
 
 
+# A checksum recognizer that passed validation is scored at Presidio's
+# maximum (1.0). Anything at or above this line actually checked out.
+_CHECKSUM_SCORE = 0.99
+
+
+@dataclass(frozen=True, slots=True)
+class _Hit:
+    start: int
+    end: int
+    op_type: str
+    score: float
+    entity_type: str
+    context: bool
+    # Loose pattern. ``US_BANK_NUMBER`` is "any 8–17 digits". Nearby
+    # words can let it win, but a real check (a card, a phone the
+    # words named) always beats it.
+    weak: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _Decision:
+    start: int
+    end: int
+    op_type: str
+    score: float
+    entity_type: str
+    # False for a loose guess with no supporting words. The digits are
+    # still removed, but the text must not claim a specific type.
+    confirmed: bool
+
+
+def _hit_has_context(result: Any) -> bool:
+    """Whether nearby words supported this hit.
+
+    Cached spans carry that as a bool. A live Presidio result carries
+    it on the explanation. Either one is enough.
+    """
+    if getattr(result, "context", None) is True:
+        return True
+    explanation = getattr(result, "analysis_explanation", None)
+    if explanation is None:
+        return False
+    word = getattr(explanation, "supportive_context_word", "") or ""
+    return bool(str(word).strip())
+
+
+def _is_weak_guess(entity_type: str) -> bool:
+    """True for the bank recognizer that matches any 8–17 digit run.
+
+    Presidio scores that pattern 0.05 until nearby words ("account",
+    "bank") lift it. It stays a loose guess even after that lift, so
+    a card checksum or a context-backed phone can still beat it.
+    """
+    return entity_type == "US_BANK_NUMBER"
+
+
+def _collect_hits(
+    text: str,
+    raw_results: Sequence[Any],
+    type_filter: list[str] | None,
+) -> list[_Hit]:
+    hits: list[_Hit] = []
+    for result in raw_results:
+        score = float(result.score)
+        raw = text[result.start : result.end]
+        if not _pii_scores.is_believable(result.entity_type, score, raw):
+            continue
+        op_type = _pii_taxonomy.type_for_entity(result.entity_type)
+        if op_type is None:
+            continue
+        if type_filter is not None and op_type not in type_filter:
+            continue
+        if op_type == "email" and "@" in raw:
+            domain = raw.rsplit("@", 1)[-1]
+            if is_reserved_email_domain(domain):
+                continue
+        hits.append(
+            _Hit(
+                start=int(result.start),
+                end=int(result.end),
+                op_type=op_type,
+                score=score,
+                entity_type=str(result.entity_type),
+                context=_hit_has_context(result),
+                weak=_is_weak_guess(str(result.entity_type)),
+            )
+        )
+    return hits
+
+
+def _clusters(hits: list[_Hit]) -> list[list[_Hit]]:
+    """Group hits that cover the same digits.
+
+    Touching at an edge (one ends where the next starts) is not an
+    overlap — those are two values.
+    """
+    ordered = sorted(hits, key=lambda hit: (hit.start, hit.end))
+    groups: list[list[_Hit]] = []
+    for hit in ordered:
+        if not groups or hit.start >= max(item.end for item in groups[-1]):
+            groups.append([hit])
+        else:
+            groups[-1].append(hit)
+    return groups
+
+
+def _pick_winner(cluster: list[_Hit]) -> _Hit | None:
+    """Choose the type for one overlap cluster.
+
+    Order, first match wins the pool, then the highest score in it:
+
+    1. A detector the nearby words support, and that is not a loose
+       guess. "Phone number" then beats a health-number checksum that
+       the words never mentioned.
+    2. A value that actually checked out (card checksum and the like),
+       even if a loose pattern nearby was context-boosted. A real card
+       next to the word "account" stays a card.
+    3. Whatever the nearby words support, including a confirmed bank
+       account.
+    4. The strongest remaining hit that is not a loose guess.
+
+    A cluster of only loose guesses returns ``None``. The digits are
+    still hidden by the caller, without a type label.
+    """
+    supported = [hit for hit in cluster if hit.context and not hit.weak]
+    if supported:
+        pool = supported
+    else:
+        checked = [
+            hit
+            for hit in cluster
+            if hit.score >= _CHECKSUM_SCORE and not hit.weak
+        ]
+        if checked:
+            pool = checked
+        else:
+            contextual = [hit for hit in cluster if hit.context]
+            if contextual:
+                pool = contextual
+            else:
+                pool = [hit for hit in cluster if not hit.weak]
+    if not pool:
+        return None
+    return max(pool, key=lambda hit: (hit.score, hit.end - hit.start, -hit.start))
+
+
+def _resolve_detections(
+    text: str,
+    raw_results: Sequence[Any],
+    type_filter: list[str] | None,
+) -> list[_Decision]:
+    """One decision per value, shared by scan, sanitize, and label."""
+    decisions: list[_Decision] = []
+    for cluster in _clusters(_collect_hits(text, raw_results, type_filter)):
+        winner = _pick_winner(cluster)
+        if winner is None:
+            decisions.append(
+                _Decision(
+                    start=min(hit.start for hit in cluster),
+                    end=max(hit.end for hit in cluster),
+                    op_type="bank_account",
+                    score=max(hit.score for hit in cluster),
+                    entity_type="US_BANK_NUMBER",
+                    confirmed=False,
+                )
+            )
+            continue
+        start, end = winner.start, winner.end
+        for hit in cluster:
+            # A loose guess that sticks out past the winner would
+            # leave digits in the clear. Fold those digits into the
+            # winner's mask. Do not fold a losing *strong* hit — that
+            # span is a different claim, and extending into it can
+            # swallow the words around the value.
+            if hit.weak and hit.start < winner.end and winner.start < hit.end:
+                start = min(start, hit.start)
+                end = max(end, hit.end)
+        decisions.append(
+            _Decision(
+                start=start,
+                end=end,
+                op_type=winner.op_type,
+                score=winner.score,
+                entity_type=winner.entity_type,
+                confirmed=True,
+            )
+        )
+    return decisions
+
+
 def _apply_results(
     text: str,
     raw_results: Sequence[Any],
@@ -572,65 +749,37 @@ def _apply_results(
     mask_char: str,
     label_mode: bool,
 ) -> tuple[str, list[Sanitization]]:
-    """Common masker for Presidio results.
+    """Mask Presidio hits after overlap resolution.
 
-    Walks the analyzer output, translates each Presidio entity to an
-    operator type (dropping unknowns), filters by ``type_filter``,
-    drops reserved-domain emails, and rewrites the spans.
-
-    When two recognizers overlap on the same span (e.g. an SSN that
-    also looks like a sequence of digits), the higher-score entity
-    wins; this matches Presidio's own "highest score wins" merge
-    Behavior and prevents double-masking.
+    See :func:`_pick_winner` for which detector keeps the label when
+    several claim the same digits. A loose bank-account guess with no
+    supporting words still has its digits removed, but the replacement
+    is a digit mask rather than a ``<BANK_ACCOUNT>`` label.
     """
-    selected: list[tuple[int, int, str, float]] = []
-    for r in raw_results:
-        # Same test the reporting path applies, so a span that gets
-        # masked here is always one ``scan`` also reported.
-        if not _pii_scores.is_believable(
-            r.entity_type, float(r.score), text[r.start : r.end]
-        ):
-            continue
-        op_type = _pii_taxonomy.type_for_entity(r.entity_type)
-        if op_type is None:
-            continue
-        if type_filter is not None and op_type not in type_filter:
-            continue
-        raw = text[r.start : r.end]
-        if op_type == "email" and "@" in raw:
-            domain = raw.rsplit("@", 1)[-1]
-            if is_reserved_email_domain(domain):
-                continue
-        selected.append((r.start, r.end, op_type, float(r.score)))
-
-    selected.sort(key=lambda it: (it[0], -it[3]))
-
-    # Drop overlapping spans — keep the first (highest-score after
-    # the sort), discard later ones that fall inside it.
-    merged: list[tuple[int, int, str]] = []
-    last_end = -1
-    for start, end, op_type, _score in selected:
-        if start < last_end:
-            continue
-        merged.append((start, end, op_type))
-        last_end = end
+    decisions = _resolve_detections(text, raw_results, type_filter)
 
     counts: dict[str, int] = {}
     sample_pattern: dict[str, str] = {}
 
     pieces: list[str] = []
     cursor = 0
-    for start, end, op_type in merged:
-        pieces.append(text[cursor:start])
-        raw = text[start:end]
-        if label_mode:
-            replacement = _label_for(op_type)
+    for decision in decisions:
+        pieces.append(text[cursor : decision.start])
+        raw = text[decision.start : decision.end]
+        if not decision.confirmed:
+            # Hide the digits without naming a type. ``label_redact``
+            # throws the records away; ``sanitize`` keeps one so a
+            # policy that already redacts bank accounts still does.
+            replacement = re.sub(r"\d", mask_char, raw)
+        elif label_mode:
+            replacement = _label_for(decision.op_type)
         else:
-            replacement = _mask_value(op_type, raw, mask_char)
-            counts[op_type] = counts.get(op_type, 0) + 1
-            sample_pattern.setdefault(op_type, replacement)
+            replacement = _mask_value(decision.op_type, raw, mask_char)
+        if not label_mode:
+            counts[decision.op_type] = counts.get(decision.op_type, 0) + 1
+            sample_pattern.setdefault(decision.op_type, replacement)
         pieces.append(replacement)
-        cursor = end
+        cursor = decision.end
     pieces.append(text[cursor:])
 
     records = [
@@ -764,10 +913,31 @@ _WORD_PLACEHOLDERS: dict[str, str] = {
 
 _CC_RE = re.compile(
     r"\b"
-    r"(?:4\d{3}|5[1-5]\d{2}|3[47]\d{2}|6(?:011|5\d{2}))"
+    r"(?:4\d{3}|5[1-5]\d{2}|3[47]\d{2}|6(?:011|5\d{2})"
+    # Mastercard 2-series (2221–2720). Presidio's built-in card
+    # pattern skips this range; without it a real card falls through
+    # to the loose bank-account guess.
+    r"|222[1-9]|22[3-9]\d|2[3-6]\d{2}|27[01]\d|2720)"
     r"[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{1,4}"
     r"\b"
 )
+
+
+def _is_card_number(digits: str) -> bool:
+    """True for a Luhn-valid card, including Mastercard 2-series.
+
+    Numbers that start with ``2`` are only cards when they are 16
+    digits inside the 2221–2720 range. Any other prefix keeps the
+    long-standing 13–19 digit rule.
+    """
+    if not digits.isdigit() or not luhn_check(digits):
+        return False
+    if digits.startswith("2"):
+        if len(digits) != 16:
+            return False
+        iin = int(digits[:4])
+        return 2221 <= iin <= 2720
+    return 13 <= len(digits) <= 19
 _SSN_RE = re.compile(r"\b(\d{3})[\s\-](\d{2})[\s\-](\d{4})\b")
 _INVALID_SSN_AREAS = {0, 666} | set(range(900, 1000))
 _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
@@ -860,7 +1030,7 @@ def _scan_with_fallback(
     if wants("credit_card"):
         for m in _CC_RE.finditer(text):
             digits = re.sub(r"\D", "", m.group())
-            if 13 <= len(digits) <= 19 and luhn_check(digits):
+            if _is_card_number(digits):
                 conf = 0.85 + _context_boost(text, m.start(), m.end(), "credit_card")
                 findings.append(
                     PIIFinding(
@@ -1031,7 +1201,7 @@ def _sanitize_with_fallback(
     if wants("credit_card"):
         def _cc_repl(m: re.Match[str]) -> str:
             digits = re.sub(r"\D", "", m.group(0))
-            if len(digits) < 13 or len(digits) > 19 or not luhn_check(digits):
+            if not _is_card_number(digits):
                 return m.group(0)
             rendered = re.sub(r"\d", mask_char, m.group(0))
             _bump("credit_card", rendered)
@@ -1132,7 +1302,7 @@ def _label_redact_with_fallback(
     if wants("credit_card"):
         def _cc_repl(m: re.Match[str]) -> str:
             digits = re.sub(r"\D", "", m.group(0))
-            if len(digits) < 13 or len(digits) > 19 or not luhn_check(digits):
+            if not _is_card_number(digits):
                 return m.group(0)
             return _label_for("credit_card")
         text = _CC_RE.sub(_cc_repl, text)

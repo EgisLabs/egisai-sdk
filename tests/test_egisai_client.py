@@ -111,15 +111,16 @@ def test_client_without_any_key_raises() -> None:
 
 
 def test_client_vault_mode_sends_sentinel_not_provider_key(monkeypatch) -> None:
-    """No provider_key + no OPENAI_API_KEY → BYOK vault mode.
+    """No provider_key → BYOK vault mode (even if OPENAI_API_KEY is set).
 
     The Client still authenticates with the Egis key, but Authorization
     carries an Egis-namespaced placeholder the Gateway resolves against
     the org's stored provider keys — never a real provider credential.
+    A stray OPENAI_API_KEY must not flip this into passthrough.
     """
     from egisai._client import _VAULT_SENTINEL
 
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-should-not-be-used")
     monkeypatch.setattr(_config, "_CONFIG", None)
     seen: dict[str, Any] = {}
     client = egisai.Client(
@@ -132,6 +133,7 @@ def test_client_vault_mode_sends_sentinel_not_provider_key(monkeypatch) -> None:
     )
     assert seen["egis_key"] == "egis_live_key"
     assert seen["auth"] == f"Bearer {_VAULT_SENTINEL}"
+    assert "sk-should-not-be-used" not in (seen["auth"] or "")
 
 
 def test_set_context_rides_along_when_init_is_active() -> None:

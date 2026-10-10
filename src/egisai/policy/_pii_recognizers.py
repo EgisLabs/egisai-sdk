@@ -447,6 +447,41 @@ class WordFormDigitsRecognizer(EntityRecognizer):
 # ── Registration helper ─────────────────────────────────────────────
 
 
+class MastercardRangeRecognizer(PatternRecognizer):
+    """Mastercard numbers Presidio's built-in card pattern skips.
+
+    The shipped pattern covers Visa, the 51–55 Mastercard range, Amex,
+    and Discover. Mastercard's 2-series (2221–2720) is a real card and
+    was falling through to the loose "any long number" bank guess.
+    Checksum failure drops the hit, so a 16-digit string that merely
+    starts with 2 is not labeled a card.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            supported_entity="CREDIT_CARD",
+            name="EgisMastercardRangeRecognizer",
+            supported_language="en",
+            patterns=[
+                Pattern(
+                    name="Mastercard 2-series",
+                    regex=r"\b2\d{3}(?:[-\s]?\d{4}){3}\b",
+                    score=0.3,
+                )
+            ],
+            context=["credit", "card", "mastercard", "debit"],
+        )
+
+    def validate_result(self, pattern_text: str) -> bool:
+        digits = re.sub(r"\D", "", pattern_text)
+        if len(digits) != 16:
+            return False
+        iin = int(digits[:4])
+        if iin < 2221 or iin > 2720:
+            return False
+        return luhn_check(digits)
+
+
 def register_custom_recognizers(registry) -> None:  # type: ignore[no-untyped-def]
     """Add every Egis-prefixed recognizer to a Presidio ``RecognizerRegistry``.
 
@@ -461,6 +496,7 @@ def register_custom_recognizers(registry) -> None:  # type: ignore[no-untyped-de
         PasswordRecognizer(),
         DateOfBirthRecognizer(),
         WordFormDigitsRecognizer(),
+        MastercardRangeRecognizer(),
     )
     for rec in custom_recognizers:
         # ``rec.name`` is set by Presidio's ``EntityRecognizer.__init__``
