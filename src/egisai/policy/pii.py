@@ -52,6 +52,7 @@ from egisai.policy import (
 )
 from egisai.policy._pii_helpers import (
     is_reserved_email_domain,
+    is_valid_spanish_nif,
     luhn_check,
     shannon_entropy,
     word_run_to_digits,
@@ -950,6 +951,11 @@ _PHONE_RE = re.compile(
 _IBAN_RE = re.compile(
     r"\b([A-Z]{2}\d{2}[\s]?[\dA-Z]{4}[\s]?(?:[\dA-Z]{4}[\s]?){1,7}[\dA-Z]{1,4})\b"
 )
+# Spanish DNI / NIF / NIE. The regex is broad; ``is_valid_spanish_nif``
+# does the mod-23 control-letter check so a random ``\d{8}[A-Z]`` run
+# is rejected ~22/23 of the time. Mirrors the Presidio-side
+# ``SpanishNifRecognizer`` so detection is identical warm or cold.
+_ES_NIF_RE = re.compile(r"\b(?:[XYZ]\d{7}|\d{8})[A-Z]\b", re.IGNORECASE)
 _KEY_RE = re.compile(
     r"(?:"
     r"(?:sk|pk|api|key|token|secret|bearer|ghp|gho|ghu|ghs|ghr|glpat|"
@@ -983,6 +989,7 @@ _CONTEXT_KEYWORDS: dict[str, list[str]] = {
     "email": ["email", "e-mail", "mailto", "contact"],
     "phone": ["phone", "mobile", "cell", "tel", "call", "sms", "whatsapp"],
     "iban": ["iban", "bank", "account", "transfer", "swift", "bic"],
+    "national_id": ["dni", "nif", "nie", "documento", "identidad", "national id"],
 }
 _CONTEXT_WINDOW = 60
 
@@ -1020,9 +1027,10 @@ def _scan_with_fallback(
     """Regex+checksum scan covering the highest-impact entities only.
 
     Coverage parity with the pre-Presidio engine: SSN, credit card,
-    IBAN, email, phone, API key — all checksum or context validated.
-    Anything Presidio adds (passport, names, multi-country IDs, …)
-    requires the warm path; callers degrade gracefully.
+    IBAN, Spanish national ID (DNI/NIF/NIE), email, phone, API key —
+    all checksum or context validated. Anything Presidio adds
+    (passport, names, other multi-country IDs, …) requires the warm
+    path; callers degrade gracefully.
     """
     findings: list[PIIFinding] = []
     wants = lambda op_type: type_filter is None or op_type in type_filter  # noqa: E731
@@ -1067,6 +1075,19 @@ def _scan_with_fallback(
                     value_redacted=clean[:4] + "****" + clean[-4:],
                     confidence=min(1.0, conf),
                     method="mod97",
+                )
+            )
+    if wants("national_id"):
+        for m in _ES_NIF_RE.finditer(text):
+            raw = m.group()
+            if not is_valid_spanish_nif(raw):
+                continue
+            findings.append(
+                PIIFinding(
+                    type="national_id",
+                    value_redacted="***" + raw[-1],
+                    confidence=0.9,
+                    method="es_nif_mod23",
                 )
             )
     if wants("email"):
@@ -1175,9 +1196,9 @@ def _sanitize_with_fallback(
     """Mask validated PII using the regex+checksum engine.
 
     Mirrors the operator-facing types our regex chain knows about:
-    ssn, credit_card, iban, email, phone, api_key. Other types are
-    silently no-ops in this code path — they require the warm
-    Presidio engine.
+    ssn, credit_card, iban, national_id (Spanish DNI/NIF/NIE), email,
+    phone, api_key. Other types are silently no-ops in this code
+    path — they require the warm Presidio engine.
     """
     counts: dict[str, int] = {}
     sample_pattern: dict[str, str] = {}
@@ -1238,6 +1259,15 @@ def _sanitize_with_fallback(
             _bump("iban", rendered)
             return rendered
         text = _IBAN_RE.sub(_iban_repl, text)
+
+    if wants("national_id"):
+        def _nif_repl(m: re.Match[str]) -> str:
+            if not is_valid_spanish_nif(m.group(0)):
+                return m.group(0)
+            rendered = _WORD_PLACEHOLDERS["national_id"]
+            _bump("national_id", rendered)
+            return rendered
+        text = _ES_NIF_RE.sub(_nif_repl, text)
 
     if wants("email"):
         def _email_repl(m: re.Match[str]) -> str:
@@ -1327,6 +1357,13 @@ def _label_redact_with_fallback(
                 return m.group(0)
             return _label_for("iban")
         text = _IBAN_RE.sub(_iban_repl, text)
+
+    if wants("national_id"):
+        def _nif_repl(m: re.Match[str]) -> str:
+            if not is_valid_spanish_nif(m.group(0)):
+                return m.group(0)
+            return _label_for("national_id")
+        text = _ES_NIF_RE.sub(_nif_repl, text)
 
     if wants("email"):
         def _email_repl(m: re.Match[str]) -> str:

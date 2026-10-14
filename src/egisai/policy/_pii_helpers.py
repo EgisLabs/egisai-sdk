@@ -71,6 +71,40 @@ def luhn_check(digits: str) -> bool:
     return total % 10 == 0
 
 
+# Control-letter table for the Spanish DNI/NIF/NIE mod-23 checksum.
+# The letter is ``_NIF_CONTROL_LETTERS[number % 23]``.
+_NIF_CONTROL_LETTERS = "TRWAGMYFPDXBNJZSQVHLCKE"
+
+
+def is_valid_spanish_nif(value: str) -> bool:
+    """Validate a Spanish DNI / NIF / NIE against its mod-23 checksum.
+
+    Accepts the three personal-identifier shapes used in Spain:
+
+    * **DNI / NIF** — 8 digits plus a control letter (``12345678Z``).
+    * **NIE** — a leading ``X``/``Y``/``Z`` (mapped to ``0``/``1``/``2``),
+      7 digits, then a control letter (``X1234567L``).
+
+    Whitespace and hyphens are ignored and the control letter is
+    compared case-insensitively. Returns ``False`` for anything that
+    is not exactly a 9-character identifier whose control letter
+    matches the computed one — so a random ``\\d{8}[A-Z]`` string is
+    rejected ~22/23 of the time, keeping false positives negligible.
+    """
+    cleaned = value.strip().upper().replace("-", "").replace(" ", "")
+    if len(cleaned) != 9:
+        return False
+    body, control = cleaned[:8], cleaned[8]
+    if not control.isalpha():
+        return False
+    nie_prefix = {"X": "0", "Y": "1", "Z": "2"}
+    if body[0] in nie_prefix:
+        body = nie_prefix[body[0]] + body[1:]
+    if not body.isdigit():
+        return False
+    return _NIF_CONTROL_LETTERS[int(body) % 23] == control
+
+
 # ── English word-form digit decoding ────────────────────────────────
 #
 # Token map for the obfuscation attack where the user spells a number

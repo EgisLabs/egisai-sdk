@@ -38,6 +38,17 @@ def test_label_redact_replaces_email() -> None:
     assert label_redact("contact jane@acme.com please") == "contact <EMAIL> please"
 
 
+def test_label_redact_replaces_spanish_dni() -> None:
+    """Checksum-valid DNI/NIE → <NATIONAL_ID>; bad checksum untouched."""
+    from egisai.policy.pii import label_redact
+
+    # 12345678Z and X1234567L both carry a valid mod-23 control letter.
+    assert label_redact("mi DNI es 12345678Z gracias") == "mi DNI es <NATIONAL_ID> gracias"
+    assert label_redact("NIE X1234567L") == "NIE <NATIONAL_ID>"
+    # Wrong control letter → not a real ID, left in place.
+    assert label_redact("ref 12345678A here") == "ref 12345678A here"
+
+
 def test_label_redact_replaces_credit_card_luhn_validated_only() -> None:
     """Only Luhn-valid sequences should be redacted."""
     from egisai.policy.pii import label_redact
