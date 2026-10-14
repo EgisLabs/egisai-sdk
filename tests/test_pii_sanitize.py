@@ -52,6 +52,38 @@ def test_sanitize_only_kinds_filter_skips_others() -> None:
     assert types == {"ssn"}
 
 
+def test_spanish_nif_checksum_helper() -> None:
+    """mod-23 control letter accepts real IDs, rejects bad ones."""
+    from egisai.policy._pii_helpers import is_valid_spanish_nif
+
+    assert is_valid_spanish_nif("12345678Z")  # DNI/NIF
+    assert is_valid_spanish_nif("X1234567L")  # NIE
+    assert is_valid_spanish_nif("x1234567l")  # case-insensitive
+    assert not is_valid_spanish_nif("12345678A")  # wrong control letter
+    assert not is_valid_spanish_nif("1234567Z")  # too short
+    assert not is_valid_spanish_nif("A2345678Z")  # non-NIE leading letter
+
+
+def test_sanitize_masks_spanish_dni() -> None:
+    from egisai.policy.pii import sanitize
+
+    text, records = sanitize("Please note my DNI 12345678Z on file.")
+
+    assert "12345678Z" not in text
+    assert "[id-redacted]" in text
+    assert {r.type for r in records} == {"national_id"}
+
+
+def test_scan_detects_spanish_nie_but_not_bad_checksum() -> None:
+    from egisai.policy.pii import scan
+
+    hits = scan("NIE X1234567L and bogus 12345678A")
+    types = {f.type for f in hits}
+    assert "national_id" in types
+    # The bad-checksum string must not add a second national_id hit.
+    assert sum(1 for f in hits if f.type == "national_id") == 1
+
+
 def test_sanitize_clean_prompt_is_no_op() -> None:
     from egisai.policy.pii import sanitize
 

@@ -179,6 +179,7 @@ CANONICAL_TYPES: tuple[PiiTypeSpec, ...] = (
             "IN_VOTER",
             "ES_NIF",
             "ES_NIE",
+            "EGIS_ES_NIF",
             "PL_PESEL",
             "FI_PERSONAL_IDENTITY_CODE",
             "KR_RRN",

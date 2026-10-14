@@ -18,6 +18,10 @@ upstream recognizer covers them:
   word-form digits (``"one two three four five six seven eight nine"``)
   that decode to an SSN- or credit-card-shape sequence. Catches a
   classic obfuscation Presidio's regex-driven recognizers miss.
+* **``EGIS_ES_NIF``** — Spanish DNI / NIF / NIE with mod-23 control-
+  letter validation. Presidio's own ``ES_NIF`` / ``ES_NIE``
+  recognizers only load under the Spanish NLP engine; our analyzer
+  runs the English engine, so without this the ID sails through.
 
 We also patch an **email-domain post-filter** onto Presidio's
 ``EmailRecognizer`` so RFC-2606 reserved domains (``example.com``,
@@ -42,6 +46,7 @@ from presidio_analyzer.nlp_engine import NlpArtifacts
 
 from egisai.policy._pii_helpers import (
     is_reserved_email_domain,  # noqa: F401 — re-exported for callers
+    is_valid_spanish_nif,
     luhn_check,
     shannon_entropy,
     word_run_to_digits,
@@ -444,7 +449,7 @@ class WordFormDigitsRecognizer(EntityRecognizer):
         return results
 
 
-# ── Registration helper ─────────────────────────────────────────────
+# ── Mastercard 2-series recognizer ──────────────────────────────────
 
 
 class MastercardRangeRecognizer(PatternRecognizer):
@@ -482,6 +487,57 @@ class MastercardRangeRecognizer(PatternRecognizer):
         return luhn_check(digits)
 
 
+# ── Spanish DNI / NIF / NIE recognizer ──────────────────────────────
+#
+# Presidio ships ``ES_NIF`` / ``ES_NIE`` recognizers, but they only
+# load under the Spanish NLP engine. Our analyzer runs the English
+# engine (``en_core_web_lg``), so those recognizers are never
+# registered and a Spanish national ID sails through unmasked — a
+# real gap for EU customers whose end users paste a DNI into a prompt.
+#
+# This recognizer runs under the English engine and validates the
+# mod-23 control letter, so a random ``\d{8}[A-Z]`` string is kept
+# only ~1/23 of the time. Published under ``EGIS_ES_NIF`` and mapped
+# to the operator ``national_id`` type in ``_pii_taxonomy.py``.
+
+_ES_NIF_RE = re.compile(r"\b(?:[XYZ]\d{7}|\d{8})[A-Z]\b", re.IGNORECASE)
+
+
+class SpanishNifRecognizer(PatternRecognizer):
+    """Spanish DNI / NIF / NIE with mod-23 control-letter validation.
+
+    The regex is broad (8 digits + letter, or an ``X``/``Y``/``Z``
+    prefix + 7 digits + letter); the checksum in ``validate_result``
+    does the real work. A failed checksum drops the hit, so an IBAN
+    fragment or an order number that merely has the right shape is
+    not labelled a national ID.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            supported_entity="EGIS_ES_NIF",
+            name="EgisSpanishNifRecognizer",
+            supported_language="en",
+            patterns=[
+                Pattern(
+                    name="es_dni_nif_nie",
+                    regex=_ES_NIF_RE.pattern,
+                    # Pre-validation score only; ``validate_result``
+                    # promotes a checksum-valid hit to full score the
+                    # same way ``MastercardRangeRecognizer`` does.
+                    score=0.3,
+                )
+            ],
+            context=["dni", "nif", "nie", "documento", "identidad"],
+        )
+
+    def validate_result(self, pattern_text: str) -> bool:
+        return is_valid_spanish_nif(pattern_text)
+
+
+# ── Registration helper ─────────────────────────────────────────────
+
+
 def register_custom_recognizers(registry) -> None:  # type: ignore[no-untyped-def]
     """Add every Egis-prefixed recognizer to a Presidio ``RecognizerRegistry``.
 
@@ -497,6 +553,7 @@ def register_custom_recognizers(registry) -> None:  # type: ignore[no-untyped-de
         DateOfBirthRecognizer(),
         WordFormDigitsRecognizer(),
         MastercardRangeRecognizer(),
+        SpanishNifRecognizer(),
     )
     for rec in custom_recognizers:
         # ``rec.name`` is set by Presidio's ``EntityRecognizer.__init__``

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.80.0] — 2026-10-13
+
+### Added
+- Native Spanish **DNI / NIF / NIE** detection in the PII engine,
+  mapped to the existing `national_id` type. Validated with the
+  mod-23 control-letter checksum, so a random `########X` string is
+  rejected ~22/23 of the time. Fires on both the warm Presidio path
+  (new `EGIS_ES_NIF` recognizer, which runs under the English NLP
+  engine where Presidio's own `ES_NIF`/`ES_NIE` never load) and the
+  regex fallback, so coverage is identical cold or warm. No
+  per-policy `custom_types` pattern needed.
+
+---
+
 ## [0.79.3] — 2026-10-10
 
 ### Fixed
