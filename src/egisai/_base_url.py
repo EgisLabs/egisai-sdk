@@ -9,6 +9,9 @@ _CLOUD_HOSTS = frozenset(
     {
         "app.egisai.co",
         "www.app.egisai.co",
+        # Madrid / EU deployment — a separate stack sharing this
+        # codebase. Listed so an on-prem build refuses it too.
+        "es.app.egisai.co",
     }
 )
 

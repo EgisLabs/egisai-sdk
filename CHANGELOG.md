@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.80.1] — 2026-10-16
+
+### Changed
+- Recognize the EU deployment host `es.app.egisai.co` as a cloud host.
+  SDK auto-detect now treats it like `app.egisai.co`, and on-prem
+  builds refuse it alongside the US host (dependency-confusion guard).
+
+---
+
 ## [0.80.0] — 2026-10-13
 
 ### Added
