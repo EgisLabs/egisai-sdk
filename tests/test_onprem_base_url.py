@@ -44,6 +44,21 @@ def test_onprem_build_refuses_cloud_host(
         resolve_platform_base_url("https://app.egisai.co")
 
 
+def test_onprem_build_refuses_eu_cloud_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The EU deployment host counts as a cloud host too."""
+    monkeypatch.setattr(egisai, "__onprem_build__", True)
+    with pytest.raises(RuntimeError, match="must not use the cloud host"):
+        resolve_platform_base_url("https://es.app.egisai.co")
+
+
+def test_eu_host_is_recognized_as_cloud() -> None:
+    from egisai._base_url import _CLOUD_HOSTS
+
+    assert "es.app.egisai.co" in _CLOUD_HOSTS
+
+
 def test_onprem_build_reads_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
