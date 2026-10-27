@@ -121,3 +121,39 @@ jobs:
 
           print("OK — nightly install smoke green")
           PY
+
+      - name: Assert the NER model actually loads and masks (live install)
+        # The import chain above never calls ``spacy.load`` — but that load is
+        # exactly where a regressed native dep bites (the murmurhash 1.0.16
+        # tokenizer crash: ``OverflowError: Python int too large to convert to
+        # C ssize_t`` → ``pii_ner_loader_failed`` → silent regex-only
+        # fallback). This step warms the real NER analyzer against the LIVE
+        # PyPI wheel and asserts a free-form person name + street address get
+        # masked, so the next broken upstream release is caught here within a
+        # day even though we didn't push any code.
+        run: |
+          EGISAI_NER_ENGINE=spacy /tmp/egisai-nightly/bin/python - <<'PY'
+          from egisai.policy import _pii_loader, pii
+
+          _pii_loader.prime_analyzer_async()
+          if not _pii_loader.wait_for_warm(timeout_secs=300.0):
+              raise SystemExit(
+                  "NER never warmed — en_core_web_lg download or spacy.load "
+                  "failed (e.g. a regressed native dep like murmurhash 1.0.16)."
+              )
+
+          text = "John Smith lives at 1600 Pennsylvania Avenue, Washington DC"
+          masked, records = pii.sanitize(text)
+          types = sorted({r.type for r in records})
+          print("sanitized:", masked)
+          print("record types:", types)
+
+          # A free-form PERSON name can only be caught by the NER model, never
+          # by the regex/checksum fallback — so a clean mask is definitive.
+          if "John Smith" in masked or "person_name" not in types:
+              raise SystemExit(f"PERSON not masked — NER degraded: {masked!r}")
+          if "Washington" in masked or "address" not in types:
+              raise SystemExit(f"ADDRESS not masked — NER degraded: {masked!r}")
+
+          print("OK — live install loaded NER and masked name + address")
+          PY

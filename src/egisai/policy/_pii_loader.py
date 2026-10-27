@@ -13,11 +13,18 @@ Why this is its own module:
   :mod:`egisai.policy.pii`, so PII protection is **never** off — only
   the NER-driven entities (names, locations, GDPR special-category
   text) are temporarily unavailable until the model is warm.
-* Fail-open semantics. If the customer is in a sealed environment
+* Fail-open on CLOUD. If a cloud customer is in a sealed environment
   with no internet, ``spacy.cli.download`` will fail; we surface a
   single warning to stderr and continue running with the regex
   fallback. The user's ``client.messages.create(...)`` is never
   blocked by our model setup.
+* On-prem is different (gap #35): the on-prem build NEVER downloads a
+  model (``_ensure_spacy_model_present`` / ``ensure_model_files`` raise
+  instead of reaching the internet). The supported NER sources are a
+  model shipped in the offline bundle or the operator-owned remote NER
+  engine (``set_remote_engine``). When neither is available the on-prem
+  PII gate in :mod:`egisai._evaluator` fails CLOSED on ``pii_scan``
+  rather than silently degrading to regex-only.
 
 Lifetime:
 
@@ -155,6 +162,31 @@ def prime_analyzer_async(*, quiet: bool = False) -> None:
     we don't print the friendly "downloading PII model" notice on
     first run, so containerized / pipelines stay silent.
     """
+    # Remote-engine short-circuit: when a trusted RemotePIIEngine is
+    # installed (the on-prem control plane offloads NER to its own
+    # in-network service via EGISAI_BASE_URL), the local analyzer is never
+    # consulted — pii.scan/sanitize delegate to the remote engine. Loading
+    # (and, on-prem, downloading) a local spaCy/ONNX model would be wasted
+    # work and, on-prem, a forbidden internet fetch. Mark the loader settled
+    # so the warm-up gate never blocks and the hot path proceeds straight to
+    # the remote engine.
+    from egisai.policy.pii import get_remote_engine
+
+    if get_remote_engine() is not None:
+        with _lock:
+            _state.primed = True
+            _state.loading = False
+            _state.settled = True
+            _state.settle_event.set()
+        # No "failed to load" / "falling back" noise — the remote engine
+        # fully covers NER. Keep this at debug so quiet init stays quiet.
+        if not quiet:
+            LOGGER.debug(
+                "[egisai] remote PII engine installed — skipping local NER "
+                "model load (no spaCy/ONNX model needed in this process)."
+            )
+        return
+
     with _lock:
         if _state.primed:
             return
@@ -259,14 +291,35 @@ def _load_in_background(*, quiet: bool) -> None:
             _state.analyzer = analyzer
             _state.error = None
     except BaseException as exc:  # noqa: BLE001 - intentionally broad; fail-open
-        LOGGER.warning(
-            "[egisai] PII NER analyzer failed to load (%s: %s) — "
-            "falling back to regex+checksum detection. "
-            "Names / locations / GDPR special-category text will not "
-            "be flagged until this is fixed.",
-            exc.__class__.__name__,
-            exc,
-        )
+        # Wording must match what the evaluator actually does next.
+        # Cloud falls open to regex+checksum; on-prem refuses governed
+        # calls with pii_engine_unavailable when a pii_scan rule is in
+        # scope (gap #35). Never claim a fallback that won't happen.
+        try:
+            from egisai._base_url import is_onprem_build
+
+            onprem = bool(is_onprem_build())
+        except Exception:  # noqa: BLE001
+            onprem = False
+        if onprem:
+            LOGGER.warning(
+                "[egisai] PII NER analyzer failed to load (%s: %s) — "
+                "on-prem fails closed: governed calls with a pii_scan "
+                "policy will be refused (pii_engine_unavailable) until "
+                "the control-plane NER worker is reachable. The local "
+                "model is not downloaded on-prem.",
+                exc.__class__.__name__,
+                exc,
+            )
+        else:
+            LOGGER.warning(
+                "[egisai] PII NER analyzer failed to load (%s: %s) — "
+                "falling back to regex+checksum detection. "
+                "Names / locations / GDPR special-category text will not "
+                "be flagged until this is fixed.",
+                exc.__class__.__name__,
+                exc,
+            )
         # Surface the warning on the operator's dashboard via a
         # fire-and-forget telemetry POST. The send itself is
         # bulletproof (any failure is swallowed silently inside
@@ -514,6 +567,24 @@ def _ensure_spacy_model_present(*, quiet: bool) -> None:
 
     if spacy.util.is_package(_SPACY_MODEL_NAME):
         return
+
+    # On-prem SDK must NEVER reach the internet (gap #35). spacy.cli.download
+    # pulls ~400–750 MB from github.com/explosion inside the customer's app
+    # process — forbidden on a sealed deployment. The supported on-prem NER
+    # sources are a model shipped/installed in the bundle (so is_package()
+    # above is already True) or the operator-owned remote NER engine
+    # (set_remote_engine, reached via EGISAI_BASE_URL). Fail clearly here;
+    # the on-prem PII gate in _evaluator then fails closed on pii_scan rules.
+    from egisai._base_url import is_onprem_build
+
+    if is_onprem_build():
+        raise RuntimeError(
+            f"on-prem SDK will not download the spaCy model "
+            f"{_SPACY_MODEL_NAME!r} from the internet. Install it into the "
+            "SDK environment from the offline bundle, or point the SDK at "
+            "your control plane's remote NER engine (EGISAI_BASE_URL). "
+            "Until one is available, pii_scan rules fail closed."
+        )
 
     if not quiet:
         # Loud + friendly: this only happens on a fresh install, and
