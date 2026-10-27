@@ -180,6 +180,9 @@ class FakeBackend:
         self.ungoverned_agent_ids: list[str] = []
         self.etag: str = '"empty"'
         self.handshake_calls = 0
+        # Tests set this to 401/503 to simulate a rejected/unreachable
+        # control plane without standing up real HTTP.
+        self.handshake_status: int = 200
         self.ensured_agents: list[dict[str, Any]] = []
         # Raw request bodies hitting /v1/sdk/agents/ensure — useful
         # for tests that need to assert what the SDK actually shipped
@@ -235,6 +238,11 @@ class FakeBackend:
                     )
             except Exception:
                 pass
+            if self.handshake_status != 200:
+                return httpx.Response(
+                    self.handshake_status,
+                    json={"detail": "unauthorized"},
+                )
             return httpx.Response(
                 200,
                 json={

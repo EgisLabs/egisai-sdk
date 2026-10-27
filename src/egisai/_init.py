@@ -116,14 +116,20 @@ def init(
         The client-side counterpart of the Gateway's
         ``gateway_degraded_mode``.
 
-        * ``"allow"`` (default, fail-open) — run the call ungoverned.
-          This is the SDK's core contract: it lives inside your process
-          and must never break your call path. A genuinely policy-free
-          org lands here too.
+        * ``"allow"`` (cloud default, fail-open) — run the call
+          ungoverned. This is the cloud SDK's core contract: it lives
+          inside your process and must never break your call path. A
+          genuinely policy-free org lands here too.
         * ``"block"`` — fail closed. Governed calls are refused with
           ``egis_unavailable`` until the SDK reaches Egis at least once
           (even a sync that returns zero rules clears it). Choose this
           only when a refused call beats an ungoverned one.
+
+        **On-prem builds (``egisai.__onprem_build__ is True``) default
+        to ``"block"``** (gap #34): a self-hosted deployment that can't
+        confirm policy must refuse governed calls rather than run them
+        unprotected. Opt out explicitly with ``on_outage="allow"`` or
+        ``EGISAI_ON_OUTAGE=allow`` if you prefer fail-open there.
 
         Never affects PII: PII detection is fully local and always runs
         regardless of this setting. Also settable via
@@ -286,13 +292,23 @@ def init(
                 f"semantic_on_outage must be 'allow' or 'block', "
                 f"got {semantic_on_outage!r}"
             )
-        # ``on_outage`` resolves explicit kwarg → env var → default
-        # "allow" (fail open). Validated at init() so a typo can't
-        # silently leave the in-process posture in an unintended state.
+        # ``on_outage`` resolves explicit kwarg → env var → default.
+        # The default is build-dependent (gap #34): cloud fails OPEN
+        # ("allow" — the SDK lives in the customer's process and must
+        # never break their call path), but the on-prem build fails
+        # CLOSED ("block") so a bad key / unreachable control plane /
+        # TLS error refuses governed calls instead of silently running
+        # them unprotected. An operator can still opt out explicitly
+        # with on_outage="allow" or EGISAI_ON_OUTAGE=allow. Validated
+        # at init() so a typo can't silently leave the in-process
+        # posture in an unintended state.
+        from egisai._base_url import is_onprem_build
+
+        _default_on_outage = "block" if is_onprem_build() else "allow"
         resolved_on_outage = (
             on_outage
             or os.getenv("EGISAI_ON_OUTAGE")
-            or "allow"
+            or _default_on_outage
         ).strip().lower()
         if resolved_on_outage not in ("allow", "block"):
             raise ValueError(
@@ -462,13 +478,29 @@ def init(
             _routing_mod.set_quality_sample(hs.get("routing_quality_sample"))
             handshake_ok = True
         except Exception as exc:  # noqa: BLE001
-            LOGGER.warning(
-                "[egisai] handshake failed: %s — running in OFFLINE mode "
-                "(no policies will be enforced) api_key=%s base_url=%s",
-                exc,
-                redact_api_key(cfg.api_key),
-                cfg.base_url,
-            )
+            if resolved_on_outage == "block":
+                # Fail-closed (on-prem default, gap #34): do NOT imply the
+                # SDK is happily running — governed calls will be REFUSED
+                # until the control plane is reached at least once.
+                LOGGER.error(
+                    "[egisai] handshake failed: %s — on_outage='block', so "
+                    "governed calls will be REFUSED (egis_unavailable) until "
+                    "the SDK reaches the control plane. Check the API key, "
+                    "base_url and TLS. To fail open instead (run ungoverned), "
+                    "set on_outage='allow' or EGISAI_ON_OUTAGE=allow. "
+                    "api_key=%s base_url=%s",
+                    exc,
+                    redact_api_key(cfg.api_key),
+                    cfg.base_url,
+                )
+            else:
+                LOGGER.warning(
+                    "[egisai] handshake failed: %s — running in OFFLINE mode "
+                    "(no policies will be enforced) api_key=%s base_url=%s",
+                    exc,
+                    redact_api_key(cfg.api_key),
+                    cfg.base_url,
+                )
             # Offline ⇒ the routing decision service is unreachable
             # anyway; pin the client dormant so the hot path never
             # pays a doomed /route round-trip.
@@ -476,13 +508,6 @@ def init(
 
             _routing_mod.reset()
             _routing_mod.set_enabled_hint(False)
-            if resolved_on_outage == "block":
-                LOGGER.warning(
-                    "[egisai] on_outage='block' and Egis is unreachable "
-                    "— governed calls will be REFUSED until the SDK "
-                    "reaches the control plane. Set on_outage='allow' "
-                    "to fail open instead."
-                )
 
         rules_count = 0
         if handshake_ok:
@@ -561,6 +586,37 @@ def init(
         if patch_mcp_server.apply():
             enabled.append("mcp-server")
 
+        # On-prem: offload PII/NER to the operator's OWN control plane
+        # (gap #35). The on-prem SDK never downloads or runs the heavy
+        # model locally; it posts to ``{EGISAI_BASE_URL}/v1/sdk/pii/*``
+        # with the agent's Egis API key, served by the in-network
+        # ``egisai-ner`` worker. Installed only after a successful
+        # handshake (base_url + api_key confirmed reachable) and only on
+        # on-prem builds — cloud keeps the fully-local on-device engine.
+        # No manual ``set_remote_engine`` is required. Must run BEFORE
+        # ``prime_analyzer_async`` so the warm-up short-circuits (a remote
+        # engine fully covers NER, so the local model load is skipped).
+        from egisai._base_url import is_onprem_build as _is_onprem_build
+
+        if handshake_ok and _is_onprem_build():
+            try:
+                from egisai.policy import _remote_pii_http
+
+                _remote_pii_http.install()
+                if not quiet:
+                    print(
+                        "✓ [egisai] on-prem PII NER offloaded to the control "
+                        "plane (no local model download).",
+                        flush=True,
+                    )
+            except Exception:  # noqa: BLE001 — never break the call path
+                LOGGER.warning(
+                    "[egisai] failed to install the remote PII engine — "
+                    "on-prem PII detection will fail closed until the "
+                    "control plane is reachable.",
+                    exc_info=True,
+                )
+
         start_logger()
         start_refresher()
         # Kick off Presidio + spaCy NER warm-up in a daemon thread.
@@ -575,29 +631,46 @@ def init(
         atexit.register(shutdown)
 
         if not quiet:
-            integrations = ", ".join(enabled) if enabled else "none"
-            mode = (
-                f" mode=gateway on_outage={cfg.gateway_on_outage}"
-                if cfg.gateway_mode
-                else ""
-            )
-            # Surface a fail-closed in-process posture on the banner —
-            # it changes what happens on an Egis outage, so an operator
-            # should see it without reading diagnostics().
-            outage = (
-                " on_outage=block" if cfg.on_outage == "block" else ""
-            )
-            print(
-                f"✓ [egisai] active — app={cfg.app} env={cfg.env} "
-                f"on_block={cfg.on_block}{outage}{mode} "
-                f"integrations=[{integrations}] "
-                f"policies={rules_count}",
-                flush=True,
-            )
-            if rules_count == 0 and handshake_ok:
+            if handshake_ok:
+                integrations = ", ".join(enabled) if enabled else "none"
+                mode = (
+                    f" mode=gateway on_outage={cfg.gateway_on_outage}"
+                    if cfg.gateway_mode
+                    else ""
+                )
+                # Surface a fail-closed in-process posture on the banner —
+                # it changes what happens on an Egis outage, so an operator
+                # should see it without reading diagnostics().
+                outage = (
+                    " on_outage=block" if cfg.on_outage == "block" else ""
+                )
                 print(
-                    "   ⚠  no enabled policies in this org — every call will be allowed.\n"
-                    "      visit your dashboard → Policies → + New policy.",
+                    f"✓ [egisai] active — app={cfg.app} env={cfg.env} "
+                    f"on_block={cfg.on_block}{outage}{mode} "
+                    f"integrations=[{integrations}] "
+                    f"policies={rules_count}",
+                    flush=True,
+                )
+                if rules_count == 0:
+                    print(
+                        "   ⚠  no enabled policies in this org — every call will be allowed.\n"
+                        "      visit your dashboard → Policies → + New policy.",
+                        flush=True,
+                    )
+            elif cfg.on_outage == "block":
+                # Fail-closed: never claim "active" after a failed handshake —
+                # governed calls will raise egis_unavailable until the control
+                # plane is reached. Matches the error log printed above.
+                print(
+                    "✗ [egisai] not active: governed calls will be refused "
+                    f"(handshake failed; on_outage=block) — app={cfg.app} "
+                    f"env={cfg.env}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"⚠ [egisai] offline — app={cfg.app} env={cfg.env} "
+                    "(handshake failed; policies not enforced)",
                     flush=True,
                 )
 

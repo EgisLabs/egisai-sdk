@@ -459,6 +459,111 @@ def _outage_block_decision() -> PolicyDecision:
     )
 
 
+def _pii_engine_unavailable_decision() -> PolicyDecision:
+    """Fail-closed ``block`` when on-prem PII NER is permanently unavailable.
+
+    On-prem the SDK must not silently degrade to regex-only when the NER
+    engine can't load (gap #35): names / addresses / GDPR special-category
+    text would go undetected without any signal to the operator. This mirrors
+    the PII fail-closed contract (security-and-compliance.mdc rule 4) —
+    refuse the call rather than run it with a known coverage gap.
+    """
+    from egisai.policy.engine import MatchedPolicyRecord
+
+    message = (
+        "Egis could not load the PII NER engine and is configured to fail "
+        "closed on-prem. The on-prem SDK does not download models from the "
+        "internet — ship the model in the offline bundle or configure the "
+        "remote NER engine (EGISAI_BASE_URL). This call was refused rather "
+        "than run with regex-only PII detection. To accept regex-only "
+        "detection instead, set EGISAI_ONPREM_PII_REGEX_ONLY=1."
+    )
+    record = MatchedPolicyRecord(
+        name="PII engine unavailable",
+        type="pii_engine_unavailable",
+        verdict="block",
+        reason_code="pii_engine_unavailable",
+        message=message,
+    )
+    return PolicyDecision.deny(
+        reason_code="pii_engine_unavailable",
+        message=message,
+        matched_policy="PII engine unavailable",
+        matched_policies=(record,),
+    )
+
+
+def _onprem_pii_fail_closed(rules: list) -> bool:
+    """True when an on-prem call must be refused for lack of PII NER.
+
+    All of these must hold:
+      * this is an on-prem build;
+      * a ``pii_scan`` rule is scoped to this call (otherwise NER is
+        irrelevant — allow);
+      * the operator has NOT opted into regex-only on-prem detection;
+      * no remote PII engine is installed (a remote engine fully covers
+        NER, so the local model being absent is fine);
+      * the local analyzer has settled with a failure — i.e. the model is
+        permanently unavailable, not merely still warming. During warm-up
+        the existing one-shot gate waits; we only fail closed once we know
+        NER will never come up in this process.
+    """
+    from egisai._base_url import is_onprem_build
+
+    if not is_onprem_build():
+        return False
+    if not _has_active_pii_rule(rules):
+        return False
+    if os.getenv("EGISAI_ONPREM_PII_REGEX_ONLY", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return False
+    from egisai.policy.pii import get_remote_engine
+
+    if get_remote_engine() is not None:
+        return False
+    return _pii_loader.is_settled() and _pii_loader.last_error() is not None
+
+
+def _onprem_pii_remote_degraded(rules: list) -> bool:
+    """True when the on-prem remote PII engine failed on THIS request.
+
+    The pre-eval ``_onprem_pii_fail_closed`` gate defers whenever a remote
+    engine is installed (it fully covers NER) — but it can't know the remote
+    call will fail. This POST-eval gate closes that gap: if a remote engine is
+    installed and the call to it raised during this evaluation, the SDK fell
+    back to the local (regex-only, on-prem) engine, a silent under-detection.
+    On-prem that must fail closed (``pii_engine_unavailable``).
+
+    All of these must hold:
+      * this is an on-prem build;
+      * a ``pii_scan`` rule is scoped to this call;
+      * the operator has NOT opted into regex-only on-prem detection;
+      * a remote PII engine is installed;
+      * a remote PII call failed during this request
+        (``pii.remote_failed()`` — reset before evaluation).
+    """
+    from egisai._base_url import is_onprem_build
+
+    if not is_onprem_build():
+        return False
+    if not _has_active_pii_rule(rules):
+        return False
+    if os.getenv("EGISAI_ONPREM_PII_REGEX_ONLY", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return False
+    from egisai.policy import pii as _pii
+
+    if _pii.get_remote_engine() is None:
+        return False
+    return _pii.remote_failed()
+
+
 def _no_rules_decision() -> PolicyDecision:
     """Decide what to do when the cache holds no rules for this call.
 
@@ -576,6 +681,8 @@ def evaluate(call: InputCall) -> PolicyDecision:
     # this returns the analyzer is either warm OR we've decided to
     # proceed with the regex fallback. Idempotent across phases.
     _maybe_wait_for_pii_analyzer(rules)
+    if _onprem_pii_fail_closed(rules):
+        return _pii_engine_unavailable_decision()
     ctx = PolicyContext(
         tenant=call.tenant or "",
         model=call.model,
@@ -589,6 +696,11 @@ def evaluate(call: InputCall) -> PolicyDecision:
     inj_blocker = (
         _get_injection_blocker() if _has_injection_rule(rules) else None
     )
+    # Reset the per-request remote-PII-failure flag so a prior call's
+    # failure never bleeds forward; the post-eval gate below reads it.
+    from egisai.policy import pii as _pii
+
+    _pii.reset_remote_failure()
     try:
         decision = evaluate_policies(
             rules,
@@ -600,6 +712,11 @@ def evaluate(call: InputCall) -> PolicyDecision:
     except Exception:  # noqa: BLE001
         LOGGER.warning("policy evaluator errored, allowing by default", exc_info=True)
         decision = PolicyDecision.allow()
+    # On-prem: if the remote NER engine failed during this evaluation the
+    # masking above silently fell back to regex-only — refuse rather than
+    # run with a known coverage gap.
+    if _onprem_pii_remote_degraded(rules):
+        return _pii_engine_unavailable_decision()
     _record_limits_usage(call.surfaces, agent_id, decision.verdict)
     return decision
 
@@ -632,6 +749,8 @@ def evaluate_output(call: OutputCall) -> PolicyDecision:
     # ``claude_agent_sdk``) where the first patched entry point is the
     # output / tool-result hook rather than the model-call entrypoint.
     _maybe_wait_for_pii_analyzer(rules)
+    if _onprem_pii_fail_closed(rules):
+        return _pii_engine_unavailable_decision()
     # Snapshot the end-user identity so identity-aware access rules
     # (``deny_resource_access``) can decide per user. Read once, here,
     # so the policy engine stays a pure function of its inputs.
@@ -654,8 +773,11 @@ def evaluate_output(call: OutputCall) -> PolicyDecision:
     inj_blocker = (
         _get_injection_blocker() if _has_injection_rule(rules) else None
     )
+    from egisai.policy import pii as _pii
+
+    _pii.reset_remote_failure()
     try:
-        return evaluate_output_policies(
+        decision = evaluate_output_policies(
             rules,
             ctx,
             semantic_blocker=blocker,
@@ -665,6 +787,11 @@ def evaluate_output(call: OutputCall) -> PolicyDecision:
     except Exception:  # noqa: BLE001
         LOGGER.warning("output evaluator errored, allowing by default", exc_info=True)
         return PolicyDecision.allow()
+    # Mirror the input side: on-prem a remote NER failure during this
+    # evaluation means the response was masked regex-only — fail closed.
+    if _onprem_pii_remote_degraded(rules):
+        return _pii_engine_unavailable_decision()
+    return decision
 
 
 def extract_prompt_text(messages: Any) -> str:

@@ -14,7 +14,7 @@ plus an httpx / requests fallback.
 
 from __future__ import annotations
 
-__version__ = "0.80.1"
+__version__ = "0.81.3"
 
 # Stamped ``True`` only in private on-prem wheels / control-plane builds.
 # Public PyPI builds keep ``False``. Used to refuse the cloud URL default

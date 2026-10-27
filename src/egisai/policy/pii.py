@@ -35,6 +35,7 @@ arguments to ``scan/sanitize/label_redact`` accept both ``types=``
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 import math
 import re
@@ -180,6 +181,74 @@ def get_remote_engine() -> RemotePIIEngine | None:
     return _remote_engine
 
 
+# ── Remote-failure signal (fail-closed on-prem) ─────────────────────
+#
+# When a remote engine is installed and a call to it fails, the code
+# above falls back to the LOCAL engine (fail-open on availability).
+# On a *cloud* `pip install`, the local engine is the full on-device
+# model, so that fallback is harmless. On an *on-prem* build the local
+# path is regex-only (the model is never downloaded — gap #35), so a
+# silent fallback would under-detect names/addresses with no signal.
+#
+# So every remote failure sets a per-request flag the on-prem evaluator
+# reads AFTER evaluation to fail closed (``pii_engine_unavailable``).
+# A ContextVar keeps it per-call and thread-safe; reset at the top of
+# each governed evaluation so a prior failure never bleeds forward.
+_remote_failed: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "egisai_pii_remote_failed", default=False
+)
+
+
+def reset_remote_failure() -> None:
+    """Clear the per-request remote-failure flag. Call before evaluation."""
+    _remote_failed.set(False)
+
+
+def note_remote_failure() -> None:
+    """Record that a remote PII call failed on this request."""
+    _remote_failed.set(True)
+
+
+def remote_failed() -> bool:
+    """True if a remote PII call failed since the last ``reset_remote_failure``."""
+    return _remote_failed.get()
+
+
+def _remote_failure_is_fail_closed() -> bool:
+    """On-prem builds refuse the call after a remote PII failure.
+
+    Cloud keeps the local-engine fallback. The log line must match what
+    actually happens next — customers' developers read these messages.
+    """
+    try:
+        from egisai._base_url import is_onprem_build
+
+        return bool(is_onprem_build())
+    except Exception:  # noqa: BLE001 — never break the hot path
+        return False
+
+
+def _log_remote_pii_failure(op: str, exc: BaseException) -> None:
+    """Warn about a remote PII failure with wording that matches behavior."""
+    if _remote_failure_is_fail_closed():
+        LOGGER.warning(
+            "[egisai] remote PII %s failed (%s: %s) — governed call will "
+            "be refused (pii_engine_unavailable); not falling back to a "
+            "local engine.",
+            op,
+            exc.__class__.__name__,
+            exc,
+        )
+    else:
+        LOGGER.warning(
+            "[egisai] remote PII %s failed (%s: %s) — running the local "
+            "engine instead.",
+            op,
+            exc.__class__.__name__,
+            exc,
+        )
+
+
 # ── Normalisation ──────────────────────────────────────────────────
 
 
@@ -265,13 +334,13 @@ def scan(text: str) -> list[PIIFinding]:
     if engine is not None:
         try:
             remote_built_in = engine.scan(text)
-        except Exception as exc:  # noqa: BLE001 — fail open to local engine
-            LOGGER.warning(
-                "[egisai] remote PII scan failed (%s: %s) — running the "
-                "local engine instead.",
-                exc.__class__.__name__,
-                exc,
-            )
+        except Exception as exc:  # noqa: BLE001 — cloud falls open to local
+            note_remote_failure()
+            _log_remote_pii_failure("scan", exc)
+            # On-prem: do not touch the local engine — the evaluator
+            # refuses with pii_engine_unavailable after this flag.
+            if _remote_failure_is_fail_closed():
+                return []
         else:
             # The worker only knows the built-in detectors — custom
             # operator patterns are published into THIS process's
@@ -321,13 +390,11 @@ def sanitize(
     if engine is not None:
         try:
             masked, records = engine.sanitize(text, type_filter, mask_char)
-        except Exception as exc:  # noqa: BLE001 — fail open to local engine
-            LOGGER.warning(
-                "[egisai] remote PII sanitize failed (%s: %s) — running the "
-                "local engine instead.",
-                exc.__class__.__name__,
-                exc,
-            )
+        except Exception as exc:  # noqa: BLE001 — cloud falls open to local
+            note_remote_failure()
+            _log_remote_pii_failure("sanitize", exc)
+            if _remote_failure_is_fail_closed():
+                return text, []
         else:
             # Overlay custom operator patterns locally, over the
             # worker's already-masked text — same order the local path
@@ -414,13 +481,11 @@ def label_redact(
     if engine is not None:
         try:
             redacted = engine.label_redact(text, type_filter)
-        except Exception as exc:  # noqa: BLE001 — fail open to local engine
-            LOGGER.warning(
-                "[egisai] remote PII label_redact failed (%s: %s) — running "
-                "the local engine instead.",
-                exc.__class__.__name__,
-                exc,
-            )
+        except Exception as exc:  # noqa: BLE001 — cloud falls open to local
+            note_remote_failure()
+            _log_remote_pii_failure("label_redact", exc)
+            if _remote_failure_is_fail_closed():
+                return text
         else:
             # Custom labels are this process's job — overlay them on
             # the worker's built-in labelled text.

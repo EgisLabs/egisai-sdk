@@ -7,6 +7,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.81.3] — 2026-10-25
+
+### Fixed
+- **On-prem PII log messages match fail-closed behavior.** When the
+  remote NER worker is down, logs now say the governed call will be
+  refused (`pii_engine_unavailable`) instead of "running the local
+  engine instead" / "falling back to regex". The local model is not
+  attempted when a remote engine is configured. Cloud wording is
+  unchanged (still falls open to the local engine).
+
+## [0.81.2] — 2026-10-25
+
+### Fixed
+- **Do not print `✓ [egisai] active` after a failed handshake.** When
+  `on_outage=block` (on-prem default) and the control plane rejects the
+  key or is unreachable, init now prints
+  `✗ [egisai] not active: governed calls will be refused` instead of the
+  green active banner that previously followed the handshake-failed
+  error. Offline (`on_outage=allow`) prints an explicit offline line.
+
+## [0.81.1] — 2026-10-25
+
+### Fixed
+- **Exclude the broken `murmurhash 1.0.16`.** That release (2026-10-24)
+  regressed the spaCy tokenizer (`OverflowError: Python int too large to
+  convert to C ssize_t`), which made `en_core_web_lg` fail to load
+  (`pii_ner_loader_failed`) and silently degraded name/address detection to
+  the regex-only fallback. The SDK now pins `murmurhash!=1.0.16` on every
+  install path that pulls spaCy (base install and all extras), so a fresh
+  `pip install egisai` keeps full NER-driven PII masking. The on-prem offline
+  bundle derives its wheel closure from these same specs, so it inherits the
+  safe set automatically.
+
+### Security
+- New fresh-install NER CI gate (clean venv, Python 3.11 + 3.12, from the
+  built wheel with normal dependency resolution) asserts the NER model loads
+  and masks a person name + street address. It runs on SDK PRs and on a daily
+  schedule, so the next broken upstream release is caught before customers see
+  it.
+
+## [0.81.0] — 2026-10-23
+
+### Added
+- **On-prem SDK auto-uses the control plane for PII NER** (no manual
+  `set_remote_engine`). After a successful handshake, on-prem builds
+  install an HTTP PII engine that posts to `{EGISAI_BASE_URL}/v1/sdk/pii/*`
+  (authenticated with the agent's Egis API key), served by the in-network
+  `egisai-ner` worker the control plane already hosts. Raw text travels
+  only to the operator-owned control plane, never to a third party; it is
+  never persisted or logged. The local heavy-model warm-up is skipped once
+  the remote engine is installed. Cloud keeps the fully-local on-device
+  engine and never calls these endpoints.
+- Remote-PII failures now fail CLOSED on-prem **per request**. When a
+  remote NER call fails mid-evaluation (timeout, worker down, degraded
+  tier), the on-prem evaluator refuses the governed call
+  (`pii_engine_unavailable`) instead of silently masking regex-only. New
+  `pii.reset_remote_failure()` / `remote_failed()` signals back this gate.
+  Opt into regex-only with `EGISAI_ONPREM_PII_REGEX_ONLY=1`.
+
+### Changed
+- **On-prem builds now fail CLOSED by default on handshake failure**
+  (`__onprem_build__ is True`). A bad key, unreachable control plane, or
+  TLS error refuses governed calls (`egis_unavailable`) instead of
+  silently running them unprotected. Cloud keeps its fail-open `allow`
+  default unchanged. Opt out of the on-prem default with
+  `on_outage="allow"` or `EGISAI_ON_OUTAGE=allow`.
+
+### Security
+- **On-prem SDK never reaches the internet for NER models.** The spaCy
+  (`en_core_web_lg`, github) and Ettin ONNX (huggingface) auto-downloads
+  are refused on on-prem builds — the operator ships a model in the
+  offline bundle or configures the remote NER engine (`set_remote_engine`,
+  reached via `EGISAI_BASE_URL`). When neither is available, on-prem
+  fails CLOSED on `pii_scan` rules (`pii_engine_unavailable`) rather than
+  silently degrading to regex-only. Opt into regex-only with
+  `EGISAI_ONPREM_PII_REGEX_ONLY=1`. Cloud fail-open behavior unchanged.
+- A `RemotePIIEngine` installed before `init()` short-circuits local NER
+  model loading entirely (no download, no spaCy/ONNX load in-process).
+
+### Fixed
+- The deprecated `google-generativeai` FutureWarning no longer prints at
+  SDK startup. We suppress it when patching an already-installed legacy
+  package, and the on-prem bundle no longer ships it (`google-genai`
+  covers Gemini).
+
+---
+
 ## [0.80.1] — 2026-10-16
 
 ### Changed

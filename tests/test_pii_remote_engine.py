@@ -190,6 +190,49 @@ class TestFailOpen:
         out = pii_scanner.label_redact("pay with 4111 1111 1111 1111")
         assert "4111 1111 1111 1111" not in out
 
+    def test_cloud_warning_says_local_engine(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        pii_scanner.set_remote_engine(_BrokenEngine())
+        with caplog.at_level("WARNING"):
+            pii_scanner.scan("pay with 4111 1111 1111 1111")
+        assert "running the local engine instead" in caplog.text
+        assert "will be refused" not in caplog.text
+
+
+class TestOnpremFailClosedMessaging:
+    """On-prem remote failures must say refuse — never 'falling back'."""
+
+    def test_scan_warns_refuse_not_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import egisai
+
+        monkeypatch.setattr(egisai, "__onprem_build__", True)
+        pii_scanner.set_remote_engine(_BrokenEngine())
+        pii_scanner.reset_remote_failure()
+        with caplog.at_level("WARNING"):
+            findings = pii_scanner.scan("pay with 4111 1111 1111 1111")
+        assert findings == []
+        assert pii_scanner.remote_failed() is True
+        assert "will be refused" in caplog.text
+        assert "running the local engine instead" not in caplog.text
+
+    def test_label_redact_warns_refuse_not_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import egisai
+
+        monkeypatch.setattr(egisai, "__onprem_build__", True)
+        pii_scanner.set_remote_engine(_BrokenEngine())
+        pii_scanner.reset_remote_failure()
+        with caplog.at_level("WARNING"):
+            out = pii_scanner.label_redact("hi")
+        assert out == "hi"
+        assert pii_scanner.remote_failed() is True
+        assert "will be refused" in caplog.text
+        assert "running the local engine instead" not in caplog.text
+
 
 def test_clearing_the_engine_restores_local_behavior() -> None:
     engine = _FakeEngine()

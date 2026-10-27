@@ -216,6 +216,19 @@ def ensure_model_files(model_dir: Path) -> None:
     if not missing:
         return
 
+    # On-prem SDK must NEVER reach the internet (gap #35). Refuse to fetch
+    # from huggingface.co; the operator ships these files in the bundle and
+    # points EGISAI_ETTIN_MODEL_DIR at them.
+    from egisai._base_url import is_onprem_build
+
+    if is_onprem_build():
+        raise RuntimeError(
+            "on-prem SDK will not download NER model files from "
+            "huggingface.co. Ship the Ettin ONNX files in the offline "
+            "bundle and set EGISAI_ETTIN_MODEL_DIR to that directory. "
+            f"Missing: {', '.join(missing)}"
+        )
+
     repo = os.environ.get("EGISAI_ETTIN_REPO", _DEFAULT_REPO).strip()
     revision = os.environ.get("EGISAI_ETTIN_REVISION", _DEFAULT_REVISION).strip()
     model_dir.mkdir(parents=True, exist_ok=True)

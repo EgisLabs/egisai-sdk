@@ -168,7 +168,19 @@ def apply() -> bool:
         return False
     any_patched = False
     try:
-        from google.generativeai import GenerativeModel  # type: ignore
+        # Importing google.generativeai emits a FutureWarning ("All support
+        # for the google.generativeai package has ended …"). That is the
+        # vendor's deprecation notice, not something the operator can act on
+        # from inside our SDK, so we must not surface it at startup (gap #37).
+        # We only reach here when the package is actually installed; on-prem
+        # bundles no longer ship it at all. Suppress just this import's
+        # warnings so patching an already-installed legacy package stays
+        # silent.
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            from google.generativeai import GenerativeModel  # type: ignore
     except Exception:  # noqa: BLE001
         return False
 
