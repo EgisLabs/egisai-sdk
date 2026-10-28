@@ -97,12 +97,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11.18", "3.12.16", "3.13"]
-        os: [ubuntu-latest, macos-latest]
+        # SECURITY (eMudhra/emSign CA incident, 2026-10-20): Linux pins the
+        # exact fixed CPython patches (3.11.18 / 3.12.16); 3.13 tracks latest.
+        # macOS resolves the latest patch of the same minor because the hosted
+        # arm64 image lacks those exact patches in the setup-python manifest.
+        include:
+          - { os: ubuntu-latest, python-version: "3.11.18" }
+          - { os: ubuntu-latest, python-version: "3.12.16" }
+          - { os: ubuntu-latest, python-version: "3.13" }
+          - { os: macos-latest, python-version: "3.11" }
+          - { os: macos-latest, python-version: "3.12" }
+          - { os: macos-latest, python-version: "3.13" }
     steps:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
+          # macOS uses a minor spec — pull the newest patch so it stays
+          # at/above the eMudhra CA floor on a current runner.
+          check-latest: true
 
       - uses: actions/download-artifact@v7
         with:
