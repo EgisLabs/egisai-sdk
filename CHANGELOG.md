@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.81.4] — 2026-10-27
+
+### Security
+- **eMudhra / emSign CA certificate incident.** Raised the `certifi`
+  dependency floor to `>= 2026.10.19` so every install path — public
+  PyPI, the on-prem offline SDK bundle, and the manylinux build — pulls a
+  trust store that no longer trusts the compromised eMudhra/emSign
+  intermediate CAs disclosed on 2026-10-20
+  (https://discuss.python.org/t/109576). No API or behaviour changes.
+  On-prem wheels for this version ship in on-prem **1.6.1**.
+
 ## [0.81.3] — 2026-10-25
 
 ### Fixed

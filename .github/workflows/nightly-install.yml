@@ -55,13 +55,32 @@ jobs:
       # combination's outcome.
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
-        os: [ubuntu-latest, macos-latest]
-        strategy: [pinned, eager]
+        # SECURITY (eMudhra/emSign CA incident, 2026-10-20): Linux pins the
+        # exact fixed CPython patches (3.11.18 / 3.12.16); 3.13 tracks latest.
+        # macOS resolves the latest patch of the same minor because the hosted
+        # arm64 image lacks those exact patches in the setup-python manifest.
+        # The os/python pairs are fully crossed with the install strategy
+        # (pinned / eager) via an explicit ``include`` list.
+        include:
+          - { os: ubuntu-latest, python-version: "3.11.18", strategy: pinned }
+          - { os: ubuntu-latest, python-version: "3.12.16", strategy: pinned }
+          - { os: ubuntu-latest, python-version: "3.13", strategy: pinned }
+          - { os: macos-latest, python-version: "3.11", strategy: pinned }
+          - { os: macos-latest, python-version: "3.12", strategy: pinned }
+          - { os: macos-latest, python-version: "3.13", strategy: pinned }
+          - { os: ubuntu-latest, python-version: "3.11.18", strategy: eager }
+          - { os: ubuntu-latest, python-version: "3.12.16", strategy: eager }
+          - { os: ubuntu-latest, python-version: "3.13", strategy: eager }
+          - { os: macos-latest, python-version: "3.11", strategy: eager }
+          - { os: macos-latest, python-version: "3.12", strategy: eager }
+          - { os: macos-latest, python-version: "3.13", strategy: eager }
     steps:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
+          # macOS uses a minor spec — pull the newest patch so it stays
+          # at/above the eMudhra CA floor on a current runner.
+          check-latest: true
 
       - name: Fresh venv
         run: python -m venv /tmp/egisai-nightly
@@ -74,7 +93,7 @@ jobs:
         # where our minimum-version pins are too loose against a new
         # upstream release.
         run: |
-          /tmp/egisai-nightly/bin/pip install --upgrade pip
+          /tmp/egisai-nightly/bin/pip install --upgrade "pip>=26.2.2"
           if [ "${{ matrix.strategy }}" = "eager" ]; then
             /tmp/egisai-nightly/bin/pip install --upgrade --upgrade-strategy eager egisai
           else

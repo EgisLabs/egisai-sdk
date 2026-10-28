@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "egisai"
-version = "0.81.3"
+version = "0.81.4"
 description = "Native runtime governance SDK for AI agents — import egisai; egisai.init() and you're protected."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -52,6 +52,16 @@ classifiers = [
 dependencies = [
   "httpx>=0.27.0,<1.0",
   "pydantic>=2.9.0,<3.0",
+  # ── SECURITY: eMudhra / emSign CA incident (2026-10-20) ────────────
+  # Compromised eMudhra intermediate CAs enabled MITM on TLS endpoints
+  # including pypi.org. ``certifi`` is the trust store httpx/requests use
+  # for every outbound HTTPS call the SDK makes (e.g. the governance
+  # plane, remote NER offload), so it is pinned to the first release that
+  # drops the compromised intermediates. ``certifi`` is a transitive dep
+  # of httpx; pinning the floor here makes it an explicit, enforced
+  # requirement of ``pip install egisai``. See Python.org security notice
+  # https://discuss.python.org/t/109576.
+  "certifi>=2026.10.19",
   # ── PII detection layer ──────────────────────────────────────────
   # Presidio is a Microsoft-maintained, MIT-licensed engine that
   # bundles ~60 checksum-validated recognizers for IDs, passports,
