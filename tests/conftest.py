@@ -178,6 +178,11 @@ class FakeBackend:
         # snapshot as the rules. Tests set these via ``set_rules``.
         self.paused_agent_ids: list[str] = []
         self.ungoverned_agent_ids: list[str] = []
+        # MCP add-on enforcement directives riding the same snapshot:
+        # stopped servers and operator-disapproved tools. Empty by
+        # default so non-MCP tests see no change.
+        self.paused_mcp_server_ids: list[str] = []
+        self.blocked_mcp_tools: list[str] = []
         self.etag: str = '"empty"'
         self.handshake_calls = 0
         # Tests set this to 401/503 to simulate a rejected/unreachable
@@ -217,6 +222,8 @@ class FakeBackend:
         etag: str = '"new"',
         paused_agent_ids: list[str] | None = None,
         ungoverned_agent_ids: list[str] | None = None,
+        paused_mcp_server_ids: list[str] | None = None,
+        blocked_mcp_tools: list[str] | None = None,
     ) -> None:
         self.rules = rules
         self.etag = etag
@@ -224,6 +231,10 @@ class FakeBackend:
             self.paused_agent_ids = paused_agent_ids
         if ungoverned_agent_ids is not None:
             self.ungoverned_agent_ids = ungoverned_agent_ids
+        if paused_mcp_server_ids is not None:
+            self.paused_mcp_server_ids = paused_mcp_server_ids
+        if blocked_mcp_tools is not None:
+            self.blocked_mcp_tools = blocked_mcp_tools
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -278,6 +289,8 @@ class FakeBackend:
                     "rules": self.rules,
                     "paused_agent_ids": self.paused_agent_ids,
                     "ungoverned_agent_ids": self.ungoverned_agent_ids,
+                    "paused_mcp_server_ids": self.paused_mcp_server_ids,
+                    "blocked_mcp_tools": self.blocked_mcp_tools,
                 },
             )
         if path.endswith("/v1/sdk/agents/ensure"):

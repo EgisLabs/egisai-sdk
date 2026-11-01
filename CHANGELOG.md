@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.82.0] — 2026-10-31
+
+### Added
+- **MCP Servers: operator stop + tool disapprove are now enforced.**
+  The inbound MCP gate refuses a `tools/call` when an operator has
+  stopped the server, or disapproved that specific tool, from the
+  dashboard. Both directives ride the existing `/v1/sdk/policies`
+  snapshot (new `paused_mcp_server_ids` / `blocked_mcp_tools` fields),
+  so they take effect on the next policy refresh with no restart —
+  the inbound twin of the agent pause gate. Backwards compatible:
+  older backends omit the fields and nothing is refused.
+
+### Fixed
+- **MCP request detail now shows real policy latency.** The inbound
+  gate records the time spent evaluating policy and stamps it on the
+  audit event (`policy_latency_ms`), so the request modal's "Policy"
+  latency is a true number instead of always 0.
+
 ## [0.81.4] — 2026-10-27
 
 ### Security

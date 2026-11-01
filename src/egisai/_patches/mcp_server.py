@@ -83,6 +83,10 @@ class _Gate:
     blocked: bool = False
     message: str = ""
     sanitizations: list[dict[str, Any]] = field(default_factory=list)
+    # Wall-clock spent evaluating policy for this call, in ms. Stamped
+    # on the audit event so the request detail's "Policy" latency is a
+    # real number instead of always 0.
+    policy_latency_ms: int = 0
 
 
 # ── Tool-error type (block enforcement) ─────────────────────────────
@@ -349,6 +353,35 @@ def _prepare_gate(instance: Any, tool_name: str, arguments: Any) -> _Gate:
     identity = _resolve_identity(instance)
     gate = _Gate(identity=identity, tool_name=tool_name, arguments=arguments)
 
+    # ── Operator stop switches (checked before any policy) ───────────
+    # A stopped server, or a disapproved tool, is refused outright — the
+    # inbound twin of the agent pause gate. Both directives ride the
+    # same ``/v1/sdk/policies`` snapshot the rules do, so they take
+    # effect on the next cache refresh with no restart. We can only
+    # match them once the server has a registered id (attribution); an
+    # unregistered server fails open, exactly like the rest of the gate.
+    server_id = (identity.server_id or "").strip().lower()
+    if server_id:
+        from egisai._policy_cache import (
+            get_blocked_mcp_tools,
+            get_paused_mcp_server_ids,
+        )
+
+        if server_id in get_paused_mcp_server_ids():
+            gate.blocked = True
+            gate.message = (
+                "[egisai] This MCP server is stopped by an operator — "
+                "inbound tool calls are refused."
+            )
+            return gate
+        if f"{server_id}:{tool_name}" in get_blocked_mcp_tools():
+            gate.blocked = True
+            gate.message = (
+                f"[egisai] The tool '{tool_name}' is disapproved by an "
+                "operator — this call is refused."
+            )
+            return gate
+
     rules = _scope_rules(get_rules(), identity.server_id)
     if not rules:
         return gate
@@ -363,6 +396,7 @@ def _prepare_gate(instance: Any, tool_name: str, arguments: Any) -> _Gate:
         stream=False,
         allow_sanitize=True,
     )
+    policy_started = time.monotonic()
     try:
         # Single-surface gate: an inbound MCP ``tools/call``. Rules
         # scoped via ``applies_to`` only fire when they cover "mcp".
@@ -372,8 +406,12 @@ def _prepare_gate(instance: Any, tool_name: str, arguments: Any) -> _Gate:
         # checks already ran and any block among them would have been
         # returned; an exception here means the engine itself failed).
         LOGGER.debug("mcp policy eval failed: %s", exc.__class__.__name__)
+        gate.policy_latency_ms = int(
+            (time.monotonic() - policy_started) * 1000
+        )
         return gate
 
+    gate.policy_latency_ms = int((time.monotonic() - policy_started) * 1000)
     gate.decision = decision
     if decision.verdict == "block":
         gate.blocked = True
@@ -439,6 +477,7 @@ def _emit_event(
     ev["tool_name"] = gate.tool_name
     ev["verdict"] = verdict
     ev["latency_ms"] = latency_ms
+    ev["policy_latency_ms"] = gate.policy_latency_ms
     ev["enforcement_status"] = "enforced"
     ev["payload_preview"] = safe_preview(gate.arguments)
     if error:

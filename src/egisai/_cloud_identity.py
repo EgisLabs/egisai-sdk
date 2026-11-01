@@ -264,7 +264,17 @@ def collect() -> dict[str, Any]:
     is plausible, so a laptop pays nothing: no AWS env var means no
     IMDS call, and the 169.254 hop that would otherwise hang behind a
     corporate firewall never happens.
+
+    On an EgisAI on-prem control plane (``EGIS_DEPLOYMENT=onprem``) this
+    is a hard no-op: an air-gapped install must never dial a cloud
+    metadata server (``169.254.169.254`` / ``metadata.google.internal``),
+    so we report nothing rather than probe. The env var is the platform's
+    own; a customer agent host embedding the SDK does not set it, so cloud
+    and customer-side behaviour is unchanged.
     """
+    if os.environ.get("EGIS_DEPLOYMENT", "").strip().lower() == "onprem":
+        return {}
+
     found: dict[str, Any] = {}
 
     aws = _clean(os.environ.get("AWS_ROLE_ARN"))
