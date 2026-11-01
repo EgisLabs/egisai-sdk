@@ -90,3 +90,29 @@ def test_cache_clears_mcp_directives_when_resumed(fake_backend) -> None:
     fake_backend.set_rules([], etag='"v2"', paused_mcp_server_ids=[])
     assert refresh_now() is True
     assert sid not in get_paused_mcp_server_ids()
+
+
+def test_cache_carries_ungoverned_mcp_servers(fake_backend) -> None:
+    """Ungoverned MCP servers ride the snapshot into the SDK cache, so
+    the inbound gate can skip policy for them (monitor-only)."""
+    sid = "AB12CD34-0000-0000-0000-000000000000"
+    fake_backend.set_rules(
+        [], etag='"v1"', ungoverned_mcp_server_ids=[sid],
+    )
+
+    import egisai
+
+    egisai.init(api_key="egis_live_x", app="a", env="t",
+                base_url="http://fake", enable_sse=False)
+
+    from egisai._policy_cache import (
+        get_ungoverned_mcp_server_ids,
+        refresh_now,
+    )
+
+    assert sid.lower() in get_ungoverned_mcp_server_ids()
+
+    # Operator re-governs the server: the next snapshot drops the id.
+    fake_backend.set_rules([], etag='"v2"', ungoverned_mcp_server_ids=[])
+    assert refresh_now() is True
+    assert sid.lower() not in get_ungoverned_mcp_server_ids()

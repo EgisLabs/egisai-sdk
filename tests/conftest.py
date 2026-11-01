@@ -182,6 +182,7 @@ class FakeBackend:
         # stopped servers and operator-disapproved tools. Empty by
         # default so non-MCP tests see no change.
         self.paused_mcp_server_ids: list[str] = []
+        self.ungoverned_mcp_server_ids: list[str] = []
         self.blocked_mcp_tools: list[str] = []
         self.etag: str = '"empty"'
         self.handshake_calls = 0
@@ -223,6 +224,7 @@ class FakeBackend:
         paused_agent_ids: list[str] | None = None,
         ungoverned_agent_ids: list[str] | None = None,
         paused_mcp_server_ids: list[str] | None = None,
+        ungoverned_mcp_server_ids: list[str] | None = None,
         blocked_mcp_tools: list[str] | None = None,
     ) -> None:
         self.rules = rules
@@ -233,6 +235,8 @@ class FakeBackend:
             self.ungoverned_agent_ids = ungoverned_agent_ids
         if paused_mcp_server_ids is not None:
             self.paused_mcp_server_ids = paused_mcp_server_ids
+        if ungoverned_mcp_server_ids is not None:
+            self.ungoverned_mcp_server_ids = ungoverned_mcp_server_ids
         if blocked_mcp_tools is not None:
             self.blocked_mcp_tools = blocked_mcp_tools
 
@@ -290,6 +294,7 @@ class FakeBackend:
                     "paused_agent_ids": self.paused_agent_ids,
                     "ungoverned_agent_ids": self.ungoverned_agent_ids,
                     "paused_mcp_server_ids": self.paused_mcp_server_ids,
+                    "ungoverned_mcp_server_ids": self.ungoverned_mcp_server_ids,
                     "blocked_mcp_tools": self.blocked_mcp_tools,
                 },
             )
