@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.84.0] — 2026-11-01
+
+### Added
+- **MCP request latency is now sub-millisecond truthful.** The
+  inbound MCP gate times the tool call and its policy check with
+  `time.perf_counter_ns()` and ships nanosecond-resolution
+  `latency_ns` / `policy_latency_ns` alongside the existing whole-
+  millisecond fields. In-process MCP calls finish well under a
+  millisecond, so the old `latency_ms` floored to `0` and the
+  dashboard showed a confusing "0 ms"; the backend now stores the
+  nanosecond values and the request detail renders a real "42 µs".
+  Additive and backwards compatible — older backends ignore the new
+  fields and keep showing whole milliseconds.
+
+---
+
+## [0.83.0] — 2026-11-01
+
+### Added
+- **MCP Servers: operator "Stop governing" is now enforced.** The
+  inbound MCP gate skips every policy phase — no block, no PII
+  sanitization, no semantic judge — for a server an operator has
+  opted out of governance from the dashboard, while still emitting
+  the audit event so the Requests page keeps full visibility
+  (monitor-only mode). The inbound twin of the agent governance
+  opt-out. Rides the existing `/v1/sdk/policies` snapshot (new
+  `ungoverned_mcp_server_ids` field), so it takes effect on the next
+  policy refresh with no restart. Stop (pause) and tool disapproval
+  still win — those are explicit refusals the opt-out can't mask.
+  Backwards compatible: older backends omit the field and every
+  server keeps being governed (the safe, enforcing direction).
+
+---
+
 ## [0.82.0] — 2026-10-31
 
 ### Added

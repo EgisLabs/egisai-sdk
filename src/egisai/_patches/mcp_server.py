@@ -87,6 +87,13 @@ class _Gate:
     # on the audit event so the request detail's "Policy" latency is a
     # real number instead of always 0.
     policy_latency_ms: int = 0
+    # Same measurement at nanosecond resolution. An in-process policy
+    # check almost always finishes well under a millisecond, so the ms
+    # value above floors to 0 and the dashboard would show a confusing
+    # "0 ms". Carrying nanoseconds lets the request detail render a
+    # truthful "42 µs" instead of hiding the card. ``perf_counter_ns``
+    # is monotonic and the highest-resolution clock available.
+    policy_latency_ns: int = 0
 
 
 # ── Tool-error type (block enforcement) ─────────────────────────────
@@ -365,6 +372,7 @@ def _prepare_gate(instance: Any, tool_name: str, arguments: Any) -> _Gate:
         from egisai._policy_cache import (
             get_blocked_mcp_tools,
             get_paused_mcp_server_ids,
+            get_ungoverned_mcp_server_ids,
         )
 
         if server_id in get_paused_mcp_server_ids():
@@ -381,6 +389,16 @@ def _prepare_gate(instance: Any, tool_name: str, arguments: Any) -> _Gate:
                 "operator — this call is refused."
             )
             return gate
+        if server_id in get_ungoverned_mcp_server_ids():
+            # Governance opt-out (monitor-only): skip every policy phase
+            # — no block, no PII sanitization, no judge. The call flows
+            # untouched and the plain gate (verdict "allow") still ships
+            # its audit event below, so the Requests page keeps full
+            # visibility. The inbound twin of the agent ungovern gate.
+            # Stop (pause) and tool disapproval above still win — those
+            # are explicit operator refusals, not maskable by the softer
+            # monitor-only posture.
+            return gate
 
     rules = _scope_rules(get_rules(), identity.server_id)
     if not rules:
@@ -396,7 +414,7 @@ def _prepare_gate(instance: Any, tool_name: str, arguments: Any) -> _Gate:
         stream=False,
         allow_sanitize=True,
     )
-    policy_started = time.monotonic()
+    policy_started_ns = time.perf_counter_ns()
     try:
         # Single-surface gate: an inbound MCP ``tools/call``. Rules
         # scoped via ``applies_to`` only fire when they cover "mcp".
@@ -406,12 +424,12 @@ def _prepare_gate(instance: Any, tool_name: str, arguments: Any) -> _Gate:
         # checks already ran and any block among them would have been
         # returned; an exception here means the engine itself failed).
         LOGGER.debug("mcp policy eval failed: %s", exc.__class__.__name__)
-        gate.policy_latency_ms = int(
-            (time.monotonic() - policy_started) * 1000
-        )
+        gate.policy_latency_ns = time.perf_counter_ns() - policy_started_ns
+        gate.policy_latency_ms = gate.policy_latency_ns // 1_000_000
         return gate
 
-    gate.policy_latency_ms = int((time.monotonic() - policy_started) * 1000)
+    gate.policy_latency_ns = time.perf_counter_ns() - policy_started_ns
+    gate.policy_latency_ms = gate.policy_latency_ns // 1_000_000
     gate.decision = decision
     if decision.verdict == "block":
         gate.blocked = True
@@ -451,6 +469,7 @@ def _emit_event(
     *,
     latency_ms: int,
     error: bool,
+    latency_ns: int = 0,
 ) -> None:
     """Build + enqueue a ``source_kind='mcp_server'`` audit event."""
     try:
@@ -478,6 +497,12 @@ def _emit_event(
     ev["verdict"] = verdict
     ev["latency_ms"] = latency_ms
     ev["policy_latency_ms"] = gate.policy_latency_ms
+    # Nanosecond-resolution twins. In-process MCP tool calls and their
+    # policy checks finish sub-millisecond, so the ms fields floor to 0;
+    # the backend stores these ns values alongside and the dashboard
+    # shows "42 µs" instead of a confusing "0 ms".
+    ev["latency_ns"] = latency_ns
+    ev["policy_latency_ns"] = gate.policy_latency_ns
     ev["enforcement_status"] = "enforced"
     ev["payload_preview"] = safe_preview(gate.arguments)
     if error:
@@ -529,7 +554,9 @@ def _make_wrapper(orig: Any) -> Any:
 
         if gate.blocked:
             try:
-                await asyncio.to_thread(_emit_event, gate, latency_ms=0, error=False)
+                await asyncio.to_thread(
+                    _emit_event, gate, latency_ms=0, latency_ns=0, error=False
+                )
             except Exception:  # noqa: BLE001
                 pass
             _raise_block(gate.message)
@@ -541,36 +568,48 @@ def _make_wrapper(orig: Any) -> Any:
         if "arguments" in kwargs:
             kwargs = dict(kwargs)
             kwargs["arguments"] = forward_args
-            started = time.monotonic()
+            started_ns = time.perf_counter_ns()
             try:
                 result = await orig(self, name, *args, **kwargs)
             except BaseException:
-                latency = int((time.monotonic() - started) * 1000)
+                latency_ns = time.perf_counter_ns() - started_ns
                 try:
                     await asyncio.to_thread(
-                        _emit_event, gate, latency_ms=latency, error=True
+                        _emit_event,
+                        gate,
+                        latency_ms=latency_ns // 1_000_000,
+                        latency_ns=latency_ns,
+                        error=True,
                     )
                 except Exception:  # noqa: BLE001
                     pass
                 raise
         else:
-            started = time.monotonic()
+            started_ns = time.perf_counter_ns()
             try:
                 result = await orig(self, name, forward_args, *args, **kwargs)
             except BaseException:
-                latency = int((time.monotonic() - started) * 1000)
+                latency_ns = time.perf_counter_ns() - started_ns
                 try:
                     await asyncio.to_thread(
-                        _emit_event, gate, latency_ms=latency, error=True
+                        _emit_event,
+                        gate,
+                        latency_ms=latency_ns // 1_000_000,
+                        latency_ns=latency_ns,
+                        error=True,
                     )
                 except Exception:  # noqa: BLE001
                     pass
                 raise
 
-        latency = int((time.monotonic() - started) * 1000)
+        latency_ns = time.perf_counter_ns() - started_ns
         try:
             await asyncio.to_thread(
-                _emit_event, gate, latency_ms=latency, error=False
+                _emit_event,
+                gate,
+                latency_ms=latency_ns // 1_000_000,
+                latency_ns=latency_ns,
+                error=False,
             )
         except Exception:  # noqa: BLE001
             pass

@@ -205,11 +205,12 @@ def fetch_policies(
     list[str] | None,
     list[str] | None,
     list[str] | None,
+    list[str] | None,
 ]:
     """Pull the per-org policy + paused/ungoverned-agent snapshot.
 
     Returns ``(new_etag, rules, paused_agent_ids, ungoverned_agent_ids,
-    paused_mcp_server_ids, blocked_mcp_tools)``.
+    paused_mcp_server_ids, ungoverned_mcp_server_ids, blocked_mcp_tools)``.
 
     * ``rules`` is ``None`` on a 304 (cache still fresh — the
       caller leaves its current rule list AND its current
@@ -239,7 +240,7 @@ def fetch_policies(
         lambda: get_client().get("/v1/sdk/policies", headers=headers),
     )
     if r.status_code == 304:
-        return etag, None, None, None, None, None
+        return etag, None, None, None, None, None, None
     if r.status_code != 200:
         raise _http_error(op="fetch_policies", status=r.status_code)
     body = r.json()
@@ -257,6 +258,12 @@ def fetch_policies(
     raw_paused_mcp = body.get("paused_mcp_server_ids") or []
     paused_mcp: list[str] = [
         str(a).strip().lower() for a in raw_paused_mcp if a
+    ]
+    # Ungoverned MCP servers — monitor-only. Same default posture:
+    # absent ⇒ empty ⇒ "nothing opted out" ⇒ keep governing (safe).
+    raw_ungoverned_mcp = body.get("ungoverned_mcp_server_ids") or []
+    ungoverned_mcp: list[str] = [
+        str(a).strip().lower() for a in raw_ungoverned_mcp if a
     ]
     # Each key is ``"<server_id>:<tool_name>"``. Normalize the server-id
     # half to lowercase (to match the gate's lowercased lookup) while
@@ -279,6 +286,7 @@ def fetch_policies(
         paused,
         ungoverned,
         paused_mcp,
+        ungoverned_mcp,
         blocked_tools,
     )
 
