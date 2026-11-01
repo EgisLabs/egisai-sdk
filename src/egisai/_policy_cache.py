@@ -40,6 +40,17 @@ _paused_agent_ids: frozenset[str] = frozenset()
 # turned policy enforcement off; monitoring stays on). Same
 # frozenset rationale as the paused set.
 _ungoverned_agent_ids: frozenset[str] = frozenset()
+# ── MCP Servers add-on enforcement directives ────────────────────────
+# Lower-case canonical UUID strings of MCP servers an operator has
+# *stopped* from the dashboard. The MCP gate refuses every inbound
+# ``tools/call`` against one of these before the tool runs — the
+# inbound twin of ``_paused_agent_ids``.
+_paused_mcp_server_ids: frozenset[str] = frozenset()
+# ``"<mcp_server_id>:<tool_name>"`` keys (server id lower-case) of tools
+# an operator *disapproved*. The MCP gate refuses an inbound call to any
+# listed tool. Scoped per server so the same tool name on two servers is
+# governed independently.
+_blocked_mcp_tools: frozenset[str] = frozenset()
 # True once this process has completed *any* successful policy sync
 # from the control plane — including one that returned zero rules
 # (a healthy org with no policies) and a 304 (nothing changed since a
@@ -216,11 +227,34 @@ def get_ungoverned_agent_ids() -> frozenset[str]:
         return _ungoverned_agent_ids
 
 
+def get_paused_mcp_server_ids() -> frozenset[str]:
+    """Snapshot of the operator-stopped MCP-server ID set.
+
+    The MCP server gate refuses every inbound ``tools/call`` against a
+    server in this set. Same frozenset/O(1)-containment contract as
+    :func:`get_paused_agent_ids`.
+    """
+    with _lock:
+        return _paused_mcp_server_ids
+
+
+def get_blocked_mcp_tools() -> frozenset[str]:
+    """Snapshot of disapproved ``"<server_id>:<tool_name>"`` keys.
+
+    The MCP gate refuses an inbound call to any listed tool. Same
+    frozenset contract as the other state snapshots.
+    """
+    with _lock:
+        return _blocked_mcp_tools
+
+
 def replace_rules(
     new_etag: str | None,
     raw_rules: list[dict],
     paused_agent_ids: list[str] | None = None,
     ungoverned_agent_ids: list[str] | None = None,
+    paused_mcp_server_ids: list[str] | None = None,
+    blocked_mcp_tools: list[str] | None = None,
 ) -> int:
     """Replace the cache atomically. Returns the new rule count.
 
@@ -237,6 +271,7 @@ def replace_rules(
     """
     with _lock:
         global _etag, _rules, _paused_agent_ids, _ungoverned_agent_ids
+        global _paused_mcp_server_ids, _blocked_mcp_tools
         _etag = new_etag
         _rules = [_to_rule(r) for r in raw_rules]
         if paused_agent_ids is not None:
@@ -246,6 +281,16 @@ def replace_rules(
         if ungoverned_agent_ids is not None:
             _ungoverned_agent_ids = frozenset(
                 str(a).strip().lower() for a in ungoverned_agent_ids if a
+            )
+        if paused_mcp_server_ids is not None:
+            _paused_mcp_server_ids = frozenset(
+                str(a).strip().lower() for a in paused_mcp_server_ids if a
+            )
+        if blocked_mcp_tools is not None:
+            # Server id is lower-cased; the tool-name half is left as-is
+            # (tool names are case-sensitive on the wire).
+            _blocked_mcp_tools = frozenset(
+                str(a).strip() for a in blocked_mcp_tools if a
             )
         count = len(_rules)
         rules_snapshot = list(_rules)
@@ -274,7 +319,14 @@ def replace_rules(
 def refresh_now() -> bool:
     """Hit the platform once. Returns ``True`` iff the cache was updated."""
     current_etag = get_etag()
-    new_etag, rules, paused, ungoverned = fetch_policies(etag=current_etag)
+    (
+        new_etag,
+        rules,
+        paused,
+        ungoverned,
+        paused_mcp,
+        blocked_tools,
+    ) = fetch_policies(etag=current_etag)
     # The HTTP call returned without raising — whether it shipped a new
     # rule list, zero rules, or a 304. Either way we have now heard from
     # the control plane, so mark the process as synced (fail-closed
@@ -290,6 +342,8 @@ def refresh_now() -> bool:
         rules,
         paused_agent_ids=paused,
         ungoverned_agent_ids=ungoverned,
+        paused_mcp_server_ids=paused_mcp,
+        blocked_mcp_tools=blocked_tools,
     )
     return True
 
@@ -297,11 +351,13 @@ def refresh_now() -> bool:
 def clear() -> None:
     with _lock:
         global _etag, _rules, _paused_agent_ids, _ungoverned_agent_ids
-        global _synced_ok
+        global _paused_mcp_server_ids, _blocked_mcp_tools, _synced_ok
         _etag = None
         _rules = []
         _paused_agent_ids = frozenset()
         _ungoverned_agent_ids = frozenset()
+        _paused_mcp_server_ids = frozenset()
+        _blocked_mcp_tools = frozenset()
         _synced_ok = False
     # No rules ⇒ no limit rules ⇒ the usage-sync worker can stop.
     try:

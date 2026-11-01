@@ -198,10 +198,18 @@ def handshake(
 
 def fetch_policies(
     etag: str | None = None,
-) -> tuple[str | None, list[dict] | None, list[str] | None, list[str] | None]:
+) -> tuple[
+    str | None,
+    list[dict] | None,
+    list[str] | None,
+    list[str] | None,
+    list[str] | None,
+    list[str] | None,
+]:
     """Pull the per-org policy + paused/ungoverned-agent snapshot.
 
-    Returns ``(new_etag, rules, paused_agent_ids, ungoverned_agent_ids)``.
+    Returns ``(new_etag, rules, paused_agent_ids, ungoverned_agent_ids,
+    paused_mcp_server_ids, blocked_mcp_tools)``.
 
     * ``rules`` is ``None`` on a 304 (cache still fresh — the
       caller leaves its current rule list AND its current
@@ -231,7 +239,7 @@ def fetch_policies(
         lambda: get_client().get("/v1/sdk/policies", headers=headers),
     )
     if r.status_code == 304:
-        return etag, None, None, None
+        return etag, None, None, None, None, None
     if r.status_code != 200:
         raise _http_error(op="fetch_policies", status=r.status_code)
     body = r.json()
@@ -243,7 +251,36 @@ def fetch_policies(
     ungoverned: list[str] = [
         str(a).strip().lower() for a in raw_ungoverned if a
     ]
-    return body.get("etag"), body.get("rules", []), paused, ungoverned
+    # MCP Servers add-on directives. Absent on non-add-on orgs and on
+    # backends older than this field — an empty list, which the cache
+    # treats as "nothing stopped / nothing blocked" (the safe default).
+    raw_paused_mcp = body.get("paused_mcp_server_ids") or []
+    paused_mcp: list[str] = [
+        str(a).strip().lower() for a in raw_paused_mcp if a
+    ]
+    # Each key is ``"<server_id>:<tool_name>"``. Normalize the server-id
+    # half to lowercase (to match the gate's lowercased lookup) while
+    # preserving the tool name's case exactly — tool names are
+    # case-sensitive. Split on the FIRST colon so a tool name that
+    # itself contains a colon survives intact.
+    raw_blocked_tools = body.get("blocked_mcp_tools") or []
+    blocked_tools: list[str] = []
+    for a in raw_blocked_tools:
+        if not a:
+            continue
+        key = str(a).strip()
+        sid, sep, tool = key.partition(":")
+        blocked_tools.append(
+            f"{sid.lower()}{sep}{tool}" if sep else key.lower()
+        )
+    return (
+        body.get("etag"),
+        body.get("rules", []),
+        paused,
+        ungoverned,
+        paused_mcp,
+        blocked_tools,
+    )
 
 
 def fetch_usage() -> dict[str, Any] | None:
