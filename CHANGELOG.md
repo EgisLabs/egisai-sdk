@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.85.0] — 2026-11-02
+
+### Added
+- **European national-ID detection — 15 countries, opt-in by
+  country.** The `pii_scan` catalog gains per-country government-ID
+  types so operators serving EU users can detect and sanitize local
+  identifiers, not just US ones. Each is backed by a new
+  checksum-validated recognizer that runs under the English NLP
+  engine (so it fires regardless of prompt language), and each shows
+  up in its own country section ("Italy", "France", …) on the
+  Policies page. New types:
+  - **Italy** — Codice Fiscale, Tessera Sanitaria (health card),
+    passport, electronic identity card (CIE).
+  - **France** — Sécurité sociale (NIR, mod-97, incl. Corsica).
+  - **Germany** — Steuer-ID (ISO 7064 check digit).
+  - **Netherlands** — BSN (11-proef).
+  - **Belgium** — Rijksregisternummer (mod-97).
+  - **Portugal** — NIF (mod-11).
+  - **Poland** — PESEL and NIP.
+  - **Greece** — AMKA and AFM.
+  - **Sweden** — Personnummer / samordningsnummer (Luhn).
+  - **Norway** — Fødselsnummer (two mod-11 digits).
+  - **Denmark** — CPR (structure + date; mod-11 was retired).
+  - **Finland** — Henkilötunnus / HETU (mod-31).
+  - **Austria** — Sozialversicherungsnummer (weighted check digit).
+  - **Switzerland** — AHV/AVS (EAN-13).
+  - **Ireland** — PPS number (mod-23 check letter).
+  Fully additive: these detectors only run when the operator ticks
+  the box, so existing policies are unchanged. Weak-checksum numeric
+  schemes (e.g. BSN, NIF) additionally require a nearby country /
+  scheme keyword so a plain number in a "detect everything" scan is
+  never mislabelled; distinctive formats (fixed prefix, embedded
+  check letter/sign, mod-97) fire on their own.
+
+---
+
 ## [0.84.0] — 2026-11-01
 
 ### Added

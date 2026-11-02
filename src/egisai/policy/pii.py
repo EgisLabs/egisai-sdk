@@ -963,6 +963,27 @@ _WORD_PLACEHOLDERS: dict[str, str] = {
     "vehicle_registration": "[plate-redacted]",
     "date_of_birth": "[dob-redacted]",
     "nationality_or_religion": "[demographic-redacted]",
+    # European per-country government IDs (see _pii_taxonomy.py).
+    "it_codice_fiscale": "[codice-fiscale-redacted]",
+    "it_tessera_sanitaria": "[health-card-redacted]",
+    "it_passport": "[passport-redacted]",
+    "it_id_card": "[id-card-redacted]",
+    "fr_nir": "[nir-redacted]",
+    "de_tax_id": "[tax-id-redacted]",
+    "nl_bsn": "[bsn-redacted]",
+    "be_rrn": "[rrn-redacted]",
+    "pt_nif": "[nif-redacted]",
+    "pl_pesel": "[pesel-redacted]",
+    "pl_nip": "[nip-redacted]",
+    "gr_amka": "[amka-redacted]",
+    "gr_afm": "[afm-redacted]",
+    "se_personnummer": "[personnummer-redacted]",
+    "no_fodselsnummer": "[fodselsnummer-redacted]",
+    "dk_cpr": "[cpr-redacted]",
+    "fi_hetu": "[hetu-redacted]",
+    "at_svnr": "[svnr-redacted]",
+    "ch_ahv": "[ahv-redacted]",
+    "ie_pps": "[pps-redacted]",
 }
 
 

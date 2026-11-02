@@ -50,6 +50,28 @@ CATEGORY_CREDENTIALS = "Credentials"
 CATEGORY_NETWORK = "Network"
 CATEGORY_VEHICLE = "Vehicle"
 
+# Per-country buckets for European government IDs. Grouping these by
+# country (rather than folding them into the generic ``Identity``
+# bucket) lets an operator who only cares about, say, Italian data
+# find every Italian identifier in one place on the Policies page.
+# The frontend's category ordering gives these a stable slot after
+# the universal buckets above; see ``PolicyFormModal.tsx``.
+CATEGORY_IT = "Italy"
+CATEGORY_FR = "France"
+CATEGORY_DE = "Germany"
+CATEGORY_NL = "Netherlands"
+CATEGORY_BE = "Belgium"
+CATEGORY_PT = "Portugal"
+CATEGORY_PL = "Poland"
+CATEGORY_GR = "Greece"
+CATEGORY_SE = "Sweden"
+CATEGORY_NO = "Norway"
+CATEGORY_DK = "Denmark"
+CATEGORY_FI = "Finland"
+CATEGORY_AT = "Austria"
+CATEGORY_CH = "Switzerland"
+CATEGORY_IE = "Ireland"
+
 
 @dataclass(frozen=True)
 class PiiTypeSpec:
@@ -384,6 +406,256 @@ CANONICAL_TYPES: tuple[PiiTypeSpec, ...] = (
             "IN_VEHICLE_REGISTRATION",
             "NG_VEHICLE_REGISTRATION",
         }),
+    ),
+    # ── Europe — per-country government IDs ─────────────────────────
+    #
+    # Each entry is backed by a checksum-validated custom recognizer
+    # (``EGIS_*`` in ``_pii_recognizers.py``) that runs under the
+    # English NLP engine, so detection fires regardless of prompt
+    # language. These are opt-in: a policy only detects them when the
+    # operator ticks the box, so adding them changes nothing for
+    # existing policies. They overlap conceptually with the generic
+    # ``national_id`` bucket but, unlike those built-in Presidio
+    # entities (which never load under the English engine), these
+    # actually fire — and they tell the operator exactly which
+    # country's identifier was seen.
+
+    # Italy
+    PiiTypeSpec(
+        id="it_codice_fiscale",
+        label="Codice Fiscale",
+        category=CATEGORY_IT,
+        description=(
+            "Italian personal fiscal code. Validated against its "
+            "official control-character checksum, including omocodia "
+            "variants."
+        ),
+        example="RSSMRA85T10A562S",
+        presidio_entities=frozenset({"EGIS_IT_CF"}),
+    ),
+    PiiTypeSpec(
+        id="it_tessera_sanitaria",
+        label="Tessera Sanitaria (health card)",
+        category=CATEGORY_IT,
+        description=(
+            "Italian health-insurance card number (the 20-digit code on "
+            "the back, also the European Health Insurance Card number)."
+        ),
+        example="80380800301234567895",
+        presidio_entities=frozenset({"EGIS_IT_TEAM"}),
+    ),
+    PiiTypeSpec(
+        id="it_passport",
+        label="Passport number (Italy)",
+        category=CATEGORY_IT,
+        description=(
+            "Italian passport numbers (two letters + seven digits). "
+            "Matched with nearby passport context to stay precise."
+        ),
+        example="YA1234567",
+        presidio_entities=frozenset({"EGIS_IT_PASSPORT"}),
+    ),
+    PiiTypeSpec(
+        id="it_id_card",
+        label="Identity card (CIE)",
+        category=CATEGORY_IT,
+        description=(
+            "Italian electronic identity-card (CIE) numbers. Matched "
+            "with nearby ID-card context to stay precise."
+        ),
+        example="CA00000AA",
+        presidio_entities=frozenset({"EGIS_IT_CIE"}),
+    ),
+    # France
+    PiiTypeSpec(
+        id="fr_nir",
+        label="Sécurité sociale (NIR)",
+        category=CATEGORY_FR,
+        description=(
+            "French social-security number (NIR / INSEE). Validated with "
+            "its mod-97 key, including the Corsican department codes."
+        ),
+        example="2 55 08 33 100 005 33",
+        presidio_entities=frozenset({"EGIS_FR_NIR"}),
+    ),
+    # Germany
+    PiiTypeSpec(
+        id="de_tax_id",
+        label="Steuer-ID (tax ID)",
+        category=CATEGORY_DE,
+        description=(
+            "German tax identification number (Steuer-IdNr). Validated "
+            "with its ISO 7064 check digit."
+        ),
+        example="86 095 742 719",
+        presidio_entities=frozenset({"EGIS_DE_TAX_ID"}),
+    ),
+    # Netherlands
+    PiiTypeSpec(
+        id="nl_bsn",
+        label="BSN (citizen service number)",
+        category=CATEGORY_NL,
+        description=(
+            "Dutch citizen service number (BSN). Validated with the "
+            "11-proef checksum; matched near BSN context."
+        ),
+        example="111222333",
+        presidio_entities=frozenset({"EGIS_NL_BSN"}),
+    ),
+    # Belgium
+    PiiTypeSpec(
+        id="be_rrn",
+        label="Rijksregisternummer",
+        category=CATEGORY_BE,
+        description=(
+            "Belgian national register number. Validated with its "
+            "mod-97 checksum for both pre- and post-2000 births."
+        ),
+        example="93.05.18-223.61",
+        presidio_entities=frozenset({"EGIS_BE_RRN"}),
+    ),
+    # Portugal
+    PiiTypeSpec(
+        id="pt_nif",
+        label="NIF (tax number)",
+        category=CATEGORY_PT,
+        description=(
+            "Portuguese tax number (NIF / NIPC). Validated with its "
+            "mod-11 check digit; matched near tax context."
+        ),
+        example="501442600",
+        presidio_entities=frozenset({"EGIS_PT_NIF"}),
+    ),
+    # Poland
+    PiiTypeSpec(
+        id="pl_pesel",
+        label="PESEL",
+        category=CATEGORY_PL,
+        description=(
+            "Polish PESEL national identification number. Validated with "
+            "its weighted checksum; matched near PESEL context."
+        ),
+        example="44051401359",
+        presidio_entities=frozenset({"EGIS_PL_PESEL"}),
+    ),
+    PiiTypeSpec(
+        id="pl_nip",
+        label="NIP (tax number)",
+        category=CATEGORY_PL,
+        description=(
+            "Polish tax number (NIP). Validated with its weighted mod-11 "
+            "checksum; matched near tax context."
+        ),
+        example="856-734-62-15",
+        presidio_entities=frozenset({"EGIS_PL_NIP"}),
+    ),
+    # Greece
+    PiiTypeSpec(
+        id="gr_amka",
+        label="AMKA (social security)",
+        category=CATEGORY_GR,
+        description=(
+            "Greek social-security number (AMKA). Validated with its "
+            "Luhn checksum and birth-date prefix; matched near context."
+        ),
+        example="01019000007",
+        presidio_entities=frozenset({"EGIS_GR_AMKA"}),
+    ),
+    PiiTypeSpec(
+        id="gr_afm",
+        label="AFM (tax number)",
+        category=CATEGORY_GR,
+        description=(
+            "Greek tax number (AFM). Validated with its mod-11 check "
+            "digit; matched near tax context."
+        ),
+        example="090000045",
+        presidio_entities=frozenset({"EGIS_GR_AFM"}),
+    ),
+    # Sweden
+    PiiTypeSpec(
+        id="se_personnummer",
+        label="Personnummer",
+        category=CATEGORY_SE,
+        description=(
+            "Swedish personal identity number (and coordination number). "
+            "Validated with its Luhn checksum; matched near context."
+        ),
+        example="811218-9876",
+        presidio_entities=frozenset({"EGIS_SE_PNR"}),
+    ),
+    # Norway
+    PiiTypeSpec(
+        id="no_fodselsnummer",
+        label="Fødselsnummer",
+        category=CATEGORY_NO,
+        description=(
+            "Norwegian national identity number (fødselsnummer / "
+            "D-number). Validated with its two mod-11 check digits."
+        ),
+        example="01019000083",
+        presidio_entities=frozenset({"EGIS_NO_FNR"}),
+    ),
+    # Denmark
+    PiiTypeSpec(
+        id="dk_cpr",
+        label="CPR number",
+        category=CATEGORY_DK,
+        description=(
+            "Danish CPR number. Validated by structure and birth date "
+            "(the mod-11 check was officially retired); matched near "
+            "CPR context."
+        ),
+        example="010190-1234",
+        presidio_entities=frozenset({"EGIS_DK_CPR"}),
+    ),
+    # Finland
+    PiiTypeSpec(
+        id="fi_hetu",
+        label="Henkilötunnus (HETU)",
+        category=CATEGORY_FI,
+        description=(
+            "Finnish personal identity code (HETU). Validated with its "
+            "mod-31 control character."
+        ),
+        example="131052-308T",
+        presidio_entities=frozenset({"EGIS_FI_HETU"}),
+    ),
+    # Austria
+    PiiTypeSpec(
+        id="at_svnr",
+        label="Sozialversicherungsnummer",
+        category=CATEGORY_AT,
+        description=(
+            "Austrian social-insurance number (SVNR). Validated with its "
+            "weighted check digit; matched near insurance context."
+        ),
+        example="1237 010180",
+        presidio_entities=frozenset({"EGIS_AT_SVNR"}),
+    ),
+    # Switzerland
+    PiiTypeSpec(
+        id="ch_ahv",
+        label="AHV/AVS number",
+        category=CATEGORY_CH,
+        description=(
+            "Swiss social-security number (AHV/AVS, the 13-digit 756.…). "
+            "Validated with its EAN-13 checksum."
+        ),
+        example="756.9217.0769.85",
+        presidio_entities=frozenset({"EGIS_CH_AHV"}),
+    ),
+    # Ireland
+    PiiTypeSpec(
+        id="ie_pps",
+        label="PPS number",
+        category=CATEGORY_IE,
+        description=(
+            "Irish Personal Public Service (PPS) number. Validated with "
+            "its mod-23 check letter."
+        ),
+        example="1234567T",
+        presidio_entities=frozenset({"EGIS_IE_PPS"}),
     ),
 )
 

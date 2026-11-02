@@ -34,6 +34,8 @@ short-circuit before anything LLM-based runs.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from presidio_analyzer import (
     AnalysisExplanation,
@@ -44,6 +46,7 @@ from presidio_analyzer import (
 )
 from presidio_analyzer.nlp_engine import NlpArtifacts
 
+from egisai.policy import _pii_eu
 from egisai.policy._pii_helpers import (
     is_reserved_email_domain,  # noqa: F401 — re-exported for callers
     is_valid_spanish_nif,
@@ -535,6 +538,339 @@ class SpanishNifRecognizer(PatternRecognizer):
         return is_valid_spanish_nif(pattern_text)
 
 
+# ── European national-identifier recognizers ────────────────────────
+#
+# Presidio ships country recognizers (IT_FISCAL_CODE, PL_PESEL,
+# FI_PERSONAL_IDENTITY_CODE, …) but registers them under each
+# country's ``supported_language`` (``it``, ``pl``, ``fi``). Our
+# analyzer runs the English engine, so none of them load and the IDs
+# sail through — the same gap the Spanish NIF recognizer above closes.
+# These recognizers close it for 15 more countries, each validated by
+# the exact national checksum in :mod:`egisai.policy._pii_eu`.
+#
+# One data-driven recognizer handles every entity: a flat spec table
+# keeps the checksum (the hard part) in ``_pii_eu`` and leaves this
+# class to do span-finding, validation, and context gating.
+#
+# ``require_context`` is the false-positive governor. A checksum that
+# only removes ~1 in 10–11 candidates (a single mod-11 / Luhn / 11-
+# test) is too weak to fire on a bare numeric run without over-masking
+# ordinary numbers in a "detect everything" scan — those entities only
+# emit when a country/scheme keyword sits nearby. Strong or structurally
+# distinctive formats (mod-97, two-digit mod-11, a fixed country
+# prefix, an embedded check letter or sign) fire on their own.
+
+
+@dataclass(frozen=True)
+class _EuIdSpec:
+    """One European identifier: how to find it and how to trust it."""
+
+    entity: str
+    regex: re.Pattern[str]
+    validator: Callable[[str], bool] | None
+    context: tuple[str, ...]
+    require_context: bool
+    score: float
+
+
+# Keywords are matched case-insensitively as substrings within a
+# window around the candidate, so inflections and phrases
+# ("social security number", "codice fiscale:") are covered.
+_EU_ID_SPECS: tuple[_EuIdSpec, ...] = (
+    # ── Italy ──────────────────────────────────────────────────────
+    _EuIdSpec(
+        entity="EGIS_IT_CF",
+        regex=re.compile(
+            r"\b[A-Z]{6}[0-9A-Z]{2}[A-Z][0-9A-Z]{2}[A-Z][0-9A-Z]{3}[A-Z]\b",
+            re.IGNORECASE,
+        ),
+        validator=_pii_eu.is_valid_italian_codice_fiscale,
+        context=("codice fiscale", "fiscal code", "cf", "italian", "italy"),
+        require_context=False,
+        score=0.9,
+    ),
+    _EuIdSpec(
+        entity="EGIS_IT_TEAM",
+        regex=re.compile(r"\b80380800\d{12}\b"),
+        validator=_pii_eu.is_valid_italian_tessera_sanitaria,
+        context=("tessera sanitaria", "health card", "health insurance", "team"),
+        require_context=False,
+        score=0.9,
+    ),
+    _EuIdSpec(
+        entity="EGIS_IT_PASSPORT",
+        regex=re.compile(r"\b[A-Z]{2}\d{7}\b", re.IGNORECASE),
+        validator=None,  # no public checksum — format + context only
+        context=("passport", "passaporto", "travel document"),
+        require_context=True,
+        score=0.85,
+    ),
+    _EuIdSpec(
+        entity="EGIS_IT_CIE",
+        regex=re.compile(r"\b[A-Z]{2}\d{5}[A-Z]{2}\b", re.IGNORECASE),
+        validator=None,  # CIE has no public checksum — format + context
+        context=(
+            "carta d'identità", "carta di identita", "carta identita",
+            "identity card", "id card", "cie",
+        ),
+        require_context=True,
+        score=0.85,
+    ),
+    # ── France ─────────────────────────────────────────────────────
+    _EuIdSpec(
+        entity="EGIS_FR_NIR",
+        regex=re.compile(
+            r"\b[12]\s?\d{2}\s?\d{2}\s?(?:2[AB]|\d{2})\s?\d{3}\s?\d{3}\s?\d{2}\b",
+            re.IGNORECASE,
+        ),
+        validator=_pii_eu.is_valid_french_nir,
+        context=("sécurité sociale", "securite sociale", "nir", "insee", "french"),
+        require_context=False,
+        score=0.95,
+    ),
+    # ── Germany ────────────────────────────────────────────────────
+    _EuIdSpec(
+        entity="EGIS_DE_TAX_ID",
+        regex=re.compile(r"\b\d{2} ?\d{3} ?\d{3} ?\d{3}\b"),
+        validator=_pii_eu.is_valid_german_tax_id,
+        context=(
+            "steuer", "steueridentifikationsnummer", "tax id",
+            "tax identification", "idnr", "german",
+        ),
+        require_context=True,
+        score=0.9,
+    ),
+    # ── Netherlands ────────────────────────────────────────────────
+    _EuIdSpec(
+        entity="EGIS_NL_BSN",
+        regex=re.compile(r"\b\d{8,9}\b"),
+        validator=_pii_eu.is_valid_dutch_bsn,
+        context=(
+            "bsn", "burgerservicenummer", "sofinummer", "citizen service",
+            "dutch", "netherlands",
+        ),
+        require_context=True,
+        score=0.9,
+    ),
+    # ── Belgium ────────────────────────────────────────────────────
+    _EuIdSpec(
+        entity="EGIS_BE_RRN",
+        regex=re.compile(r"\b\d{2}[.\s]?\d{2}[.\s]?\d{2}[-\s]?\d{3}[.\s]?\d{2}\b"),
+        validator=_pii_eu.is_valid_belgian_rrn,
+        context=("rijksregister", "national register", "numéro national", "belgian"),
+        require_context=False,
+        score=0.95,
+    ),
+    # ── Portugal ───────────────────────────────────────────────────
+    _EuIdSpec(
+        entity="EGIS_PT_NIF",
+        regex=re.compile(r"\b\d{9}\b"),
+        validator=_pii_eu.is_valid_portuguese_nif,
+        context=(
+            "nif", "nipc", "contribuinte", "número de contribuinte",
+            "portuguese", "portugal",
+        ),
+        require_context=True,
+        score=0.9,
+    ),
+    # ── Poland ─────────────────────────────────────────────────────
+    _EuIdSpec(
+        entity="EGIS_PL_PESEL",
+        regex=re.compile(r"\b\d{11}\b"),
+        validator=_pii_eu.is_valid_polish_pesel,
+        context=("pesel", "polish", "poland"),
+        require_context=True,
+        score=0.9,
+    ),
+    _EuIdSpec(
+        entity="EGIS_PL_NIP",
+        regex=re.compile(
+            r"\b\d{3}-\d{3}-\d{2}-\d{2}\b|\b\d{3}-\d{2}-\d{2}-\d{3}\b|\b\d{10}\b"
+        ),
+        validator=_pii_eu.is_valid_polish_nip,
+        context=("nip", "vat", "tax", "polish", "poland"),
+        require_context=True,
+        score=0.9,
+    ),
+    # ── Greece ─────────────────────────────────────────────────────
+    _EuIdSpec(
+        entity="EGIS_GR_AMKA",
+        regex=re.compile(r"\b\d{11}\b"),
+        validator=_pii_eu.is_valid_greek_amka,
+        context=("amka", "social security", "greek", "greece", "ασφ"),
+        require_context=True,
+        score=0.9,
+    ),
+    _EuIdSpec(
+        entity="EGIS_GR_AFM",
+        regex=re.compile(r"\b\d{9}\b"),
+        validator=_pii_eu.is_valid_greek_afm,
+        context=("afm", "αφμ", "tax", "vat", "greek", "greece"),
+        require_context=True,
+        score=0.9,
+    ),
+    # ── Sweden ─────────────────────────────────────────────────────
+    _EuIdSpec(
+        entity="EGIS_SE_PNR",
+        regex=re.compile(r"\b\d{6}[-+]?\d{4}\b|\b\d{12}\b"),
+        validator=_pii_eu.is_valid_swedish_personnummer,
+        context=(
+            "personnummer", "samordningsnummer", "personal number",
+            "swedish", "sweden",
+        ),
+        require_context=True,
+        score=0.9,
+    ),
+    # ── Norway ─────────────────────────────────────────────────────
+    _EuIdSpec(
+        entity="EGIS_NO_FNR",
+        regex=re.compile(r"\b\d{6}\s?\d{5}\b"),
+        validator=_pii_eu.is_valid_norwegian_fnr,
+        context=("fødselsnummer", "fodselsnummer", "norwegian", "norway"),
+        require_context=False,
+        score=0.92,
+    ),
+    # ── Denmark ────────────────────────────────────────────────────
+    _EuIdSpec(
+        entity="EGIS_DK_CPR",
+        regex=re.compile(r"\b\d{6}-?\d{4}\b"),
+        validator=_pii_eu.is_valid_danish_cpr,
+        context=("cpr", "personnummer", "danish", "denmark"),
+        require_context=True,
+        score=0.85,
+    ),
+    # ── Finland ────────────────────────────────────────────────────
+    _EuIdSpec(
+        entity="EGIS_FI_HETU",
+        regex=re.compile(r"\b\d{6}[-+A-FYXWVU]\d{3}[0-9A-Y]\b", re.IGNORECASE),
+        validator=_pii_eu.is_valid_finnish_hetu,
+        context=("hetu", "henkilötunnus", "finnish", "finland"),
+        require_context=False,
+        score=0.9,
+    ),
+    # ── Austria ────────────────────────────────────────────────────
+    _EuIdSpec(
+        entity="EGIS_AT_SVNR",
+        regex=re.compile(r"\b\d{4}\s?\d{6}\b"),
+        validator=_pii_eu.is_valid_austrian_svnr,
+        context=(
+            "svnr", "sozialversicherung", "versicherungsnummer",
+            "austrian", "austria",
+        ),
+        require_context=True,
+        score=0.9,
+    ),
+    # ── Switzerland ────────────────────────────────────────────────
+    _EuIdSpec(
+        entity="EGIS_CH_AHV",
+        regex=re.compile(r"\b756[.\s]?\d{4}[.\s]?\d{4}[.\s]?\d{2}\b"),
+        validator=_pii_eu.is_valid_swiss_ahv,
+        context=("ahv", "avs", "swiss", "switzerland"),
+        require_context=False,
+        score=0.95,
+    ),
+    # ── Ireland ────────────────────────────────────────────────────
+    _EuIdSpec(
+        entity="EGIS_IE_PPS",
+        regex=re.compile(r"\b\d{7}[A-W][A-IW]?\b", re.IGNORECASE),
+        validator=_pii_eu.is_valid_irish_pps,
+        context=("pps", "ppsn", "personal public service", "irish", "ireland"),
+        require_context=False,
+        score=0.9,
+    ),
+)
+
+#: Every EU entity this recognizer can emit — handed to Presidio as
+#: ``supported_entities`` so an ``analyze(entities=[…])`` filter routes
+#: a country selection to exactly the matching spec.
+EU_ID_ENTITIES: tuple[str, ...] = tuple(spec.entity for spec in _EU_ID_SPECS)
+
+
+def _window_has_context(
+    text: str, start: int, end: int, keywords: tuple[str, ...], window: int = 60
+) -> bool:
+    """True when any keyword appears within ``window`` chars of the span."""
+    lo = max(0, start - window)
+    hi = min(len(text), end + window)
+    haystack = text[lo:hi].lower()
+    return any(kw in haystack for kw in keywords)
+
+
+class EuNationalIdRecognizer(EntityRecognizer):
+    """Checksum-validated European national IDs, under the English engine.
+
+    Each matched span is validated by its national checksum (where one
+    exists) before it can be emitted; a failed checksum drops the span
+    entirely, exactly like the Spanish NIF recognizer. Weak-checksum
+    numeric schemes additionally require a nearby country/scheme
+    keyword so a bare numeric run in a "detect everything" scan does
+    not get masked as, say, a Dutch BSN just because it happens to pass
+    the 11-test.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            supported_entities=list(EU_ID_ENTITIES),
+            name="EgisEuNationalIdRecognizer",
+            supported_language="en",
+        )
+
+    def load(self) -> None:  # pragma: no cover - required no-op
+        return
+
+    def analyze(
+        self,
+        text: str,
+        entities: list[str],
+        nlp_artifacts: NlpArtifacts | None = None,
+    ) -> list[RecognizerResult]:
+        results: list[RecognizerResult] = []
+        for spec in _EU_ID_SPECS:
+            if spec.entity not in entities:
+                continue
+            for match in spec.regex.finditer(text):
+                raw = match.group()
+                if spec.validator is not None and not spec.validator(raw):
+                    continue
+                if spec.require_context and not _window_has_context(
+                    text, match.start(), match.end(), spec.context
+                ):
+                    continue
+                results.append(
+                    RecognizerResult(
+                        entity_type=spec.entity,
+                        start=match.start(),
+                        end=match.end(),
+                        score=spec.score,
+                        analysis_explanation=AnalysisExplanation(
+                            recognizer="EgisEuNationalIdRecognizer",
+                            pattern_name=spec.entity,
+                            pattern=spec.regex.pattern,
+                            original_score=spec.score,
+                            textual_explanation=(
+                                "Matches the national format"
+                                + (
+                                    " and checksum"
+                                    if spec.validator is not None
+                                    else ""
+                                )
+                                + (
+                                    " with supporting context"
+                                    if spec.require_context
+                                    else ""
+                                )
+                                + "."
+                            ),
+                        ),
+                        recognition_metadata={
+                            RecognizerResult.RECOGNIZER_NAME_KEY:
+                                "EgisEuNationalIdRecognizer",
+                        },
+                    )
+                )
+        return results
+
+
 # ── Registration helper ─────────────────────────────────────────────
 
 
@@ -554,6 +890,7 @@ def register_custom_recognizers(registry) -> None:  # type: ignore[no-untyped-de
         WordFormDigitsRecognizer(),
         MastercardRangeRecognizer(),
         SpanishNifRecognizer(),
+        EuNationalIdRecognizer(),
     )
     for rec in custom_recognizers:
         # ``rec.name`` is set by Presidio's ``EntityRecognizer.__init__``
