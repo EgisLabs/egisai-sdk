@@ -334,6 +334,11 @@ class InputCall:
     # model-call path. Optional so every existing constructor keeps
     # compiling.
     hook: str = "model"
+    # File/attachment metadata (+ optional bytes) carried on the call,
+    # copied onto ``PolicyContext.attachments`` for the ``file_scan``
+    # kind. Empty by default so every existing constructor keeps
+    # compiling.
+    attachments: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -369,6 +374,10 @@ class OutputCall:
     # response path; tool / MCP gates override (``PreToolUse``,
     # ``PostToolUse``, ``mcp``).
     hook: str = "response"
+    # File/attachment metadata (+ optional bytes) carried on the
+    # response, copied onto ``OutputPolicyContext.attachments`` for the
+    # ``file_scan`` kind. Empty by default.
+    attachments: tuple[Any, ...] = ()
 
 
 # ── Phase 0: operator pause / resume gate ───────────────────────────
@@ -691,6 +700,7 @@ def evaluate(call: InputCall) -> PolicyDecision:
         stream=call.stream,
         agent_id=agent_id,
         hook=call.hook,
+        attachments=tuple(call.attachments),
     )
     blocker = _get_semantic_blocker() if _has_semantic_rule(rules) else None
     inj_blocker = (
@@ -768,6 +778,7 @@ def evaluate_output(call: OutputCall) -> PolicyDecision:
         end_user_id=identity.end_user_id or "",
         user_id=identity.user_id or "",
         hook=call.hook,
+        attachments=tuple(call.attachments),
     )
     blocker = _get_semantic_blocker() if _has_semantic_rule(rules) else None
     inj_blocker = (
@@ -901,6 +912,131 @@ def extract_payload_text(payload: Any) -> str:
                     chunks.append(parts)
 
     return "\n".join(c for c in chunks if c)
+
+
+def extract_payload_attachments(payload: Any) -> list[Any]:
+    """Collect every file/image/document attachment from a captured payload.
+
+    Companion to :func:`extract_payload_text`, but for the non-text parts
+    it deliberately drops. Walks OpenAI chat / OpenAI Responses /
+    Anthropic / Gemini multimodal shapes and returns a list of
+    :class:`egisai.policy.files.Attachment` (metadata + decoded bytes when
+    the part carried base64/data-URL content). Returns ``[]`` for payloads
+    with no attachments. Never raises — a malformed part is skipped.
+    """
+    from egisai.policy.files import Attachment, normalize_format
+
+    if not isinstance(payload, dict):
+        return []
+
+    out: list[Any] = []
+
+    def _decode_data_url(url: str) -> tuple[str, bytes | None]:
+        """``data:<mime>;base64,<data>`` → (mime, bytes). ("", None) else."""
+        if not isinstance(url, str) or not url.startswith("data:"):
+            return "", None
+        try:
+            header, _, b64 = url.partition(",")
+            mime = header[5:].split(";")[0].strip()
+            import base64
+
+            return mime, base64.b64decode(b64)
+        except Exception:  # noqa: BLE001 — best effort; skip undecodable
+            return "", None
+
+    def _add(name: str, mime: str, content: bytes | None) -> None:
+        fmt = normalize_format(name, mime)
+        if not fmt and content is None:
+            return
+        out.append(
+            Attachment(
+                name=name or "",
+                mime=mime or "",
+                fmt=fmt,
+                size_bytes=len(content) if content is not None else 0,
+                content=content,
+            )
+        )
+
+    def _part(part: Any) -> None:
+        if not isinstance(part, dict):
+            return
+        ptype = part.get("type")
+        # OpenAI chat: {"type":"image_url","image_url":{"url":"data:..."|"http..."}}
+        if ptype == "image_url":
+            iu = part.get("image_url")
+            url = iu.get("url") if isinstance(iu, dict) else iu
+            mime, content = _decode_data_url(url if isinstance(url, str) else "")
+            _add("", mime or "image/*", content)
+        # OpenAI Responses: {"type":"input_image","image_url":"data:..."}
+        elif ptype == "input_image":
+            url = part.get("image_url")
+            mime, content = _decode_data_url(url if isinstance(url, str) else "")
+            _add("", mime or "image/*", content)
+        # OpenAI Responses: {"type":"input_file","filename":...,"file_data":"data:..."}
+        elif ptype == "input_file":
+            name = part.get("filename") or ""
+            mime, content = _decode_data_url(part.get("file_data") or "")
+            _add(str(name), mime, content)
+        # Anthropic: {"type":"image"|"document","source":{...}}
+        elif ptype in ("image", "document"):
+            src = part.get("source")
+            if isinstance(src, dict):
+                mime = str(src.get("media_type") or "")
+                content = None
+                if src.get("type") == "base64" and isinstance(src.get("data"), str):
+                    try:
+                        import base64
+
+                        content = base64.b64decode(src["data"])
+                    except Exception:  # noqa: BLE001
+                        content = None
+                name = str(part.get("title") or "")
+                _add(name, mime, content)
+        # Gemini: {"inline_data":{"mime_type":...,"data":base64}} / {"file_data":...}
+        elif isinstance(part.get("inline_data"), dict):
+            idata = part["inline_data"]
+            mime = str(idata.get("mime_type") or "")
+            content = None
+            if isinstance(idata.get("data"), str):
+                try:
+                    import base64
+
+                    content = base64.b64decode(idata["data"])
+                except Exception:  # noqa: BLE001
+                    content = None
+            _add("", mime, content)
+        elif isinstance(part.get("file_data"), dict):
+            fdata = part["file_data"]
+            _add("", str(fdata.get("mime_type") or ""), None)
+
+    def _walk_messages(messages: Any) -> None:
+        if not isinstance(messages, list):
+            return
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            content = m.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    _part(part)
+
+    _walk_messages(payload.get("messages"))
+
+    inp = payload.get("input")
+    if isinstance(inp, list):
+        _walk_messages(inp)
+
+    contents = payload.get("contents")
+    if isinstance(contents, list):
+        for item in contents:
+            if isinstance(item, dict):
+                parts = item.get("parts")
+                if isinstance(parts, list):
+                    for part in parts:
+                        _part(part)
+
+    return out
 
 
 def mutate_prompt_text(payload: Any, transform: Callable[[str], str]) -> bool:

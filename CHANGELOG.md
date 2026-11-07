@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.86.0] — 2026-11-06
+
+### Added
+- **File / attachment governance (`file_scan` policy kind).** A new
+  deterministic policy type that governs files and attachments on a
+  call and returns a verdict only — `allow` or `block` with a reason —
+  never rewriting file bytes. Two tiers: a pure-Python deterministic
+  tier (format allow/block lists + per-file size cap) that needs only
+  filename + size, and an optional heavy content-inspection tier (OCR +
+  parse + PII/safety scan) offloaded to an installable file engine
+  (`egisai.policy.files.set_remote_engine`), exactly like `pii_scan`
+  offloads to the NER worker. Wired into both `evaluate_policies` and
+  `evaluate_output_policies` (runs in Phase 1, short-circuits before any
+  LLM judge). Attachments are auto-extracted from OpenAI / OpenAI
+  Responses / Anthropic / Gemini multimodal payloads
+  (`extract_payload_attachments`) and carried on
+  `PolicyContext.attachments` / `OutputPolicyContext.attachments`. Fails
+  closed by default when content inspection is unavailable.
+- New public exports: `egisai.policy.Attachment`,
+  `egisai.policy.FileFinding`.
+
+### Fixed
+- **Fail open when a framework patch outlives `init()`.** If an
+  installed OpenAI / Anthropic / Gemini patch is invoked while the SDK
+  is not initialized (config is `None` — e.g. after `shutdown()`), the
+  gate now forwards the call untouched instead of raising
+  `RuntimeError: egisai not initialized`. This upholds the hard rule
+  that governance never breaks the user's call path.
+
 ## [0.85.0] — 2026-11-02
 
 ### Added
