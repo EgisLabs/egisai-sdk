@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.86.1] — 2026-11-06
+
+### Added
+- **Audit events carry file metadata.** Every governed call's audit
+  event now includes an `attachments` list — the file *format* and byte
+  *size* of each attachment, metadata only (never the filename, never
+  the content). Powers the dashboard's new "Files uploaded" display so
+  an operator can see at a glance what a call carried and that it was
+  governed. Derived from `extract_payload_attachments`, fail-open (a
+  bad payload shape never breaks the call path).
+
+---
+
 ## [0.86.0] — 2026-11-06
 
 ### Added
