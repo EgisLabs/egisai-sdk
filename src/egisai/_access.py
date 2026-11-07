@@ -484,6 +484,71 @@ def extract_access_items_from_tool_names(names: Any) -> list[dict[str, Any]]:
     return items
 
 
+# Caps for the compact, per-call inventory stamped on an audit event /
+# forwarded by the egress node. The full bundle caps at ``_MAX_ITEMS``
+# (200) for the Access tab; a single request row never needs that many
+# to be useful, and a bounded list keeps the ``request_logs.tools``
+# JSONB column small on a hot, partitioned table.
+_MAX_EVENT_TOOLS = 50
+_MAX_EVENT_TOOL_DESC = 200
+_MAX_EVENT_TOOL_PARAMS = 20
+
+
+def compact_tool_inventory(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compact access-inventory ``items`` into the per-call ``tools`` list.
+
+    ``items`` is the output of :func:`extract_access_items` (or the
+    agent-options / tool-name variants) — already metadata-only. We keep
+    just the fields the dashboard renders on a single request:
+
+    * ``kind``        — ``"tool"`` | ``"mcp_server"``.
+    * ``name``        — tool name (``mcp__server__tool`` for MCP tools).
+    * ``server_name`` — associated MCP server, when served by one
+                        (omitted otherwise).
+    * ``description`` — PII-sanitized, truncated (already masked by
+                        :func:`_safe_description`).
+    * ``param_names`` — declared parameter names only, never values.
+
+    The ``schema_hash`` join key is intentionally dropped — it is an
+    internal correlation field for the Access tab, not display data.
+    Fails closed per entry: a malformed item is skipped, never raised.
+    Returns ``[]`` when nothing usable is present.
+    """
+    out: list[dict[str, Any]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = it.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        kind = it.get("kind")
+        entry: dict[str, Any] = {
+            "kind": kind if kind in ("tool", "mcp_server") else "tool",
+            "name": name[:255],
+        }
+        server = it.get("server_name")
+        if isinstance(server, str) and server:
+            entry["server_name"] = server[:255]
+        desc = it.get("description")
+        if isinstance(desc, str) and desc:
+            entry["description"] = desc[:_MAX_EVENT_TOOL_DESC]
+        params = it.get("param_names")
+        if isinstance(params, list) and params:
+            names = [
+                str(p)[:128]
+                for p in params[:_MAX_EVENT_TOOL_PARAMS]
+                if isinstance(p, str) and p
+            ]
+            if names:
+                entry["param_names"] = names
+        out.append(entry)
+        if len(out) >= _MAX_EVENT_TOOLS:
+            break
+    return out
+
+
 def compute_bundle_hash(items: list[dict[str, Any]]) -> str:
     """Stable SHA-256 over the inventory's identifying fields.
 

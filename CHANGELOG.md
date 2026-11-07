@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.87.0] — 2026-11-07
+
+### Added
+- **Request details now show the tools & MCP servers a call had
+  available.** Every `model_call` audit event carries a compact,
+  metadata-only `tools` inventory (tool name, MCP server association,
+  PII-sanitized description, and parameter *names* — never the schema
+  JSON, call arguments, or values). It rides the existing access
+  extraction, survives the logger's `payload`-stripping, and lets the
+  dashboard render a "Tools & MCP" section alongside the multi-step
+  tool-call waterfall. Capped at 50 entries per call to keep the audit
+  row small on the hot path.
+
+---
+
 ## [0.86.2] — 2026-11-06
 
 ### Changed

@@ -21,7 +21,6 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from egisai._access import maybe_report_access
 from egisai._auto_agent import (
     current_identity,
     resolve_identity,
@@ -516,12 +515,42 @@ def _build_input_event(
         source=source, target=target, payload=payload, model=model, stream=stream
     )
     _attribute_event(ev, payload)
-    # Access-inventory reporting for the dashboard's "Access" tab.
-    # Steady state is a dict lookup; the actual report (only when the
-    # agent's declared tool bundle changes) runs on a daemon thread
-    # and fails open. See ``egisai._access``.
+    # Access-inventory reporting for the dashboard's "Access" tab AND
+    # the per-call ``tools`` inventory shown on the request-detail /
+    # run-timeline modals ("Tools & MCP available to this call").
+    #
+    # Both are derived from the SAME metadata-only extraction
+    # (``extract_access_items`` — name + PII-sanitized description +
+    # schema hash + parameter names + MCP server association, NEVER the
+    # schema JSON, call arguments, or argument values; see the privacy
+    # contract in ``egisai._access``). We extract once and feed both
+    # sinks:
+    #   * ``maybe_report_access_items`` ships the full bundle to the
+    #     per-agent Access tab (only when the bundle hash changes).
+    #   * ``ev["tools"]`` is a compact, capped copy stamped on THIS
+    #     call's audit event so the dashboard can show exactly which
+    #     tools / MCP servers the call had available. It rides every
+    #     ``model_call`` step (``tool_call`` steps record the invoked
+    #     tool via ``tool_name`` instead) and survives the logger's
+    #     ``payload``-stripping because it is a top-level, non-
+    #     underscore key. Steady state stays cheap — the extraction
+    #     only does real work when the payload actually declares tools.
     try:
-        maybe_report_access(ev.get("agent_id"), payload)
+        from egisai._access import (
+            compact_tool_inventory,
+            extract_access_items,
+            maybe_report_access_items,
+        )
+
+        if isinstance(payload, dict) and (
+            payload.get("tools") or payload.get("toolConfig")
+        ):
+            items = extract_access_items(payload)
+            if items:
+                maybe_report_access_items(ev.get("agent_id"), items)
+                compact = compact_tool_inventory(items)
+                if compact:
+                    ev["tools"] = compact
     except Exception:  # noqa: BLE001
         LOGGER.debug("access report hook failed", exc_info=True)
     ev["prompt_chars"] = len(prompt_text or "")
