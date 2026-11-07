@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closed by default when content inspection is unavailable.
 - New public exports: `egisai.policy.Attachment`,
   `egisai.policy.FileFinding`.
+- **Audit events carry file metadata.** Every governed call's audit
+  event now includes an `attachments` list — the file *format* and byte
+  *size* of each attachment, metadata only (never the filename, never
+  the content). Powers the dashboard's new "Files uploaded" display so
+  an operator can see at a glance what a call carried and that it was
+  governed. Derived from `extract_payload_attachments`, fail-open (a
+  bad payload shape never breaks the call path).
 
 ### Fixed
 - **Fail open when a framework patch outlives `init()`.** If an

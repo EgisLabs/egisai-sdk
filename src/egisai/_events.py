@@ -81,7 +81,7 @@ def build_event(
     # Additive to ``trace_id``, never a replacement — see
     # ``_context.ambient_otel_ids``.
     otel_trace_id, otel_span_id = ambient_otel_ids()
-    return {
+    event: dict[str, Any] = {
         "event_id": uuid.uuid4().hex,
         "trace_id": trace,
         "otel_trace_id": otel_trace_id,
@@ -107,3 +107,20 @@ def build_event(
         "payload": payload,
         "payload_preview": safe_preview(payload),
     }
+    # Files carried by this call, for the dashboard's "Files uploaded"
+    # display. METADATA ONLY — format + byte size, never the filename
+    # or the content (security-and-compliance.mdc §1 / §5). Local import
+    # keeps the heavier ``_evaluator`` graph out of this early module,
+    # and the whole thing is fail-open: a bad payload shape must never
+    # break the user's call path.
+    try:
+        from egisai._evaluator import extract_payload_attachments
+
+        atts = extract_payload_attachments(payload)
+        if atts:
+            event["attachments"] = [
+                {"format": a.fmt, "size_bytes": a.effective_size} for a in atts
+            ]
+    except Exception:  # noqa: BLE001
+        pass
+    return event
