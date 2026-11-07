@@ -45,6 +45,7 @@ from egisai._evaluator import (
     OutputCall,
     evaluate,
     evaluate_output,
+    extract_payload_attachments,
     extract_payload_text,
     mutate_prompt_text,
 )
@@ -537,6 +538,7 @@ def _run_input_phase(
     prompt_text: str,
     stream: bool,
     ev: dict[str, Any],
+    attachments: tuple[Any, ...] = (),
 ) -> PolicyDecision:
     """Evaluate input-side policies and stamp the verdict onto ``ev``.
 
@@ -558,6 +560,7 @@ def _run_input_phase(
             prompt_text=prompt_text,
             stream=stream,
             hook="model",
+            attachments=attachments,
         )
     )
     elapsed_ms = int((time.monotonic() - policy_started) * 1000)
@@ -1207,6 +1210,20 @@ def gate_call(
     rules can match on the auto-detected agent — pre-0.17 only
     ``set_context(agent=…)`` callers benefited from scoped rules.
     """
+    # Fail open when the SDK isn't initialized. A framework patch can
+    # outlive its ``init()`` (e.g. ``shutdown()`` was called, or in a
+    # test the config was reset while the monkeypatch stayed live). In
+    # that state the gate has no policies, no logger, and no config to
+    # build an event from — governing is impossible, so we MUST let the
+    # user's call through untouched rather than crash it. This upholds
+    # the SDK's hard rule: "fail open, never break the user's call
+    # path" (see sdk-design-philosophy). In normal use ``init()`` sets
+    # the config before installing any patch, so this never trips.
+    from egisai._config import get_config_optional
+
+    if get_config_optional() is None:
+        return forward()
+
     prev_source = get_source()
     prev_checked = get_policy_checked()
 
@@ -1278,6 +1295,7 @@ def _gate_call_inner(
             prompt_text=prompt_text,
             stream=stream,
             ev=ev,
+            attachments=tuple(extract_payload_attachments(payload)),
         )
 
         if decision.verdict == "block":
@@ -1435,6 +1453,13 @@ async def async_gate_call(
     forward: Callable[[], Any],
 ) -> Any:
     """Async sibling of ``gate_call`` — same semantics, awaits ``forward()``."""
+    # Fail open when the SDK isn't initialized — see the sync
+    # ``gate_call`` for the full rationale.
+    from egisai._config import get_config_optional
+
+    if get_config_optional() is None:
+        return await forward()
+
     prev_source = get_source()
     prev_checked = get_policy_checked()
 
@@ -1519,6 +1544,7 @@ async def _async_gate_call_inner(
             prompt_text=prompt_text,
             stream=stream,
             ev=ev,
+            attachments=tuple(extract_payload_attachments(payload)),
         )
 
         if decision.verdict == "block":

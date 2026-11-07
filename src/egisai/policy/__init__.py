@@ -19,9 +19,12 @@ from egisai.policy.engine import (
     evaluate_output_policies,
     evaluate_policies,
 )
+from egisai.policy.files import Attachment, FileFinding
 from egisai.policy.pii import Sanitization, label_redact
 
 __all__ = [
+    "Attachment",
+    "FileFinding",
     "MatchedPolicyRecord",
     "OutputPolicyContext",
     "PolicyContext",

@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from egisai.policy import _pii_custom, _processing, fastpath, injection
+from egisai.policy import files as file_scanner
 from egisai.policy import pii as pii_scanner
 from egisai.policy._regex_safe import safe_search
 from egisai.policy.semantic import SemanticBlocker
@@ -112,6 +113,12 @@ class PolicyContext:
     # the caller did not set it. Appended with a default so existing
     # constructions keep compiling unchanged.
     hook: str = ""
+    # File/attachment metadata (+ optional bytes) carried on the call,
+    # consumed by the ``file_scan`` kind. ``tuple`` of
+    # ``egisai.policy.files.Attachment``. Empty by default so every
+    # existing construction keeps compiling. Typed ``tuple[Any, ...]``
+    # to avoid importing ``files`` at class-definition time.
+    attachments: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -157,6 +164,11 @@ class OutputPolicyContext:
     # call site ran this evaluation. Default empty so every existing
     # construction keeps compiling.
     hook: str = ""
+    # File/attachment metadata (+ optional bytes) carried on the
+    # response, consumed by the ``file_scan`` kind (e.g. a model that
+    # returns a generated file). Empty by default. See
+    # ``PolicyContext.attachments``.
+    attachments: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -449,6 +461,14 @@ _DETERMINISTIC_KINDS = frozenset(
         # network on the hot path (see ``egisai.policy.limits``).
         "rate_limit",
         "budget_limit",
+        # File / attachment governance (verdict-only, never sanitizes
+        # bytes). The deterministic tier (format allow/block + size cap)
+        # is pure-Python; heavy content inspection (OCR + parse + scan)
+        # is offloaded to the standalone file worker through an installed
+        # engine, exactly like ``pii_scan`` offloads to the NER worker.
+        # Classed deterministic so it runs in Phase 1 and short-circuits
+        # before any LLM judge (security-and-compliance.mdc rule 2).
+        "file_scan",
     }
 )
 
@@ -1161,6 +1181,9 @@ def _dispatch_one_input_policy(
 
     if policy.type == "budget_limit":
         return _budget_limit_match(policy, context.agent_id)
+
+    if policy.type == "file_scan":
+        return _file_scan_match(policy, context.attachments)
 
     # Tool / bash / MCP rules need response-side signals
     # (tool_names, tool_calls, mcp_targets) that ``PolicyContext``
@@ -2540,6 +2563,31 @@ def _max_chars_match(
     )
 
 
+def _file_scan_match(
+    policy: PolicyRule,
+    attachments: tuple[Any, ...],
+) -> MatchedPolicyRecord | None:
+    """Govern file attachments: verdict only (allow/block), never sanitize.
+
+    Runs the two-tier file evaluator (deterministic format/size, then
+    content inspection via the installed file engine) and translates the
+    first blocking :class:`~egisai.policy.files.FileFinding` into a
+    ``block`` record. No attachments, or all clean ⇒ ``None``.
+    """
+    if not attachments:
+        return None
+    finding = file_scanner.evaluate(list(attachments), policy.config)
+    if finding is None:
+        return None
+    return MatchedPolicyRecord(
+        name=policy.name,
+        type=policy.type,
+        verdict="block",
+        reason_code=finding.reason_code,
+        message=finding.message,
+    )
+
+
 def _pii_scan_match(
     policy: PolicyRule,
     *,
@@ -2925,6 +2973,9 @@ def _dispatch_one_output_policy(
 
     if policy.type == "deny_resource_access":
         return _deny_resource_access_match(policy, context)
+
+    if policy.type == "file_scan":
+        return _file_scan_match(policy, context.attachments)
 
     if policy.type == "injection_scan":
         # The response side is where this earns its keep. A tool
