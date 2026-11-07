@@ -139,6 +139,25 @@ def test_content_engine_blocks_on_finding():
     assert finding.reason_code == "pii_in_file"
 
 
+def test_content_finding_keeps_specific_reason():
+    # A content block must surface the *specific* reason (PII types),
+    # not be flattened to the policy's generic ``message``. The custom
+    # message is kept as a lead-in so both survive.
+    file_scanner.set_remote_engine(_FakeEngine())
+    att = Attachment(name="form.pdf", mime="", fmt="pdf", content=b"name SSN 123")
+    finding = file_scanner.evaluate(
+        [att], {"message": "This file was blocked by file-governance policy."}
+    )
+    assert finding is not None
+    assert finding.reason_code == "pii_in_file"
+    # The specific worker reason is visible.
+    assert "contains an SSN" in finding.message
+    # The operator's note is still there as a lead-in.
+    assert finding.message.startswith(
+        "This file was blocked by file-governance policy."
+    )
+
+
 def test_content_engine_allows_clean_file():
     file_scanner.set_remote_engine(_FakeEngine())
     att = Attachment(name="clean.pdf", mime="", fmt="pdf", content=b"hello world")

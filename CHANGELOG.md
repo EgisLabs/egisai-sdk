@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.86.2] — 2026-11-06
+
+### Changed
+- **File blocks now show the specific reason.** When content inspection
+  blocks a file, `file_scan` surfaces *why* — the PII type labels the
+  worker found, or an unreadable/parse failure — instead of flattening
+  it to the policy's generic `message`. A custom `message`, when set, is
+  kept as a lead-in so operator wording survives while the reason stays
+  visible. Deterministic format/size blocks are unchanged (still honour
+  the custom `message`). Counts + type labels only, never raw values.
+
+---
+
 ## [0.86.1] — 2026-11-06
 
 ### Added
