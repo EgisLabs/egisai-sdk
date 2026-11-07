@@ -298,12 +298,20 @@ def evaluate(
 
     if findings:
         f = findings[0]
-        if custom_message:
+        # Show the SPECIFIC reason the content engine found — the PII
+        # types, an unreadable/parse failure, etc. This is the "why" an
+        # operator cannot pre-write, so unlike the deterministic Tier-1
+        # blocks above (and the fail-closed case) it is NOT replaced by
+        # the policy's generic ``message``. The worker's message carries
+        # counts + type labels only, never raw values (security §1/§5).
+        # A custom message, when set, is kept as a lead-in so operator
+        # branding survives while the reason stays visible.
+        if custom_message and f.message and f.message != custom_message:
             return FileFinding(
                 name=f.name,
                 fmt=f.fmt,
                 reason_code=f.reason_code,
-                message=custom_message,
+                message=f"{custom_message} {f.message}",
             )
         return f
     return None
