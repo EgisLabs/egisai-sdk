@@ -10,6 +10,7 @@ nothing.
 from __future__ import annotations
 
 import logging
+import threading
 
 from egisai._context import get_policy_checked
 from egisai._events import build_event
@@ -18,6 +19,61 @@ from egisai._patches import has_module
 from egisai._patches._common import _attribute_event
 
 LOGGER = logging.getLogger("egisai.patches.http")
+
+# Hostnames of the org's registered custom (self-hosted) model
+# endpoints, delivered on the policy handshake (``custom_model_hosts``
+# in ``/v1/sdk/policies``) and pushed here by ``_policy_cache`` on
+# every refresh. A raw httpx/requests call to one of these hosts on an
+# inference-shaped path is AUDITED exactly like the built-in public
+# providers — the Case-4 analog so a private/self-hosted model called
+# over a transport we don't have a dedicated adapter for still shows up
+# on the dashboard. Audit-only, fail-open; never blocks the call.
+#
+# Guarded by a lock because the refresher thread writes while the
+# customer's model-call thread reads. Reads copy the frozenset once
+# per call so matching never holds the lock across the URL scan.
+_custom_hosts_lock = threading.Lock()
+_custom_hosts: frozenset[str] = frozenset()
+
+# Inference-shaped path tokens accepted for a *custom* host. Broader
+# than any single public provider because self-hosted servers expose a
+# grab-bag of conventions (vLLM / TGI / Ollama / LM Studio …), but we
+# still require host+path so unrelated traffic to the same host (health
+# checks, metrics scrapes) isn't logged as a phantom model call.
+_CUSTOM_PATH_TOKENS: tuple[str, ...] = (
+    "/chat/completions",
+    "/completions",
+    "/responses",
+    "/embeddings",
+    "/messages",
+    "/generate",
+    "/api/chat",
+    "/api/generate",
+)
+
+
+def set_custom_model_hosts(hosts: list[str] | None) -> None:
+    """Replace the audited custom-model host set. Thread-safe, never raises.
+
+    Called by ``_policy_cache`` on every successful policy refresh with
+    the org's ``custom_model_hosts``. ``None`` / empty clears the set
+    (the org has no custom models) — the built-in public host list is
+    unaffected either way.
+    """
+    try:
+        normalized = frozenset(
+            h.strip().lower() for h in (hosts or []) if h and h.strip()
+        )
+    except Exception:  # noqa: BLE001
+        return
+    global _custom_hosts
+    with _custom_hosts_lock:
+        _custom_hosts = normalized
+
+
+def _custom_hosts_snapshot() -> frozenset[str]:
+    with _custom_hosts_lock:
+        return _custom_hosts
 
 # (host_token, path_token) pairs — BOTH substrings must appear in
 # the URL for it to count as a model call. The earlier host-only
@@ -77,7 +133,18 @@ def _looks_like_model_call(url: str) -> bool:
     incident that motivated the host+path requirement.
     """
     u = url.lower()
-    return any(host in u and path in u for host, path in _MODEL_CALL_URL_TOKENS)
+    if any(host in u and path in u for host, path in _MODEL_CALL_URL_TOKENS):
+        return True
+    # Org-registered custom (self-hosted) model hosts — same host+path
+    # discipline, broader path vocabulary (see ``_CUSTOM_PATH_TOKENS``).
+    custom = _custom_hosts_snapshot()
+    if custom and any(
+        host in u and path in u
+        for host in custom
+        for path in _CUSTOM_PATH_TOKENS
+    ):
+        return True
+    return False
 
 
 def _patch_requests() -> bool:

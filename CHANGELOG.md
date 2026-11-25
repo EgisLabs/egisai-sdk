@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.88.0] — 2026-11-24
+
+### Added
+- **Self-hosted ("custom") model hosts are now audited on the raw-HTTP
+  fallback.** When an org registers a private / self-hosted model
+  endpoint (vLLM, TGI, Ollama, LM Studio, …) on the Gateway, the
+  platform ships its hostnames to the SDK on the policy handshake
+  (`custom_model_hosts` on `/v1/sdk/policies`). The `httpx` / `requests`
+  fallback patch adds them to its model-call host allow-list, so a raw
+  call to a private model host on an inference-shaped path shows up on
+  the dashboard as an audited `verdict="allow"` Network-layer event —
+  the Case-4 analog of the built-in public-provider hosts. Audit-only
+  and fail-open: it never blocks the call, the host set clears when the
+  org has no custom models, and backends older than this field simply
+  ship nothing (the built-in public hosts are unaffected).
+
+---
+
 ## [0.87.0] — 2026-11-07
 
 ### Added

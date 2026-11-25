@@ -206,11 +206,13 @@ def fetch_policies(
     list[str] | None,
     list[str] | None,
     list[str] | None,
+    list[str] | None,
 ]:
     """Pull the per-org policy + paused/ungoverned-agent snapshot.
 
     Returns ``(new_etag, rules, paused_agent_ids, ungoverned_agent_ids,
-    paused_mcp_server_ids, ungoverned_mcp_server_ids, blocked_mcp_tools)``.
+    paused_mcp_server_ids, ungoverned_mcp_server_ids, blocked_mcp_tools,
+    custom_model_hosts)``.
 
     * ``rules`` is ``None`` on a 304 (cache still fresh — the
       caller leaves its current rule list AND its current
@@ -240,7 +242,7 @@ def fetch_policies(
         lambda: get_client().get("/v1/sdk/policies", headers=headers),
     )
     if r.status_code == 304:
-        return etag, None, None, None, None, None, None
+        return etag, None, None, None, None, None, None, None
     if r.status_code != 200:
         raise _http_error(op="fetch_policies", status=r.status_code)
     body = r.json()
@@ -280,6 +282,14 @@ def fetch_policies(
         blocked_tools.append(
             f"{sid.lower()}{sep}{tool}" if sep else key.lower()
         )
+    # Custom (self-hosted) model hostnames for the SDK's raw-HTTP audit
+    # fallback. Absent on orgs with no custom models and on backends
+    # older than this field — an empty list, which clears the SDK's
+    # custom-host set and leaves the built-in public hosts untouched.
+    raw_custom_hosts = body.get("custom_model_hosts") or []
+    custom_hosts: list[str] = [
+        str(h).strip().lower() for h in raw_custom_hosts if h and str(h).strip()
+    ]
     return (
         body.get("etag"),
         body.get("rules", []),
@@ -288,6 +298,7 @@ def fetch_policies(
         paused_mcp,
         ungoverned_mcp,
         blocked_tools,
+        custom_hosts,
     )
 
 

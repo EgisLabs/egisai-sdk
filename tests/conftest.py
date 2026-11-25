@@ -184,6 +184,9 @@ class FakeBackend:
         self.paused_mcp_server_ids: list[str] = []
         self.ungoverned_mcp_server_ids: list[str] = []
         self.blocked_mcp_tools: list[str] = []
+        # Custom (self-hosted) model hostnames shipped on the policy
+        # feed for the SDK's raw-HTTP audit fallback. Empty by default.
+        self.custom_model_hosts: list[str] = []
         self.etag: str = '"empty"'
         self.handshake_calls = 0
         # Tests set this to 401/503 to simulate a rejected/unreachable
@@ -226,9 +229,12 @@ class FakeBackend:
         paused_mcp_server_ids: list[str] | None = None,
         ungoverned_mcp_server_ids: list[str] | None = None,
         blocked_mcp_tools: list[str] | None = None,
+        custom_model_hosts: list[str] | None = None,
     ) -> None:
         self.rules = rules
         self.etag = etag
+        if custom_model_hosts is not None:
+            self.custom_model_hosts = custom_model_hosts
         if paused_agent_ids is not None:
             self.paused_agent_ids = paused_agent_ids
         if ungoverned_agent_ids is not None:
@@ -296,6 +302,7 @@ class FakeBackend:
                     "paused_mcp_server_ids": self.paused_mcp_server_ids,
                     "ungoverned_mcp_server_ids": self.ungoverned_mcp_server_ids,
                     "blocked_mcp_tools": self.blocked_mcp_tools,
+                    "custom_model_hosts": self.custom_model_hosts,
                 },
             )
         if path.endswith("/v1/sdk/agents/ensure"):
