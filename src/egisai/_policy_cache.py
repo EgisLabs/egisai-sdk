@@ -352,6 +352,7 @@ def refresh_now() -> bool:
         paused_mcp,
         ungoverned_mcp,
         blocked_tools,
+        custom_hosts,
     ) = fetch_policies(etag=current_etag)
     # The HTTP call returned without raising — whether it shipped a new
     # rule list, zero rules, or a 304. Either way we have now heard from
@@ -361,7 +362,8 @@ def refresh_now() -> bool:
     if rules is None:
         # 304 — nothing changed since ``current_etag``. The rule
         # list AND both agent-state sets stay as-is, in lockstep
-        # with the same ETag.
+        # with the same ETag. The audited custom-host set is part of
+        # that unchanged snapshot too, so leave it alone.
         return False
     replace_rules(
         new_etag,
@@ -372,6 +374,17 @@ def refresh_now() -> bool:
         ungoverned_mcp_server_ids=ungoverned_mcp,
         blocked_mcp_tools=blocked_tools,
     )
+    # Push the org's custom (self-hosted) model hosts to the HTTP
+    # fallback patch so a raw call to a private model host is audited.
+    # Audit-only and not part of the gate's lockstep state, so it lives
+    # outside ``replace_rules`` (which many tests drive directly).
+    # Best-effort — a failure here must never poison the cache write.
+    try:
+        from egisai._patches.http import set_custom_model_hosts
+
+        set_custom_model_hosts(custom_hosts)
+    except Exception:  # noqa: BLE001
+        pass
     return True
 
 
